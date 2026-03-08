@@ -298,7 +298,15 @@ func (t *Tools) handleLaunch(ctx context.Context, request mcp.CallToolRequest) (
 		return mcp.NewToolResultError(fmt.Sprintf("setExceptionBreakpoints failed: %s", err)), nil
 	}
 
-	// 15. Send ConfigurationDoneRequest.
+	// 15. Register StopWaiter BEFORE ConfigurationDone when stop_on_entry is
+	// true, so the StoppedEvent that fires immediately after ConfigurationDone
+	// is not lost to a race.
+	var waiterCh <-chan dap.StopResult
+	if stopOnEntry {
+		waiterCh = client.StopWaiter().Register()
+	}
+
+	// 16. Send ConfigurationDoneRequest.
 	configReq := &godap.ConfigurationDoneRequest{}
 	configReq.Type = "request"
 	configReq.Command = "configurationDone"
@@ -309,15 +317,14 @@ func (t *Tools) handleLaunch(ctx context.Context, request mcp.CallToolRequest) (
 		return mcp.NewToolResultError(fmt.Sprintf("configurationDone failed: %s", err)), nil
 	}
 
-	// 16. Set program and PID.
+	// 17. Set program and PID.
 	t.session.SetProgram(program)
 	if sub.Cmd.Process != nil {
 		t.session.SetPID(sub.Cmd.Process.Pid)
 	}
 
-	// 17. Handle stop_on_entry.
+	// 18. Handle stop_on_entry.
 	if stopOnEntry {
-		waiterCh := client.StopWaiter().Register()
 		select {
 		case result := <-waiterCh:
 			if result.Exited || result.Terminated {
@@ -352,7 +359,7 @@ func (t *Tools) handleLaunch(ctx context.Context, request mcp.CallToolRequest) (
 	// Not stopping on entry: set state to running.
 	t.session.SetState(session.StateRunning)
 
-	// 18. Return JSON result.
+	// 19. Return JSON result.
 	resultMap := map[string]any{
 		"status":  "launched",
 		"program": program,
