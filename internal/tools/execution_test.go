@@ -175,3 +175,31 @@ func TestHandleStepOutStateGuardRejectsNonStopped(t *testing.T) {
 		})
 	}
 }
+
+func TestHandlePauseStateGuardRejectsNonRunning(t *testing.T) {
+	tests := []struct {
+		name  string
+		state session.State
+	}{
+		{"idle", session.StateIdle},
+		{"configuring", session.StateConfiguring},
+		{"stopped", session.StateStopped},
+		{"terminated", session.StateTerminated},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := session.NewSessionManager()
+			sm.SetState(tc.state)
+			tools := New(sm)
+
+			result, err := tools.handlePause(context.Background(), mcp.CallToolRequest{})
+			if err != nil {
+				t.Fatalf("handlePause returned error: %v", err)
+			}
+			if !result.IsError {
+				t.Fatalf("handlePause should return tool error when state is %s", tc.name)
+			}
+		})
+	}
+}
