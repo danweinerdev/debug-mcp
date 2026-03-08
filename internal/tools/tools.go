@@ -194,6 +194,4 @@ func (t *Tools) handleDisassemble(_ context.Context, _ mcp.CallToolRequest) (*mc
 	return mcp.NewToolResultError("not implemented"), nil
 }
 
-func (t *Tools) handleRunCommand(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleRunCommand is implemented in run_command.go.
