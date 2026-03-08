@@ -155,13 +155,8 @@ func (t *Tools) Register(s *server.MCPServer) {
 // handleSetBreakpoint is implemented in breakpoints.go.
 // handleSetFunctionBreakpoint is implemented in breakpoints.go.
 
-func (t *Tools) handleRemoveBreakpoint(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
-
-func (t *Tools) handleListBreakpoints(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleRemoveBreakpoint is implemented in breakpoints.go.
+// handleListBreakpoints is implemented in breakpoints.go.
 
 // --- Execution control handlers ---
 
@@ -203,9 +198,7 @@ func (t *Tools) handleEvaluate(_ context.Context, _ mcp.CallToolRequest) (*mcp.C
 	return mcp.NewToolResultError("not implemented"), nil
 }
 
-func (t *Tools) handleReadOutput(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleReadOutput is implemented in output.go.
 
 // --- Advanced handlers ---
 

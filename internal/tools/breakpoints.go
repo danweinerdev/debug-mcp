@@ -120,6 +120,117 @@ func (t *Tools) handleSetBreakpoint(ctx context.Context, request mcp.CallToolReq
 	return mcp.NewToolResultText(string(resultJSON)), nil
 }
 
+func (t *Tools) handleRemoveBreakpoint(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// 1. State guard: only allow when stopped.
+	if err := t.session.CheckState(session.StateStopped); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// 2. Parse required breakpoint_id.
+	id, err := request.RequireInt("breakpoint_id")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("missing required parameter: %s", err)), nil
+	}
+
+	// 3. Remove from session tracking.
+	filePath, wasFunction, err := t.session.RemoveBreakpointByID(id)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to remove breakpoint: %s", err)), nil
+	}
+
+	// 4. Send updated breakpoint list to DAP.
+	if wasFunction {
+		bps := t.session.AllFunctionBreakpoints()
+		req := &godap.SetFunctionBreakpointsRequest{}
+		req.Type = "request"
+		req.Command = "setFunctionBreakpoints"
+		req.Arguments = godap.SetFunctionBreakpointsArguments{
+			Breakpoints: bps,
+		}
+
+		resp, err := t.session.Client().Send(ctx, req)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("setFunctionBreakpoints request failed: %s", err)), nil
+		}
+		fbpResp, ok := resp.(*godap.SetFunctionBreakpointsResponse)
+		if !ok {
+			return mcp.NewToolResultError(fmt.Sprintf("unexpected response type: %T", resp)), nil
+		}
+		if !fbpResp.Success {
+			return mcp.NewToolResultError(fmt.Sprintf("setFunctionBreakpoints failed: %s", fbpResp.Message)), nil
+		}
+	} else {
+		bps := t.session.SourceBreakpointsForFile(filePath)
+		req := &godap.SetBreakpointsRequest{}
+		req.Type = "request"
+		req.Command = "setBreakpoints"
+		req.Arguments = godap.SetBreakpointsArguments{
+			Source:      godap.Source{Path: filePath},
+			Breakpoints: bps,
+		}
+
+		resp, err := t.session.Client().Send(ctx, req)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("setBreakpoints request failed: %s", err)), nil
+		}
+		sbResp, ok := resp.(*godap.SetBreakpointsResponse)
+		if !ok {
+			return mcp.NewToolResultError(fmt.Sprintf("unexpected setBreakpoints response type: %T", resp)), nil
+		}
+		if !sbResp.Success {
+			return mcp.NewToolResultError(fmt.Sprintf("setBreakpoints failed: %s", sbResp.Message)), nil
+		}
+	}
+
+	// 5. Return success result.
+	result := map[string]any{
+		"removed":       true,
+		"breakpoint_id": id,
+	}
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %s", err)), nil
+	}
+	return mcp.NewToolResultText(string(resultJSON)), nil
+}
+
+func (t *Tools) handleListBreakpoints(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// No state guard — valid in any state.
+	breakpoints := t.session.ListBreakpoints()
+
+	items := make([]map[string]any, 0, len(breakpoints))
+	for _, bp := range breakpoints {
+		entry := map[string]any{
+			"id":       bp.ID,
+			"type":     bp.Type,
+			"verified": bp.Verified,
+		}
+		if bp.File != "" {
+			entry["file"] = bp.File
+		}
+		if bp.Line > 0 {
+			entry["line"] = bp.Line
+		}
+		if bp.Function != "" {
+			entry["function"] = bp.Function
+		}
+		if bp.Condition != "" {
+			entry["condition"] = bp.Condition
+		}
+		items = append(items, entry)
+	}
+
+	result := map[string]any{
+		"breakpoints": items,
+		"count":       len(items),
+	}
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %s", err)), nil
+	}
+	return mcp.NewToolResultText(string(resultJSON)), nil
+}
+
 func (t *Tools) handleSetFunctionBreakpoint(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// 1. State guard: allow in idle (pending) or stopped.
 	if err := t.session.CheckState(session.StateIdle, session.StateStopped); err != nil {

@@ -205,7 +205,88 @@ func (t *Tools) handleLaunch(ctx context.Context, request mcp.CallToolRequest) (
 		return mcp.NewToolResultError(fmt.Sprintf("launch failed: %s", lr.Message)), nil
 	}
 
-	// 13. Send SetExceptionBreakpointsRequest (empty filters).
+	// 13. Flush pending breakpoints (set before launch) and send to DAP.
+	pendingSourceFiles, pendingFuncBPs := t.session.FlushPendingBreakpoints()
+
+	for file, bps := range pendingSourceFiles {
+		sbReq := &godap.SetBreakpointsRequest{}
+		sbReq.Type = "request"
+		sbReq.Command = "setBreakpoints"
+		sbReq.Arguments = godap.SetBreakpointsArguments{
+			Source:      godap.Source{Path: file},
+			Breakpoints: bps,
+		}
+
+		sbResp, err := client.Send(ctx, sbReq)
+		if err != nil {
+			t.cleanupSubprocess()
+			return mcp.NewToolResultError(fmt.Sprintf("setBreakpoints failed for %s: %s", file, err)), nil
+		}
+
+		sbResponse, ok := sbResp.(*godap.SetBreakpointsResponse)
+		if !ok {
+			t.cleanupSubprocess()
+			return mcp.NewToolResultError(fmt.Sprintf("unexpected setBreakpoints response type: %T", sbResp)), nil
+		}
+		if !sbResponse.Success {
+			t.cleanupSubprocess()
+			return mcp.NewToolResultError(fmt.Sprintf("setBreakpoints failed for %s: %s", file, sbResponse.Message)), nil
+		}
+
+		for i, bp := range sbResponse.Body.Breakpoints {
+			info := session.BreakpointInfo{
+				ID:       bp.Id,
+				Type:     "source",
+				File:     file,
+				Line:     bp.Line,
+				Verified: bp.Verified,
+			}
+			if i < len(bps) {
+				info.Condition = bps[i].Condition
+			}
+			t.session.AddBreakpointResponse(info)
+		}
+	}
+
+	if len(pendingFuncBPs) > 0 {
+		fbReq := &godap.SetFunctionBreakpointsRequest{}
+		fbReq.Type = "request"
+		fbReq.Command = "setFunctionBreakpoints"
+		fbReq.Arguments = godap.SetFunctionBreakpointsArguments{
+			Breakpoints: pendingFuncBPs,
+		}
+
+		fbResp, err := client.Send(ctx, fbReq)
+		if err != nil {
+			t.cleanupSubprocess()
+			return mcp.NewToolResultError(fmt.Sprintf("setFunctionBreakpoints failed: %s", err)), nil
+		}
+
+		fbResponse, ok := fbResp.(*godap.SetFunctionBreakpointsResponse)
+		if !ok {
+			t.cleanupSubprocess()
+			return mcp.NewToolResultError(fmt.Sprintf("unexpected setFunctionBreakpoints response type: %T", fbResp)), nil
+		}
+		if !fbResponse.Success {
+			t.cleanupSubprocess()
+			return mcp.NewToolResultError(fmt.Sprintf("setFunctionBreakpoints failed: %s", fbResponse.Message)), nil
+		}
+
+		for i, bp := range fbResponse.Body.Breakpoints {
+			info := session.BreakpointInfo{
+				ID:       bp.Id,
+				Type:     "function",
+				Verified: bp.Verified,
+			}
+			if i < len(pendingFuncBPs) {
+				info.Function = pendingFuncBPs[i].Name
+				info.Condition = pendingFuncBPs[i].Condition
+			}
+			t.session.AddBreakpointResponse(info)
+		}
+	}
+
+	// 14. Send SetExceptionBreakpointsRequest (empty filters).
 	exBpReq := &godap.SetExceptionBreakpointsRequest{}
 	exBpReq.Type = "request"
 	exBpReq.Command = "setExceptionBreakpoints"
@@ -217,7 +298,7 @@ func (t *Tools) handleLaunch(ctx context.Context, request mcp.CallToolRequest) (
 		return mcp.NewToolResultError(fmt.Sprintf("setExceptionBreakpoints failed: %s", err)), nil
 	}
 
-	// 14. Send ConfigurationDoneRequest.
+	// 15. Send ConfigurationDoneRequest.
 	configReq := &godap.ConfigurationDoneRequest{}
 	configReq.Type = "request"
 	configReq.Command = "configurationDone"
@@ -228,13 +309,13 @@ func (t *Tools) handleLaunch(ctx context.Context, request mcp.CallToolRequest) (
 		return mcp.NewToolResultError(fmt.Sprintf("configurationDone failed: %s", err)), nil
 	}
 
-	// 15. Set program and PID.
+	// 16. Set program and PID.
 	t.session.SetProgram(program)
 	if sub.Cmd.Process != nil {
 		t.session.SetPID(sub.Cmd.Process.Pid)
 	}
 
-	// 16. Handle stop_on_entry.
+	// 17. Handle stop_on_entry.
 	if stopOnEntry {
 		waiterCh := client.StopWaiter().Register()
 		select {
@@ -271,7 +352,7 @@ func (t *Tools) handleLaunch(ctx context.Context, request mcp.CallToolRequest) (
 	// Not stopping on entry: set state to running.
 	t.session.SetState(session.StateRunning)
 
-	// 17. Return JSON result.
+	// 18. Return JSON result.
 	resultMap := map[string]any{
 		"status":  "launched",
 		"program": program,
