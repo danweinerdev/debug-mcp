@@ -148,10 +148,6 @@ func (t *Tools) Register(s *server.MCPServer) {
 
 // --- Session management handlers ---
 
-func (t *Tools) handleLaunch(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
-
 func (t *Tools) handleAttach(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultError("not implemented"), nil
 }
