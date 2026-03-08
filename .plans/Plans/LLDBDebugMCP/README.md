@@ -1,7 +1,7 @@
 ---
 title: "LLDB Debug MCP Server"
 type: plan
-status: active
+status: complete
 created: 2026-03-07
 updated: 2026-03-07
 tags: [lldb, mcp, dap, go, debugging]
@@ -23,12 +23,12 @@ phases:
     depends_on: [2]
   - id: 4
     title: "Inspection Tools"
-    status: planned
+    status: complete
     doc: "04-Inspection.md"
     depends_on: [3]
   - id: 5
     title: "Advanced Tools + Integration Testing"
-    status: planned
+    status: complete
     doc: "05-Advanced-Testing.md"
     depends_on: [4]
 ---
