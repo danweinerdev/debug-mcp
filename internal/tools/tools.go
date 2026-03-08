@@ -152,9 +152,7 @@ func (t *Tools) Register(s *server.MCPServer) {
 
 // --- Breakpoint handlers ---
 
-func (t *Tools) handleSetBreakpoint(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleSetBreakpoint is implemented in breakpoints.go.
 
 func (t *Tools) handleSetFunctionBreakpoint(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultError("not implemented"), nil
