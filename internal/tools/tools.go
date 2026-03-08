@@ -168,11 +168,9 @@ func (t *Tools) Register(s *server.MCPServer) {
 
 // --- Inspection handlers ---
 
-func (t *Tools) handleBacktrace(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleThreads is implemented in inspection.go.
 
-func (t *Tools) handleThreads(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (t *Tools) handleBacktrace(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultError("not implemented"), nil
 }
 

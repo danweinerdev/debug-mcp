@@ -3,9 +3,9 @@ title: "Inspection Tools"
 type: phase
 plan: "LLDBDebugMCP"
 phase: 4
-status: planned
+status: in-progress
 created: 2026-03-07
-updated: 2026-03-07
+updated: 2026-03-08
 deliverable: "Full state inspection: backtrace, threads, variables with recursive flattening, expression evaluation, and arbitrary LLDB command execution via run_command"
 tasks:
   - id: "4.1"
