@@ -169,18 +169,13 @@ func (t *Tools) Register(s *server.MCPServer) {
 // --- Inspection handlers ---
 
 // handleThreads is implemented in inspection.go.
-
-func (t *Tools) handleBacktrace(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleBacktrace is implemented in inspection.go.
 
 func (t *Tools) handleVariables(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultError("not implemented"), nil
 }
 
-func (t *Tools) handleEvaluate(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleEvaluate is implemented in inspection.go.
 
 // handleReadOutput is implemented in output.go.
 
