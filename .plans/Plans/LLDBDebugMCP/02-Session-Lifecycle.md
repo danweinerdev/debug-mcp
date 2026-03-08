@@ -3,14 +3,14 @@ title: "Session Lifecycle — MCP Server + Launch/Attach"
 type: phase
 plan: "LLDBDebugMCP"
 phase: 2
-status: planned
+status: in-progress
 created: 2026-03-07
-updated: 2026-03-07
+updated: 2026-03-08
 deliverable: "MCP server with launch, attach, disconnect, and status tools. Can launch a program under lldb-dap, receive StoppedEvent on entry, query status, and disconnect cleanly."
 tasks:
   - id: "2.1"
     title: "Session manager + state machine"
-    status: planned
+    status: complete
     verification: "Unit test: state transitions idle→configuring→stopped→running→stopped→terminated→idle all succeed. Invalid transitions (e.g. running→idle, idle→stopped) return descriptive errors. State is queryable at any time."
   - id: "2.2"
     title: "MCP server skeleton + stdio transport"
@@ -58,11 +58,11 @@ Wire up the MCP server using mcp-go and implement the session manager that owns 
 ## 2.1: Session manager + state machine
 
 ### Subtasks
-- [ ] Define `State` type: `idle`, `configuring`, `stopped`, `running`, `terminated`
-- [ ] Implement `SessionManager` struct: holds `*dap.Client`, `State`, process info (program, PID), exit code, breakpoint state maps, output buffer
-- [ ] Implement `CheckState(allowed ...State) error` for tool state guards
-- [ ] Implement `SetState(State)` with mutex protection
-- [ ] Implement `Reset()` to return to idle (clears all session state)
+- [x] Define `State` type: `idle`, `configuring`, `stopped`, `running`, `terminated`
+- [x] Implement `SessionManager` struct: holds `*dap.Client`, `State`, process info (program, PID), exit code, breakpoint state maps, output buffer
+- [x] Implement `CheckState(allowed ...State) error` for tool state guards
+- [x] Implement `SetState(State)` with mutex protection
+- [x] Implement `Reset()` to return to idle (clears all session state)
 
 ## 2.2: MCP server skeleton + stdio transport
 
