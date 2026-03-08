@@ -2,8 +2,10 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	godap "github.com/google/go-dap"
@@ -11,6 +13,148 @@ import (
 
 	"github.com/danweinerdev/lldb-debug-mcp/internal/session"
 )
+
+func (t *Tools) handleReadMemory(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// 1. State guard: must be stopped.
+	if err := t.session.CheckState(session.StateStopped); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// 2. Parse required parameters.
+	address, err := request.RequireString("address")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("missing required parameter: %s", err)), nil
+	}
+
+	count, err := request.RequireInt("count")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("missing required parameter: %s", err)), nil
+	}
+
+	// 3. Normalize address: ensure "0x" prefix for DAP.
+	if !strings.HasPrefix(address, "0x") && !strings.HasPrefix(address, "0X") {
+		address = "0x" + address
+	}
+
+	// 4. Send ReadMemoryRequest.
+	req := &godap.ReadMemoryRequest{}
+	req.Type = "request"
+	req.Command = "readMemory"
+	req.Arguments = godap.ReadMemoryArguments{
+		MemoryReference: address,
+		Count:           count,
+	}
+
+	resp, err := t.session.Client().Send(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("readMemory request failed: %s", err)), nil
+	}
+
+	// 5. Parse response.
+	memResp, ok := resp.(*godap.ReadMemoryResponse)
+	if !ok {
+		return mcp.NewToolResultError(fmt.Sprintf("unexpected readMemory response type: %T", resp)), nil
+	}
+	if !memResp.Success {
+		return mcp.NewToolResultError(fmt.Sprintf("readMemory failed: %s", memResp.Message)), nil
+	}
+
+	// 6. Handle empty data.
+	if memResp.Body.Data == "" {
+		result := map[string]any{
+			"address":    memResp.Body.Address,
+			"bytes_read": 0,
+		}
+		resultJSON, err := json.Marshal(result)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %s", err)), nil
+		}
+		return mcp.NewToolResultText(string(resultJSON)), nil
+	}
+
+	// 7. Decode base64 data.
+	data, err := base64.StdEncoding.DecodeString(memResp.Body.Data)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to decode memory data: %s", err)), nil
+	}
+
+	// 8. Parse the starting address for hex dump formatting.
+	addrStr := strings.TrimPrefix(strings.TrimPrefix(address, "0x"), "0X")
+	startAddr, err := strconv.ParseUint(addrStr, 16, 64)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to parse address: %s", err)), nil
+	}
+
+	// 9. Format as hex dump (rows of 16 bytes).
+	hexDump := formatHexDump(data, startAddr)
+
+	// 10. Return JSON.
+	result := map[string]any{
+		"address":    memResp.Body.Address,
+		"bytes_read": len(data),
+		"hex_dump":   hexDump,
+	}
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %s", err)), nil
+	}
+	return mcp.NewToolResultText(string(resultJSON)), nil
+}
+
+// formatHexDump formats raw bytes as a hex dump with 16 bytes per row.
+// Each row contains an address column, hex bytes (split into two groups of 8),
+// and an ASCII representation. Non-printable characters are shown as '.'.
+//
+// Example output:
+//
+//	0x7fff5000: 48 65 6c 6c 6f 20 57 6f  72 6c 64 21 00 00 00 00  |Hello World!....|
+func formatHexDump(data []byte, startAddr uint64) string {
+	var sb strings.Builder
+	for offset := 0; offset < len(data); offset += 16 {
+		// Address column.
+		fmt.Fprintf(&sb, "0x%08x: ", startAddr+uint64(offset))
+
+		// Hex bytes.
+		end := offset + 16
+		if end > len(data) {
+			end = len(data)
+		}
+		row := data[offset:end]
+
+		for i := 0; i < 16; i++ {
+			if i == 8 {
+				sb.WriteByte(' ')
+			}
+			if i < len(row) {
+				fmt.Fprintf(&sb, "%02x ", row[i])
+			} else {
+				sb.WriteString("   ")
+			}
+		}
+
+		// ASCII representation.
+		sb.WriteString(" |")
+		for i := 0; i < 16; i++ {
+			if i < len(row) {
+				b := row[i]
+				if b >= 0x20 && b <= 0x7e {
+					sb.WriteByte(b)
+				} else {
+					sb.WriteByte('.')
+				}
+			} else {
+				sb.WriteByte(' ')
+			}
+		}
+		sb.WriteByte('|')
+
+		// Add newline between rows (not after last).
+		if offset+16 < len(data) {
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String()
+}
 
 func (t *Tools) handleDisassemble(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// 1. State guard: must be stopped.

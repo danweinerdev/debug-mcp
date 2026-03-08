@@ -3,8 +3,6 @@
 package tools
 
 import (
-	"context"
-
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
@@ -177,10 +175,7 @@ func (t *Tools) Register(s *server.MCPServer) {
 
 // --- Advanced handlers ---
 
-func (t *Tools) handleReadMemory(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
-
+// handleReadMemory is implemented in memory.go.
 // handleDisassemble is implemented in memory.go.
 
 // handleRunCommand is implemented in run_command.go.
