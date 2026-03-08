@@ -148,9 +148,7 @@ func (t *Tools) Register(s *server.MCPServer) {
 
 // --- Session management handlers ---
 
-func (t *Tools) handleAttach(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleAttach is implemented in attach.go.
 
 // --- Breakpoint handlers ---
 
