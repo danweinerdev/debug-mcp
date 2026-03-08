@@ -685,3 +685,374 @@ func TestCrashHandling(t *testing.T) {
 		t.Errorf("expected run_command 'bt' result to contain 'main', got: %q", resultText)
 	}
 }
+
+// --- End-to-end debugging workflow test ---
+
+// TestEndToEndDebuggingWorkflow exercises a realistic agent debugging scenario:
+// launch, set breakpoint, continue, inspect, step, evaluate, run_command,
+// manage breakpoints, and continue to exit.
+func TestEndToEndDebuggingWorkflow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	fixture := testFixturePath(t, "loop")
+	loopSource := testFixturePath(t, "loop.c")
+
+	tools, _ := newTestTools(t)
+	t.Cleanup(func() { disconnectCleanup(t, tools) })
+
+	// ---------------------------------------------------------------
+	// Step 1: Launch loop with stop_on_entry=true.
+	// ---------------------------------------------------------------
+	launchData := launchFixture(t, tools, fixture)
+	if launchData["status"] != "launched" {
+		t.Fatalf("step 1: launch status: got %q, want %q", launchData["status"], "launched")
+	}
+	if launchData["state"] != "stopped" {
+		t.Fatalf("step 1: launch state: got %q, want %q", launchData["state"], "stopped")
+	}
+	t.Log("step 1 passed: launched and stopped on entry")
+
+	// ---------------------------------------------------------------
+	// Step 2: Set breakpoint at loop.c line 6 (sum += i).
+	// ---------------------------------------------------------------
+	var firstBreakpointID float64
+	{
+		req := makeCallToolRequest(map[string]any{
+			"file": loopSource,
+			"line": float64(6),
+		})
+		result, err := tools.handleSetBreakpoint(ctx, req)
+		if err != nil {
+			t.Fatalf("step 2: handleSetBreakpoint error: %v", err)
+		}
+		if result.IsError {
+			text := result.Content[0].(mcp.TextContent).Text
+			t.Fatalf("step 2: handleSetBreakpoint tool error: %s", text)
+		}
+		bpData := parseToolResult(t, result)
+		bpID, ok := bpData["breakpoint_id"].(float64)
+		if !ok {
+			t.Fatalf("step 2: expected breakpoint_id in response, got: %v", bpData)
+		}
+		firstBreakpointID = bpID
+		t.Logf("step 2 passed: set breakpoint id=%v at line 6", firstBreakpointID)
+	}
+
+	// ---------------------------------------------------------------
+	// Step 3: Continue to breakpoint.
+	// ---------------------------------------------------------------
+	{
+		continueData := callContinue(t, tools)
+		status, _ := continueData["status"].(string)
+		if status != "stopped" {
+			t.Fatalf("step 3: expected status 'stopped', got %q", status)
+		}
+		reason, _ := continueData["reason"].(string)
+		if !strings.Contains(reason, "breakpoint") {
+			t.Fatalf("step 3: expected stop reason containing 'breakpoint', got %q", reason)
+		}
+		t.Logf("step 3 passed: continued and hit breakpoint (reason=%q)", reason)
+	}
+
+	// ---------------------------------------------------------------
+	// Step 4: Backtrace -- verify at least 1 frame with "main".
+	// ---------------------------------------------------------------
+	{
+		req := makeCallToolRequest(nil)
+		result, err := tools.handleBacktrace(ctx, req)
+		if err != nil {
+			t.Fatalf("step 4: handleBacktrace error: %v", err)
+		}
+		if result.IsError {
+			text := result.Content[0].(mcp.TextContent).Text
+			t.Fatalf("step 4: handleBacktrace tool error: %s", text)
+		}
+		btData := parseToolResult(t, result)
+		framesRaw, ok := btData["frames"].([]any)
+		if !ok || len(framesRaw) == 0 {
+			t.Fatalf("step 4: expected non-empty frames array, got: %v", btData["frames"])
+		}
+		foundMain := false
+		for _, frameRaw := range framesRaw {
+			frame, ok := frameRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := frame["name"].(string)
+			if strings.Contains(name, "main") {
+				foundMain = true
+				break
+			}
+		}
+		if !foundMain {
+			t.Fatalf("step 4: no frame with 'main' found in backtrace: %v", framesRaw)
+		}
+		t.Log("step 4 passed: backtrace contains 'main' frame")
+	}
+
+	// ---------------------------------------------------------------
+	// Step 5: Variables -- verify "i" and "sum" exist in locals.
+	// ---------------------------------------------------------------
+	{
+		req := makeCallToolRequest(nil)
+		result, err := tools.handleVariables(ctx, req)
+		if err != nil {
+			t.Fatalf("step 5: handleVariables error: %v", err)
+		}
+		if result.IsError {
+			text := result.Content[0].(mcp.TextContent).Text
+			t.Fatalf("step 5: handleVariables tool error: %s", text)
+		}
+		varData := parseToolResult(t, result)
+		varsRaw, ok := varData["variables"].([]any)
+		if !ok {
+			t.Fatalf("step 5: expected variables array, got: %v", varData["variables"])
+		}
+		foundI := false
+		foundSum := false
+		for _, v := range varsRaw {
+			varEntry, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := varEntry["name"].(string)
+			if name == "i" {
+				foundI = true
+			}
+			if name == "sum" {
+				foundSum = true
+			}
+		}
+		if !foundI {
+			t.Fatalf("step 5: variable 'i' not found in locals: %v", varsRaw)
+		}
+		if !foundSum {
+			t.Fatalf("step 5: variable 'sum' not found in locals: %v", varsRaw)
+		}
+		t.Log("step 5 passed: found variables 'i' and 'sum'")
+	}
+
+	// ---------------------------------------------------------------
+	// Step 6: Step over 3 times, verify each succeeds (still in loop.c).
+	// ---------------------------------------------------------------
+	for stepNum := 1; stepNum <= 3; stepNum++ {
+		req := makeCallToolRequest(nil)
+		result, err := tools.handleStepOver(ctx, req)
+		if err != nil {
+			t.Fatalf("step 6.%d: handleStepOver error: %v", stepNum, err)
+		}
+		if result.IsError {
+			text := result.Content[0].(mcp.TextContent).Text
+			t.Fatalf("step 6.%d: handleStepOver tool error: %s", stepNum, text)
+		}
+		stepData := parseToolResult(t, result)
+		status, _ := stepData["status"].(string)
+		if status != "stopped" {
+			t.Fatalf("step 6.%d: expected status 'stopped' after step, got %q", stepNum, status)
+		}
+		t.Logf("step 6.%d passed: step over completed", stepNum)
+	}
+	t.Log("step 6 passed: all 3 step overs completed")
+
+	// ---------------------------------------------------------------
+	// Step 7: Evaluate expression "i + 1", verify numeric result.
+	// ---------------------------------------------------------------
+	{
+		req := makeCallToolRequest(map[string]any{
+			"expression": "i + 1",
+		})
+		result, err := tools.handleEvaluate(ctx, req)
+		if err != nil {
+			t.Fatalf("step 7: handleEvaluate error: %v", err)
+		}
+		if result.IsError {
+			text := result.Content[0].(mcp.TextContent).Text
+			t.Fatalf("step 7: handleEvaluate tool error: %s", text)
+		}
+		evalData := parseToolResult(t, result)
+		evalResult, ok := evalData["result"].(string)
+		if !ok {
+			t.Fatalf("step 7: expected 'result' string in evaluate response, got: %v", evalData)
+		}
+		// The result should contain a numeric value (e.g. "1", "2", etc.).
+		hasDigit := false
+		for _, ch := range evalResult {
+			if ch >= '0' && ch <= '9' {
+				hasDigit = true
+				break
+			}
+		}
+		if !hasDigit {
+			t.Fatalf("step 7: expected numeric value in evaluate result, got %q", evalResult)
+		}
+		t.Logf("step 7 passed: evaluate 'i + 1' = %q", evalResult)
+	}
+
+	// ---------------------------------------------------------------
+	// Step 8: Run command "register read", verify non-empty result.
+	// ---------------------------------------------------------------
+	{
+		req := makeCallToolRequest(map[string]any{
+			"command": "register read",
+		})
+		result, err := tools.handleRunCommand(ctx, req)
+		if err != nil {
+			t.Fatalf("step 8: handleRunCommand error: %v", err)
+		}
+		if result.IsError {
+			text := result.Content[0].(mcp.TextContent).Text
+			t.Fatalf("step 8: handleRunCommand tool error: %s", text)
+		}
+		rcData := parseToolResult(t, result)
+		rcResult, ok := rcData["result"].(string)
+		if !ok || rcResult == "" {
+			t.Fatalf("step 8: expected non-empty 'result' from register read, got: %v", rcData)
+		}
+		t.Logf("step 8 passed: register read returned %d bytes of output", len(rcResult))
+	}
+
+	// ---------------------------------------------------------------
+	// Step 9: Set second breakpoint at line 9 (printf("final sum=...")).
+	// ---------------------------------------------------------------
+	var secondBreakpointID float64
+	{
+		req := makeCallToolRequest(map[string]any{
+			"file": loopSource,
+			"line": float64(9),
+		})
+		result, err := tools.handleSetBreakpoint(ctx, req)
+		if err != nil {
+			t.Fatalf("step 9: handleSetBreakpoint error: %v", err)
+		}
+		if result.IsError {
+			text := result.Content[0].(mcp.TextContent).Text
+			t.Fatalf("step 9: handleSetBreakpoint tool error: %s", text)
+		}
+		bpData := parseToolResult(t, result)
+		bpID, ok := bpData["breakpoint_id"].(float64)
+		if !ok {
+			t.Fatalf("step 9: expected breakpoint_id in response, got: %v", bpData)
+		}
+		secondBreakpointID = bpID
+		t.Logf("step 9 passed: set second breakpoint id=%v at line 9", secondBreakpointID)
+	}
+
+	// ---------------------------------------------------------------
+	// Step 10: Continue to second breakpoint. The loop may still have
+	// iterations remaining, so we may hit the first breakpoint (line 6)
+	// several times before reaching the second breakpoint (line 9).
+	// Keep continuing until we hit the second breakpoint.
+	// ---------------------------------------------------------------
+	{
+		hitSecond := false
+		for attempts := 0; attempts < 20; attempts++ {
+			continueData := callContinue(t, tools)
+			status, _ := continueData["status"].(string)
+			if status != "stopped" {
+				t.Fatalf("step 10: expected status 'stopped', got %q", status)
+			}
+			// Check if we hit the second breakpoint.
+			if hitIDs, ok := continueData["hit_breakpoint_ids"].([]any); ok {
+				for _, id := range hitIDs {
+					if idFloat, ok := id.(float64); ok && idFloat == secondBreakpointID {
+						hitSecond = true
+						break
+					}
+				}
+			}
+			if hitSecond {
+				break
+			}
+			t.Logf("step 10: hit breakpoint (not second), continuing...")
+		}
+		if !hitSecond {
+			t.Fatal("step 10: never hit the second breakpoint after 20 continues")
+		}
+		t.Log("step 10 passed: continued and hit second breakpoint")
+	}
+
+	// ---------------------------------------------------------------
+	// Step 11: Remove first breakpoint by ID.
+	// ---------------------------------------------------------------
+	{
+		req := makeCallToolRequest(map[string]any{
+			"breakpoint_id": firstBreakpointID,
+		})
+		result, err := tools.handleRemoveBreakpoint(ctx, req)
+		if err != nil {
+			t.Fatalf("step 11: handleRemoveBreakpoint error: %v", err)
+		}
+		if result.IsError {
+			text := result.Content[0].(mcp.TextContent).Text
+			t.Fatalf("step 11: handleRemoveBreakpoint tool error: %s", text)
+		}
+		rmData := parseToolResult(t, result)
+		removed, ok := rmData["removed"].(bool)
+		if !ok || !removed {
+			t.Fatalf("step 11: expected removed=true, got: %v", rmData)
+		}
+		t.Logf("step 11 passed: removed breakpoint id=%v", firstBreakpointID)
+	}
+
+	// ---------------------------------------------------------------
+	// Step 12: List breakpoints -- should have exactly 1 (second BP).
+	// ---------------------------------------------------------------
+	{
+		req := makeCallToolRequest(nil)
+		result, err := tools.handleListBreakpoints(ctx, req)
+		if err != nil {
+			t.Fatalf("step 12: handleListBreakpoints error: %v", err)
+		}
+		if result.IsError {
+			text := result.Content[0].(mcp.TextContent).Text
+			t.Fatalf("step 12: handleListBreakpoints tool error: %s", text)
+		}
+		bpListData := parseToolResult(t, result)
+		count, ok := bpListData["count"].(float64)
+		if !ok {
+			t.Fatalf("step 12: expected 'count' in list breakpoints response, got: %v", bpListData)
+		}
+		if int(count) != 1 {
+			t.Fatalf("step 12: expected 1 breakpoint remaining, got %d (data: %v)", int(count), bpListData)
+		}
+		// Verify the remaining breakpoint is the second one.
+		bpsRaw, ok := bpListData["breakpoints"].([]any)
+		if !ok || len(bpsRaw) != 1 {
+			t.Fatalf("step 12: expected 1 breakpoint entry, got: %v", bpListData["breakpoints"])
+		}
+		bpEntry, ok := bpsRaw[0].(map[string]any)
+		if !ok {
+			t.Fatalf("step 12: breakpoint entry is not a map: %v", bpsRaw[0])
+		}
+		remainingID, ok := bpEntry["id"].(float64)
+		if !ok {
+			t.Fatalf("step 12: expected 'id' in breakpoint entry, got: %v", bpEntry)
+		}
+		if remainingID != secondBreakpointID {
+			t.Fatalf("step 12: remaining breakpoint id=%v, expected %v", remainingID, secondBreakpointID)
+		}
+		t.Logf("step 12 passed: 1 breakpoint remaining (id=%v)", remainingID)
+	}
+
+	// ---------------------------------------------------------------
+	// Step 13: Continue to exit.
+	// ---------------------------------------------------------------
+	{
+		continueData := callContinue(t, tools)
+		status, _ := continueData["status"].(string)
+		if status != "exited" {
+			t.Fatalf("step 13: expected status 'exited', got %q (data: %v)", status, continueData)
+		}
+		exitCode, ok := continueData["exit_code"].(float64)
+		if !ok {
+			t.Fatalf("step 13: expected exit_code, got: %v", continueData)
+		}
+		if int(exitCode) != 0 {
+			t.Fatalf("step 13: expected exit_code=0, got %d", int(exitCode))
+		}
+		t.Log("step 13 passed: program exited with code 0")
+	}
+
+	t.Log("end-to-end debugging workflow completed successfully")
+}
