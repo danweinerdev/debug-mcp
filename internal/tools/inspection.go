@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	godap "github.com/google/go-dap"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -158,6 +159,123 @@ func (t *Tools) handleEvaluate(ctx context.Context, request mcp.CallToolRequest)
 	if evalResp.Body.VariablesReference > 0 {
 		result["has_children"] = true
 		result["variables_reference"] = evalResp.Body.VariablesReference
+	}
+
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %s", err)), nil
+	}
+	return mcp.NewToolResultText(string(resultJSON)), nil
+}
+
+func (t *Tools) handleVariables(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// 1. State guard: must be stopped.
+	if err := t.session.CheckState(session.StateStopped); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// 2. Parse parameters.
+	frameIndex := 0
+	if raw, ok := request.GetArguments()["frame_index"]; ok && raw != nil {
+		if fi, ok := raw.(float64); ok {
+			frameIndex = int(fi)
+		}
+	}
+
+	scope := "local"
+	if raw, ok := request.GetArguments()["scope"]; ok && raw != nil {
+		if s, ok := raw.(string); ok && s != "" {
+			scope = s
+		}
+	}
+
+	// Default depth: 2 for local/register, 1 for global.
+	depth := 2
+	if scope == "global" {
+		depth = 1
+	}
+	if raw, ok := request.GetArguments()["depth"]; ok && raw != nil {
+		if d, ok := raw.(float64); ok && d >= 0 {
+			depth = int(d)
+		}
+	}
+
+	filter := ""
+	if raw, ok := request.GetArguments()["filter"]; ok && raw != nil {
+		if f, ok := raw.(string); ok {
+			filter = f
+		}
+	}
+
+	// 3. Resolve frame ID from session frame mapping.
+	frameMapping := t.session.FrameMapping()
+	frameID, ok := frameMapping[frameIndex]
+	if !ok {
+		frameID = frameIndex
+	}
+
+	// 4. Send ScopesRequest.
+	scopesReq := &godap.ScopesRequest{}
+	scopesReq.Type = "request"
+	scopesReq.Command = "scopes"
+	scopesReq.Arguments = godap.ScopesArguments{
+		FrameId: frameID,
+	}
+
+	resp, err := t.session.Client().Send(ctx, scopesReq)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("scopes request failed: %s", err)), nil
+	}
+
+	// 5. Parse ScopesResponse.
+	scopesResp, ok := resp.(*godap.ScopesResponse)
+	if !ok {
+		return mcp.NewToolResultError(fmt.Sprintf("unexpected scopes response type: %T", resp)), nil
+	}
+	if !scopesResp.Success {
+		return mcp.NewToolResultError(fmt.Sprintf("scopes failed: %s", scopesResp.Message)), nil
+	}
+
+	// Find the matching scope.
+	var targetScope *godap.Scope
+	for i := range scopesResp.Body.Scopes {
+		s := &scopesResp.Body.Scopes[i]
+		switch scope {
+		case "local":
+			if strings.EqualFold(s.Name, "Locals") || strings.EqualFold(s.Name, "Local") {
+				targetScope = s
+			}
+		case "global":
+			if strings.EqualFold(s.Name, "Globals") || strings.EqualFold(s.Name, "Global") {
+				targetScope = s
+			}
+		case "register":
+			if strings.EqualFold(s.Name, "Registers") || strings.EqualFold(s.Name, "Register") {
+				targetScope = s
+			}
+		}
+		if targetScope != nil {
+			break
+		}
+	}
+
+	if targetScope == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("scope '%s' not found in frame %d", scope, frameIndex)), nil
+	}
+
+	// 6. Call FlattenVariables.
+	maxCount := 100
+	vars, truncated, err := FlattenVariables(ctx, t.session.Client(), targetScope.VariablesReference, depth, maxCount, filter)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to fetch variables: %s", err)), nil
+	}
+
+	// 7. Return JSON.
+	result := map[string]any{
+		"variables": vars,
+		"count":     len(vars),
+		"scope":     scope,
+		"truncated": truncated,
 	}
 
 	resultJSON, err := json.Marshal(result)
