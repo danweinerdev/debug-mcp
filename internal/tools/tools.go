@@ -181,8 +181,6 @@ func (t *Tools) handleReadMemory(_ context.Context, _ mcp.CallToolRequest) (*mcp
 	return mcp.NewToolResultError("not implemented"), nil
 }
 
-func (t *Tools) handleDisassemble(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleDisassemble is implemented in memory.go.
 
 // handleRunCommand is implemented in run_command.go.
