@@ -5,6 +5,7 @@ package session
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -360,4 +361,159 @@ func (s *SessionManager) SetFrameMapping(mapping map[int]int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.frameMapping = mapping
+}
+
+// --- Breakpoint methods ---
+
+// AddSourceBreakpoint creates a source breakpoint and adds it to the
+// tracked breakpoints for the given file.
+func (s *SessionManager) AddSourceBreakpoint(file string, line int, condition string) godap.SourceBreakpoint {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bp := godap.SourceBreakpoint{Line: line, Condition: condition}
+	s.sourceBreakpoints[file] = append(s.sourceBreakpoints[file], bp)
+	return bp
+}
+
+// AddFunctionBreakpoint creates a function breakpoint and adds it to
+// the tracked function breakpoints.
+func (s *SessionManager) AddFunctionBreakpoint(name string, condition string) godap.FunctionBreakpoint {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bp := godap.FunctionBreakpoint{Name: name, Condition: condition}
+	s.functionBreakpoints = append(s.functionBreakpoints, bp)
+	return bp
+}
+
+// AddBreakpointResponse stores resolved breakpoint metadata by ID.
+func (s *SessionManager) AddBreakpointResponse(info BreakpointInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.breakpointResponses[info.ID] = info
+}
+
+// RemoveBreakpointByID removes a tracked breakpoint by its DAP ID.
+// It returns the file path for source breakpoints, wasFunction=true for
+// function breakpoints, or an error if the ID is not found.
+func (s *SessionManager) RemoveBreakpointByID(id int) (filePath string, wasFunction bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	info, ok := s.breakpointResponses[id]
+	if !ok {
+		return "", false, fmt.Errorf("breakpoint ID %d not found", id)
+	}
+
+	switch info.Type {
+	case "source":
+		filePath = info.File
+		bps := s.sourceBreakpoints[filePath]
+		for i, bp := range bps {
+			if bp.Line == info.Line {
+				s.sourceBreakpoints[filePath] = append(bps[:i], bps[i+1:]...)
+				break
+			}
+		}
+	case "function":
+		wasFunction = true
+		for i, bp := range s.functionBreakpoints {
+			if bp.Name == info.Function {
+				s.functionBreakpoints = append(s.functionBreakpoints[:i], s.functionBreakpoints[i+1:]...)
+				break
+			}
+		}
+	}
+
+	delete(s.breakpointResponses, id)
+	return filePath, wasFunction, nil
+}
+
+// ListBreakpoints returns all tracked breakpoints sorted by ID.
+func (s *SessionManager) ListBreakpoints() []BreakpointInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make([]BreakpointInfo, 0, len(s.breakpointResponses))
+	for _, info := range s.breakpointResponses {
+		result = append(result, info)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID < result[j].ID
+	})
+	return result
+}
+
+// SourceBreakpointsForFile returns a copy of the source breakpoints for a file.
+func (s *SessionManager) SourceBreakpointsForFile(file string) []godap.SourceBreakpoint {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	bps := s.sourceBreakpoints[file]
+	if len(bps) == 0 {
+		return nil
+	}
+	cp := make([]godap.SourceBreakpoint, len(bps))
+	copy(cp, bps)
+	return cp
+}
+
+// AllFunctionBreakpoints returns a copy of the function breakpoint list.
+func (s *SessionManager) AllFunctionBreakpoints() []godap.FunctionBreakpoint {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.functionBreakpoints) == 0 {
+		return nil
+	}
+	cp := make([]godap.FunctionBreakpoint, len(s.functionBreakpoints))
+	copy(cp, s.functionBreakpoints)
+	return cp
+}
+
+// AddPendingSourceBreakpoint adds a source breakpoint to the pending buffer.
+// Pending breakpoints are flushed to active state on InitializedEvent.
+func (s *SessionManager) AddPendingSourceBreakpoint(file string, line int, condition string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bp := godap.SourceBreakpoint{Line: line, Condition: condition}
+	s.pendingSourceBPs[file] = append(s.pendingSourceBPs[file], bp)
+}
+
+// AddPendingFunctionBreakpoint adds a function breakpoint to the pending buffer.
+// Pending breakpoints are flushed to active state on InitializedEvent.
+func (s *SessionManager) AddPendingFunctionBreakpoint(name string, condition string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bp := godap.FunctionBreakpoint{Name: name, Condition: condition}
+	s.pendingFunctionBPs = append(s.pendingFunctionBPs, bp)
+}
+
+// FlushPendingBreakpoints moves pending breakpoints to active state and
+// returns them so the caller can send DAP requests. Pending buffers are
+// cleared after the flush.
+func (s *SessionManager) FlushPendingBreakpoints() (sourceFiles map[string][]godap.SourceBreakpoint, funcBPs []godap.FunctionBreakpoint) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sourceFiles = s.pendingSourceBPs
+	funcBPs = s.pendingFunctionBPs
+
+	// Move pending source breakpoints to active.
+	for file, bps := range sourceFiles {
+		s.sourceBreakpoints[file] = append(s.sourceBreakpoints[file], bps...)
+	}
+
+	// Move pending function breakpoints to active.
+	s.functionBreakpoints = append(s.functionBreakpoints, funcBPs...)
+
+	// Clear pending buffers.
+	s.pendingSourceBPs = make(map[string][]godap.SourceBreakpoint)
+	s.pendingFunctionBPs = nil
+
+	return sourceFiles, funcBPs
 }
