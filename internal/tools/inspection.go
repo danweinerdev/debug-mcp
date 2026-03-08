@@ -12,6 +12,56 @@ import (
 	"github.com/danweinerdev/lldb-debug-mcp/internal/session"
 )
 
+// resolveFrameID returns the DAP frame ID for the given user-facing frame index.
+// If the frame mapping is empty or doesn't contain the requested index, it sends
+// a StackTraceRequest to populate the mapping. This ensures that tools like
+// variables and evaluate work without requiring a prior backtrace call.
+func (t *Tools) resolveFrameID(ctx context.Context, frameIndex int) (int, error) {
+	frameMapping := t.session.FrameMapping()
+	if frameID, ok := frameMapping[frameIndex]; ok {
+		return frameID, nil
+	}
+
+	// Frame mapping miss — do an implicit StackTraceRequest to populate it.
+	threadID := 1
+	if lastEvent := t.session.LastStoppedEvent(); lastEvent != nil {
+		threadID = lastEvent.Body.ThreadId
+	}
+
+	req := &godap.StackTraceRequest{}
+	req.Type = "request"
+	req.Command = "stackTrace"
+	req.Arguments = godap.StackTraceArguments{
+		ThreadId: threadID,
+		Levels:   20,
+	}
+
+	resp, err := t.session.Client().Send(ctx, req)
+	if err != nil {
+		return 0, fmt.Errorf("implicit stackTrace request failed: %w", err)
+	}
+
+	stackResp, ok := resp.(*godap.StackTraceResponse)
+	if !ok {
+		return 0, fmt.Errorf("unexpected stackTrace response type: %T", resp)
+	}
+	if !stackResp.Success {
+		return 0, fmt.Errorf("implicit stackTrace failed: %s", stackResp.Message)
+	}
+
+	// Populate frame mapping.
+	newMapping := make(map[int]int)
+	for i, frame := range stackResp.Body.StackFrames {
+		newMapping[i] = frame.Id
+	}
+	t.session.SetFrameMapping(newMapping)
+
+	if frameID, ok := newMapping[frameIndex]; ok {
+		return frameID, nil
+	}
+	return 0, fmt.Errorf("frame index %d out of range (stack has %d frames)", frameIndex, len(stackResp.Body.StackFrames))
+}
+
 func (t *Tools) handleBacktrace(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// 1. State guard: must be stopped.
 	if err := t.session.CheckState(session.StateStopped); err != nil {
@@ -119,12 +169,10 @@ func (t *Tools) handleEvaluate(ctx context.Context, request mcp.CallToolRequest)
 		}
 	}
 
-	// 4. Resolve frame ID from session frame mapping.
-	frameMapping := t.session.FrameMapping()
-	frameID, ok := frameMapping[frameIndex]
-	if !ok {
-		// If no mapping exists, use frameIndex as-is.
-		frameID = frameIndex
+	// 4. Resolve frame ID from session frame mapping (auto-populates if needed).
+	frameID, err := t.resolveFrameID(ctx, frameIndex)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to resolve frame: %s", err)), nil
 	}
 
 	// 5. Send EvaluateRequest.
@@ -207,11 +255,10 @@ func (t *Tools) handleVariables(ctx context.Context, request mcp.CallToolRequest
 		}
 	}
 
-	// 3. Resolve frame ID from session frame mapping.
-	frameMapping := t.session.FrameMapping()
-	frameID, ok := frameMapping[frameIndex]
-	if !ok {
-		frameID = frameIndex
+	// 3. Resolve frame ID from session frame mapping (auto-populates if needed).
+	frameID, err := t.resolveFrameID(ctx, frameIndex)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to resolve frame: %s", err)), nil
 	}
 
 	// 4. Send ScopesRequest.
