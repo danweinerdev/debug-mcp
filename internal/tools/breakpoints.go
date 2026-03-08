@@ -119,3 +119,99 @@ func (t *Tools) handleSetBreakpoint(ctx context.Context, request mcp.CallToolReq
 	}
 	return mcp.NewToolResultText(string(resultJSON)), nil
 }
+
+func (t *Tools) handleSetFunctionBreakpoint(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// 1. State guard: allow in idle (pending) or stopped.
+	if err := t.session.CheckState(session.StateIdle, session.StateStopped); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// 2. Parse parameters.
+	name, err := request.RequireString("name")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("missing required parameter: %s", err)), nil
+	}
+	condition := request.GetString("condition", "")
+
+	// 3. If state is idle, add as pending.
+	if t.session.State() == session.StateIdle {
+		t.session.AddPendingFunctionBreakpoint(name, condition)
+
+		result := map[string]any{
+			"status":    "pending",
+			"function":  name,
+			"condition": condition,
+			"message":   "Function breakpoint will be set when program is launched",
+		}
+		resultJSON, err := json.Marshal(result)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %s", err)), nil
+		}
+		return mcp.NewToolResultText(string(resultJSON)), nil
+	}
+
+	// 4. State is stopped: add and send to DAP.
+	t.session.AddFunctionBreakpoint(name, condition)
+	bps := t.session.AllFunctionBreakpoints()
+
+	req := &godap.SetFunctionBreakpointsRequest{}
+	req.Type = "request"
+	req.Command = "setFunctionBreakpoints"
+	req.Arguments = godap.SetFunctionBreakpointsArguments{
+		Breakpoints: bps,
+	}
+
+	resp, err := t.session.Client().Send(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("setFunctionBreakpoints request failed: %s", err)), nil
+	}
+
+	fbpResp, ok := resp.(*godap.SetFunctionBreakpointsResponse)
+	if !ok {
+		return mcp.NewToolResultError(fmt.Sprintf("unexpected response type: %T", resp)), nil
+	}
+	if !fbpResp.Success {
+		return mcp.NewToolResultError(fmt.Sprintf("setFunctionBreakpoints failed: %s", fbpResp.Message)), nil
+	}
+
+	// The response breakpoints correspond positionally to the request breakpoints.
+	// Our new breakpoint is the last one added.
+	var id int
+	var verified bool
+	var message string
+
+	if len(fbpResp.Body.Breakpoints) > 0 {
+		bp := fbpResp.Body.Breakpoints[len(fbpResp.Body.Breakpoints)-1]
+		id = bp.Id
+		verified = bp.Verified
+		message = bp.Message
+
+		t.session.AddBreakpointResponse(session.BreakpointInfo{
+			ID:        id,
+			Type:      "function",
+			Function:  name,
+			Condition: condition,
+			Verified:  verified,
+		})
+	}
+
+	if message == "" {
+		if verified {
+			message = fmt.Sprintf("Breakpoint set on function '%s'", name)
+		} else {
+			message = fmt.Sprintf("Breakpoint on function '%s' pending verification", name)
+		}
+	}
+
+	result := map[string]any{
+		"breakpoint_id": id,
+		"verified":      verified,
+		"function":      name,
+		"message":       message,
+	}
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal result: %s", err)), nil
+	}
+	return mcp.NewToolResultText(string(resultJSON)), nil
+}
