@@ -198,10 +198,6 @@ func (t *Tools) handlePause(_ context.Context, _ mcp.CallToolRequest) (*mcp.Call
 
 // --- Inspection handlers ---
 
-func (t *Tools) handleStatus(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
-
 func (t *Tools) handleBacktrace(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultError("not implemented"), nil
 }
