@@ -175,6 +175,12 @@ func (c *Client) ReadLoop() {
 			})
 			c.cancelAllPending(fmt.Errorf("dap.Client: read loop terminated: %w", err))
 			c.stopWaiter.Cancel()
+			// Notify the session that the debug adapter connection is lost,
+			// so it can transition to the terminated state. This handles
+			// cases where the subprocess is killed externally (crash recovery).
+			if c.onTerminated != nil {
+				c.onTerminated()
+			}
 			return
 		}
 

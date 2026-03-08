@@ -752,6 +752,12 @@ func TestReadLoopEOF(t *testing.T) {
 
 	client := NewClient(bufio.NewReader(clientReadPR), clientWritePW)
 
+	// Track whether onTerminated is called on EOF (crash recovery).
+	var terminated atomic.Bool
+	client.SetOnTerminated(func() {
+		terminated.Store(true)
+	})
+
 	// Drain the write side so SendAsync doesn't block.
 	go func() {
 		reader := bufio.NewReader(clientWritePR)
@@ -818,6 +824,12 @@ func TestReadLoopEOF(t *testing.T) {
 		// Expected.
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for client to close")
+	}
+
+	// Verify onTerminated callback was called on EOF, so the session
+	// can transition to terminated state when the subprocess crashes.
+	if !terminated.Load() {
+		t.Error("expected onTerminated callback to be called on EOF")
 	}
 }
 
