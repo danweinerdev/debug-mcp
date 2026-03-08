@@ -18,7 +18,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "Breakpoints + Execution Control"
-    status: planned
+    status: complete
     doc: "03-Breakpoints-Execution.md"
     depends_on: [2]
   - id: 4
