@@ -13,7 +13,7 @@ phases:
     doc: "01-Foundation.md"
   - id: 2
     title: "Session Lifecycle — MCP Server + Launch/Attach"
-    status: planned
+    status: complete
     doc: "02-Session-Lifecycle.md"
     depends_on: [1]
   - id: 3
