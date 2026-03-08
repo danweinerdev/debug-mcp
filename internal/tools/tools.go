@@ -152,10 +152,6 @@ func (t *Tools) handleAttach(_ context.Context, _ mcp.CallToolRequest) (*mcp.Cal
 	return mcp.NewToolResultError("not implemented"), nil
 }
 
-func (t *Tools) handleDisconnect(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
-
 // --- Breakpoint handlers ---
 
 func (t *Tools) handleSetBreakpoint(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
