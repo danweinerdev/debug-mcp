@@ -91,3 +91,87 @@ func TestHandleContinueStateGuardRejectsNonStopped(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleStepOverStateGuardRejectsNonStopped(t *testing.T) {
+	tests := []struct {
+		name  string
+		state session.State
+	}{
+		{"idle", session.StateIdle},
+		{"configuring", session.StateConfiguring},
+		{"running", session.StateRunning},
+		{"terminated", session.StateTerminated},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := session.NewSessionManager()
+			sm.SetState(tc.state)
+			tools := New(sm)
+
+			result, err := tools.handleStepOver(context.Background(), mcp.CallToolRequest{})
+			if err != nil {
+				t.Fatalf("handleStepOver returned error: %v", err)
+			}
+			if !result.IsError {
+				t.Fatalf("handleStepOver should return tool error when state is %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestHandleStepIntoStateGuardRejectsNonStopped(t *testing.T) {
+	tests := []struct {
+		name  string
+		state session.State
+	}{
+		{"idle", session.StateIdle},
+		{"configuring", session.StateConfiguring},
+		{"running", session.StateRunning},
+		{"terminated", session.StateTerminated},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := session.NewSessionManager()
+			sm.SetState(tc.state)
+			tools := New(sm)
+
+			result, err := tools.handleStepInto(context.Background(), mcp.CallToolRequest{})
+			if err != nil {
+				t.Fatalf("handleStepInto returned error: %v", err)
+			}
+			if !result.IsError {
+				t.Fatalf("handleStepInto should return tool error when state is %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestHandleStepOutStateGuardRejectsNonStopped(t *testing.T) {
+	tests := []struct {
+		name  string
+		state session.State
+	}{
+		{"idle", session.StateIdle},
+		{"configuring", session.StateConfiguring},
+		{"running", session.StateRunning},
+		{"terminated", session.StateTerminated},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := session.NewSessionManager()
+			sm.SetState(tc.state)
+			tools := New(sm)
+
+			result, err := tools.handleStepOut(context.Background(), mcp.CallToolRequest{})
+			if err != nil {
+				t.Fatalf("handleStepOut returned error: %v", err)
+			}
+			if !result.IsError {
+				t.Fatalf("handleStepOut should return tool error when state is %s", tc.name)
+			}
+		})
+	}
+}

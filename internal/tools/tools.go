@@ -161,22 +161,10 @@ func (t *Tools) Register(s *server.MCPServer) {
 // --- Execution control handlers ---
 
 // handleContinue is implemented in execution.go.
-
-func (t *Tools) handleStepOver(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
-
-func (t *Tools) handleStepInto(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
-
-func (t *Tools) handleStepOut(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
-
-func (t *Tools) handlePause(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return mcp.NewToolResultError("not implemented"), nil
-}
+// handleStepOver is implemented in execution.go.
+// handleStepInto is implemented in execution.go.
+// handleStepOut is implemented in execution.go.
+// handlePause is implemented in execution.go.
 
 // --- Inspection handlers ---
 
