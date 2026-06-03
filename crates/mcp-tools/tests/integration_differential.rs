@@ -13,7 +13,10 @@
 //!    parsed JSON **structurally** (object key order/whitespace ignored — `serde_json`
 //!    sorts keys, and the differ walks values), asserting the two recorded intentional
 //!    deviations explicitly (server name `debug` vs `lldb-debug`; `disassemble` default
-//!    20 vs 10). It **skips cleanly** with a clear message when the Go binary is absent.
+//!    20 vs 10). It **skips cleanly** (logging `SKIPPED (NOT compared)`) when the Go binary
+//!    is absent — unless `REQUIRE_GO_DIFFERENTIAL=1`, which turns the absence of the Go
+//!    oracle (or lldb-dap / the Rust binary) into a hard failure so a CI/merge job cannot
+//!    pass while this lane silently no-ops (review finding 6).
 //!
 //! OQ-3 (repl-mode default) is implicitly covered by the `run_command` scenario — a wrong
 //! default flips the backtick prefix, which the diff would catch. OQ-4 (`xcrun`) is
@@ -36,6 +39,14 @@ fn child_env() -> Vec<(String, String)> {
 
 fn child_env_refs(env: &[(String, String)]) -> Vec<(&str, &str)> {
     env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+/// The CI gate (review finding 6): when `REQUIRE_GO_DIFFERENTIAL=1`, the differential lane
+/// is mandatory — a missing Go oracle (or lldb-dap / Rust binary) is a hard failure instead
+/// of a silent skip, so a release/merge job can't pass while the strongest parity lane
+/// no-ops. Any value other than `1` (or unset) leaves the lane free to skip.
+fn require_go_differential() -> bool {
+    std::env::var("REQUIRE_GO_DIFFERENTIAL").is_ok_and(|v| v == "1")
 }
 
 // --- Golden cross-check against the documented response shapes (no Go needed) ---
@@ -186,25 +197,53 @@ async fn golden_response_shapes_over_stdio() {
 #[tokio::test(flavor = "multi_thread")]
 async fn differential_rust_vs_go() {
     if !lldb_dap_available() {
-        eprintln!("SKIP differential_rust_vs_go: lldb-dap not found");
+        // When the differential lane is required, a missing lldb-dap (without which the
+        // lane cannot run) is also a hard failure rather than a silent skip.
+        if require_go_differential() {
+            panic!(
+                "REQUIRE_GO_DIFFERENTIAL=1 but lldb-dap was not found; the differential lane \
+                 requires the adapter and must not skip."
+            );
+        }
+        eprintln!("SKIP differential_rust_vs_go: SKIPPED (NOT compared) — lldb-dap not found");
         return;
     }
     let rust = match rust_binary() {
         Some(b) => b,
         None => {
-            eprintln!("SKIP differential_rust_vs_go: debug-mcp binary not built");
+            if require_go_differential() {
+                panic!(
+                    "REQUIRE_GO_DIFFERENTIAL=1 but the Rust debug-mcp binary was not built; \
+                     build it (cargo build -p debug-mcp) so the differential lane can run."
+                );
+            }
+            eprintln!(
+                "SKIP differential_rust_vs_go: SKIPPED (NOT compared) — debug-mcp binary not built"
+            );
             return;
         }
     };
     let go = match go_reference_binary() {
         Some(b) => b,
         None => {
+            // Honor the CI gate: when REQUIRE_GO_DIFFERENTIAL=1, the absence of the Go
+            // oracle is a hard failure (so a release/merge job can't pass while the
+            // strongest parity lane silently no-ops). Otherwise skip cleanly with a clear
+            // log line that says SKIPPED (not "compared"), for dev sandboxes without Go.
+            if require_go_differential() {
+                panic!(
+                    "REQUIRE_GO_DIFFERENTIAL=1 but the Go reference binary (lldb-debug-mcp) was \
+                     not found. Set GO_DEBUG_MCP_BIN to its path or put lldb-debug-mcp on PATH. \
+                     The differential lane is required in this configuration and must not skip."
+                );
+            }
             eprintln!(
-                "SKIP differential_rust_vs_go: the Go reference binary (lldb-debug-mcp) is not \
-                 available. Go is not installed in this sandbox, so the live differential run is \
-                 skipped; the ported integration scenarios (6.2) are the substantive live parity \
-                 proof, and golden_response_shapes_over_stdio cross-checks the documented shapes. \
-                 Set GO_DEBUG_MCP_BIN or put lldb-debug-mcp on PATH to enable this lane."
+                "SKIP differential_rust_vs_go: SKIPPED (NOT compared) — the Go reference binary \
+                 (lldb-debug-mcp) is not available. Go is not installed in this sandbox, so the \
+                 live differential run is skipped; the ported integration scenarios (6.2) are the \
+                 substantive live parity proof, and golden_response_shapes_over_stdio cross-checks \
+                 the documented shapes. Set GO_DEBUG_MCP_BIN or put lldb-debug-mcp on PATH (and \
+                 optionally REQUIRE_GO_DIFFERENTIAL=1 to make its absence a hard failure)."
             );
             return;
         }

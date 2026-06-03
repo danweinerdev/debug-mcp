@@ -1,0 +1,94 @@
+name: CI
+
+# Two layers, mirroring the Makefile gates:
+#   - hermetic: `make all` (fmt-check + build + clippy + unit tests + seam). Does NOT need
+#     lldb-dap and is NOT full coverage — the integration scenarios are feature-gated and
+#     compile as zero tests here (see the README "Testing" note).
+#   - live: installs lldb + builds the C fixtures + runs `make integration` against real
+#     lldb-dap. Optionally builds the Go oracle from the `main` branch and runs the
+#     differential lane as a required gate (REQUIRE_GO_DIFFERENTIAL=1).
+on:
+  push:
+    branches: [main, rust-rewrite]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  hermetic:
+    name: Hermetic gate (make all)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: make all (fmt-check, build, clippy -D warnings, unit tests, seam)
+        run: make all
+
+  tsan:
+    name: ThreadSanitizer (dap-client concurrency)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (nightly + rust-src)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: make tsan
+        run: make tsan
+
+  live:
+    name: Live lldb-dap integration + differential
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install lldb-dap and a C compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lldb clang
+          # Expose the detected adapter to the server children (detection also falls back
+          # to PATH; this pins the exact binary the runner installed).
+          echo "LLDB_DAP_PATH=$(command -v lldb-dap || true)" >> "$GITHUB_ENV"
+
+      - name: Build the C test fixtures
+        run: make -C testdata
+
+      # The Go oracle lives on the `main` branch (the Rust rewrite deleted it from this
+      # branch). Build it into a worktree so the differential lane has a real reference
+      # binary; if Go or the source is unavailable the step is non-fatal and the lane
+      # falls back to a clean skip (REQUIRE_GO_DIFFERENTIAL is only set when the build
+      # succeeds, so the lane is required exactly when the oracle is actually present).
+      - name: Build the Go oracle from main (best-effort)
+        id: go_oracle
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if ! command -v go >/dev/null 2>&1; then
+            echo "Go toolchain not present; differential lane will skip." >&2
+            exit 0
+          fi
+          git fetch --no-tags --depth 1 origin main
+          git worktree add /tmp/go-oracle origin/main
+          if [ ! -d /tmp/go-oracle/cmd/lldb-debug-mcp ]; then
+            echo "main has no Go server (cmd/lldb-debug-mcp); differential lane will skip." >&2
+            exit 0
+          fi
+          ( cd /tmp/go-oracle && go build -o /tmp/lldb-debug-mcp ./cmd/lldb-debug-mcp )
+          echo "GO_DEBUG_MCP_BIN=/tmp/lldb-debug-mcp" >> "$GITHUB_ENV"
+          echo "built=1" >> "$GITHUB_OUTPUT"
+
+      - name: make integration (live lldb-dap scenarios + golden + differential)
+        run: make integration
+        env:
+          # Make the differential lane a hard requirement only when the Go oracle built;
+          # otherwise it skips cleanly (and the golden lane + ported scenarios still run).
+          REQUIRE_GO_DIFFERENTIAL: ${{ steps.go_oracle.outputs.built == '1' && '1' || '0' }}
