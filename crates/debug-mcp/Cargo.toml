@@ -1,0 +1,20 @@
+[package]
+name = "debug-mcp"
+description = "The debug-mcp binary: registers the backend factory, wires session/tools, rmcp serve(stdio)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "debug-mcp"
+path = "src/main.rs"
+
+[dependencies]
+debugger-core.workspace = true
+dap-client.workspace = true
+lldb-backend.workspace = true
+mcp-session.workspace = true
+mcp-tools.workspace = true
+rmcp.workspace = true
+tokio = { workspace = true }

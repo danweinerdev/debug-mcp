@@ -1,0 +1,39 @@
+[package]
+name = "mcp-tools"
+description = "The 21 MCP tool handlers, Args accessor, response builders, flatten_variables, hex-dump. Depends only on debugger-core + mcp-session (the seam)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# SEAM: must NOT depend on dap-client or lldb-backend.
+[dependencies]
+debugger-core.workspace = true
+mcp-session.workspace = true
+rmcp.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# Integration-suite-only (Phase 6): the live tests in tests/ drive the REAL lldb-dap
+# backend through the shared harness in the `integration-tests` crate (which pulls in
+# `lldb-backend`). This is a DEV-dependency, so it does NOT appear on mcp-tools' normal
+# dependency edge — the seam guarantee (`cargo tree --edges normal` has no lldb-backend)
+# is intact. (A dev-dependency cycle with integration-tests is fine: dev edges don't
+# participate in the normal build graph.)
+integration-tests = { path = "../integration-tests" }
+mcp-session = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Gates the live integration + differential-parity suite (the analog of Go's
+# `//go:build integration` tag). Without it the integration test files compile to empty
+# shells, so `cargo test --workspace` never tries to spawn lldb-dap. The suite requires a
+# real lldb-dap and the compiled C fixtures, and skips cleanly when they are absent.
+integration = []
