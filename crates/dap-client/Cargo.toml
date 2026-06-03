@@ -1,0 +1,14 @@
+[package]
+name = "dap-client"
+description = "Generic DAP wire transport: Content-Length framing, seq correlation, pending map, read-loop, stop-waiter. Below the seam."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+debugger-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
