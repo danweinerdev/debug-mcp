@@ -13,6 +13,16 @@
 //! returns a single `BackendError`, so the per-step prefix must travel in the message.
 //! Go origin: `internal/tools/launch.go`, `internal/tools/attach.go`, and the
 //! DAP-issuing parts of the other tool files.
+//!
+//! **Empty-message fallback (deviation from the Go oracle).** lldb-dap often reports a
+//! `success=false` handshake response with an *empty* `message`, writing the real cause
+//! (bad program path, permission denied) only to stderr. The Go server surfaced the bare
+//! `launch failed: ` in that case; here [`LldbBackend::diagnostic`] folds the captured
+//! stderr ring into the error instead, so the user-facing string is never empty. A
+//! non-empty DAP message is always preferred and used verbatim (full Go parity on that
+//! path).
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use dap_client::{Client, DapMessage, Request, Response};
@@ -26,6 +36,7 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::args::{attach_args_to_value, launch_args_to_value, LldbAttachArgs, LldbLaunchArgs};
+use crate::subprocess::StderrBuffer;
 use crate::{body, requests};
 
 /// The lldb-dap backend over a `dap-client::Client`. Generic over the writer `W` (the
@@ -44,6 +55,12 @@ pub struct LldbBackend<W> {
     /// Surfaced via [`DebuggerBackend::debugger_pid`] so the launch/attach handler can
     /// record it on the session (Go `SetPID(sub.Cmd.Process.Pid)`).
     pid: Option<i64>,
+    /// The lldb-dap stderr ring (last 4 KB). When a handshake fails with an empty DAP
+    /// `message` (lldb-dap commonly reports the real cause — bad program path, missing
+    /// permissions — only on stderr), this is folded into the error so the user-facing
+    /// string is never the bare `launch failed: ` / `attach failed: `. `None` in
+    /// scripted-peer tests with no real subprocess.
+    stderr: Option<Arc<StderrBuffer>>,
 }
 
 impl<W> LldbBackend<W>
@@ -54,13 +71,35 @@ where
     /// teardown. Used by the factory after spawn + read-loop start. The child's pid is
     /// snapshotted now (before any `wait`, which would invalidate `Child::id()`).
     pub fn new(client: Client<W>, is_lldb_dap: bool, child: Option<Child>) -> Self {
+        Self::with_stderr(client, is_lldb_dap, child, None)
+    }
+
+    /// Like [`Self::new`] but also wires the lldb-dap stderr ring, so an empty-message
+    /// handshake failure can fall back to the captured stderr (the factory uses this; the
+    /// scripted-peer tests construct one directly to exercise the fallback).
+    pub fn with_stderr(
+        client: Client<W>,
+        is_lldb_dap: bool,
+        child: Option<Child>,
+        stderr: Option<Arc<StderrBuffer>>,
+    ) -> Self {
         let pid = child.as_ref().and_then(|c| c.id()).map(i64::from);
         LldbBackend {
             client,
             is_lldb_dap,
             child: Mutex::new(child),
             pid,
+            stderr,
         }
+    }
+
+    /// The captured lldb-dap stderr (trimmed), or empty when unavailable. Used as the
+    /// fallback diagnostic when a handshake response carries an empty `message`.
+    fn stderr_snapshot(&self) -> String {
+        self.stderr
+            .as_ref()
+            .map(|b| b.contents().trim().to_string())
+            .unwrap_or_default()
     }
 
     /// Send a request and check it resolved to a successful [`Response`] for `op`,
@@ -74,7 +113,63 @@ where
             .send(request)
             .await
             .map_err(|e| dap_err(format!("{op} request failed: {e}")))?;
-        check_response(op, op, message)
+        self.check_response(op, op, message)
+    }
+
+    /// Check a handshake/op response for `op`. `op` is the request verb (for the
+    /// `unexpected <op> response type`) and `failed_op` the `<failed_op> failed` verb. On a
+    /// `success=false` response with an **empty** `message`, the captured lldb-dap stderr is
+    /// folded in so the error is never the bare `<failed_op> failed: ` (review finding 3);
+    /// a non-empty DAP message is preferred and used verbatim.
+    fn check_response(
+        &self,
+        op: &str,
+        failed_op: &str,
+        message: DapMessage,
+    ) -> Result<Response, BackendError> {
+        match message {
+            DapMessage::Response(resp) => {
+                if resp.success {
+                    Ok(resp)
+                } else {
+                    Err(dap_err(format!(
+                        "{failed_op} failed: {}",
+                        self.diagnostic(&resp.message)
+                    )))
+                }
+            }
+            // A non-response (or wrong-typed) message: Go's `unexpected <op> response type:
+            // <%T>`. The neutral surface is `Protocol{ty}`; Phase 5 renders the wrapping.
+            other => Err(BackendError::Protocol {
+                ty: format!("{op}:{}", message_type_label(&other)),
+            }),
+        }
+    }
+
+    /// Like [`Self::check_response`] but discards the response body (used where the caller
+    /// does not consume it).
+    fn check_response_msg(
+        &self,
+        op: &str,
+        failed_op: &str,
+        message: DapMessage,
+    ) -> Result<(), BackendError> {
+        self.check_response(op, failed_op, message).map(|_| ())
+    }
+
+    /// Pick the diagnostic text for a `success=false` handshake/op response: the DAP
+    /// `message` when present, else the trimmed lldb-dap stderr ring (so the user-facing
+    /// error is never empty). When both are empty, falls back to a literal so the wording
+    /// still parses as `<op> failed: <text>`.
+    fn diagnostic(&self, dap_message: &str) -> String {
+        if !dap_message.is_empty() {
+            return dap_message.to_string();
+        }
+        let stderr = self.stderr_snapshot();
+        if !stderr.is_empty() {
+            return stderr;
+        }
+        "no error message provided by lldb-dap".to_string()
     }
 
     /// Run the launch handshake (Go `launch.go` steps 9–18).
@@ -128,7 +223,7 @@ where
                 ))
                 .await
                 .map_err(|e| dap_err(format!("setFunctionBreakpoints failed: {e}")))?;
-            check_response_msg("setFunctionBreakpoints", "setFunctionBreakpoints", msg)?;
+            self.check_response_msg("setFunctionBreakpoints", "setFunctionBreakpoints", msg)?;
         }
 
         // setExceptionBreakpoints (empty filters) — send only, errors mapped, no
@@ -159,7 +254,7 @@ where
             Ok(result) => result.map_err(|e| dap_err(format!("launch request failed: {e}")))?,
             Err(_) => return Err(BackendError::Closed),
         };
-        check_response("launch", "launch", launch_msg)?;
+        self.check_response("launch", "launch", launch_msg)?;
 
         // Handle stop_on_entry.
         match waiter {
@@ -216,7 +311,7 @@ where
             Ok(result) => result.map_err(|e| dap_err(format!("attach request failed: {e}")))?,
             Err(_) => return Err(BackendError::Closed),
         };
-        check_response("attach", "attach", attach_msg)?;
+        self.check_response("attach", "attach", attach_msg)?;
 
         // Register the stop waiter AFTER configurationDone (attach asymmetry).
         let rx = self.client.stop_waiter().register();
@@ -237,7 +332,7 @@ where
             .send(requests::initialize())
             .await
             .map_err(|e| dap_err(format!("initialize request failed: {e}")))?;
-        check_response("initialize", "initialize", msg)?;
+        self.check_response("initialize", "initialize", msg)?;
         Ok(())
     }
 
@@ -260,7 +355,7 @@ where
                 } else {
                     Err(dap_err(format!(
                         "setBreakpoints failed for {file}: {}",
-                        resp.message
+                        self.diagnostic(&resp.message)
                     )))
                 }
             }
@@ -478,43 +573,6 @@ where
 /// failures travel in the message; see the module doc).
 fn dap_err(message: String) -> BackendError {
     BackendError::Dap { message }
-}
-
-/// Check a handshake response message for `op`. `op` is the request verb (for the
-/// `unexpected <op> response type`) and `failed_op` the `<failed_op> failed` verb.
-fn check_response(
-    op: &str,
-    failed_op: &str,
-    message: DapMessage,
-) -> Result<Response, BackendError> {
-    check_response_inner(op, failed_op, message)
-}
-
-/// Like [`check_response`] but discards the response body (used where the caller does
-/// not consume it).
-fn check_response_msg(op: &str, failed_op: &str, message: DapMessage) -> Result<(), BackendError> {
-    check_response_inner(op, failed_op, message).map(|_| ())
-}
-
-fn check_response_inner(
-    op: &str,
-    failed_op: &str,
-    message: DapMessage,
-) -> Result<Response, BackendError> {
-    match message {
-        DapMessage::Response(resp) => {
-            if resp.success {
-                Ok(resp)
-            } else {
-                Err(dap_err(format!("{failed_op} failed: {}", resp.message)))
-            }
-        }
-        // A non-response (or wrong-typed) message: Go's `unexpected <op> response type:
-        // <%T>`. The neutral surface is `Protocol{ty}`; Phase 5 renders the wrapping.
-        other => Err(BackendError::Protocol {
-            ty: format!("{op}:{}", message_type_label(&other)),
-        }),
-    }
 }
 
 /// A human label for a non-response message's "type", standing in for Go's `%T`.

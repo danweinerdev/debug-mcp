@@ -7,8 +7,10 @@
 //! method (which blocks on responses) runs concurrently with a peer-scripting future via
 //! `tokio::join!`.
 
+use std::sync::Arc;
+
 use dap_client::{write_message, Client, ReadLoop, Response, StoppedBody, StoppedEvent};
-use lldb_backend::LldbBackend;
+use lldb_backend::{LldbBackend, StderrBuffer};
 use serde_json::Value;
 use tokio::io::{duplex, BufReader, DuplexStream};
 
@@ -28,6 +30,16 @@ impl Harness {
     /// Build the backend + its scripted peer. The backend owns the `dap-client::Client`;
     /// the [`Harness`] owns the peer side and the read-loop task.
     pub fn new(is_lldb_dap: bool) -> (LldbBackend<DuplexStream>, Harness) {
+        let (backend, harness, _stderr) = Self::new_with_stderr(is_lldb_dap);
+        (backend, harness)
+    }
+
+    /// Like [`Harness::new`] but also returns the backend's stderr ring, so a test can
+    /// preload bytes into it and assert the empty-message handshake-failure fallback
+    /// (review finding 3).
+    pub fn new_with_stderr(
+        is_lldb_dap: bool,
+    ) -> (LldbBackend<DuplexStream>, Harness, Arc<StderrBuffer>) {
         let (req_client, req_peer) = duplex(64 * 1024);
         let (resp_peer, resp_client) = duplex(64 * 1024);
 
@@ -39,14 +51,16 @@ impl Harness {
         // loop still drains output into its mpsc, which is fine).
         drop(channels);
 
-        let backend = LldbBackend::new(client, is_lldb_dap, None);
+        let stderr = Arc::new(StderrBuffer::new(0));
+        let backend =
+            LldbBackend::with_stderr(client, is_lldb_dap, None, Some(Arc::clone(&stderr)));
 
         let harness = Harness {
             peer_reads: BufReader::new(req_peer),
             peer_writes: resp_peer,
             read_loop: handle,
         };
-        (backend, harness)
+        (backend, harness, stderr)
     }
 
     /// Read the next request and return `(command, seq, arguments)`.

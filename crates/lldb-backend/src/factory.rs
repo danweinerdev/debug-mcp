@@ -47,7 +47,7 @@ impl BackendFactory for LldbFactory {
             child,
             stdin,
             stdout,
-            stderr: _stderr,
+            stderr,
             is_lldb_dap,
         } = sub;
 
@@ -59,9 +59,15 @@ impl BackendFactory for LldbFactory {
         // 4. Assemble the neutral BackendEvent stream from the read loop's channels.
         let events = build_event_stream(channels);
 
-        // 5. Return the not-yet-launched backend + its event stream.
-        let backend: Arc<dyn DebuggerBackend> =
-            Arc::new(LldbBackend::new(client, is_lldb_dap, Some(child)));
+        // 5. Return the not-yet-launched backend + its event stream. The stderr ring is
+        // handed to the backend so an empty-message handshake failure falls back to the
+        // captured lldb-dap stderr (review finding 3).
+        let backend: Arc<dyn DebuggerBackend> = Arc::new(LldbBackend::with_stderr(
+            client,
+            is_lldb_dap,
+            Some(child),
+            Some(stderr),
+        ));
         Ok(Connection { backend, events })
     }
 }

@@ -385,6 +385,41 @@ async fn launch_failed_response_maps_to_go_string() {
     h.close_and_join().await;
 }
 
+#[tokio::test]
+async fn launch_failed_empty_message_falls_back_to_stderr() {
+    // Review finding 3: a `success=false` launch with an EMPTY message must not surface the
+    // bare `launch failed: ` — the captured lldb-dap stderr is folded in instead.
+    let (backend, mut h, stderr) = Harness::new_with_stderr(true);
+    stderr.write(b"error: unable to find executable for '/bin/prog'\n");
+    let spec = launch_spec(false);
+    let run = async {
+        let (_c, seq, _a) = h.next_request_full().await; // initialize
+        h.reply_ok("initialize", seq, None).await;
+        let (cmd, launch_seq, _a) = h.next_request_full().await; // launch (deferred reply)
+        assert_eq!(cmd, "launch");
+        inject_initialized(&mut h).await;
+        let (_c, seq, _a) = h.next_request_full().await; // setExceptionBreakpoints
+        h.reply_ok("setExceptionBreakpoints", seq, None).await;
+        let (_c, seq, _a) = h.next_request_full().await; // configurationDone
+        h.reply_ok("configurationDone", seq, None).await;
+        // The deferred launch failure arrives last, with an EMPTY message.
+        h.reply_err("launch", launch_seq, "").await;
+        h
+    };
+    let (result, h) = tokio::join!(backend.launch(spec), run);
+    let err = result.expect_err("should fail");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("unable to find executable"),
+        "empty DAP message must fall back to stderr, got: {rendered:?}"
+    );
+    assert!(
+        !rendered.trim_end().ends_with("launch failed:"),
+        "error must not be the bare 'launch failed:', got: {rendered:?}"
+    );
+    h.close_and_join().await;
+}
+
 // ---- attach ----
 
 #[tokio::test]
