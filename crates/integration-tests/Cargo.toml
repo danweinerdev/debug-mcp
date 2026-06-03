@@ -1,0 +1,21 @@
+[package]
+name = "integration-tests"
+description = "Phase 6 test-support library: the in-process harness (a real ToolServer over a real SessionManager + the real LldbFactory) and a stdio MCP client, consumed by the live integration + differential-parity suites in mcp-tools/tests/. A dedicated crate so it can depend on lldb-backend without mcp-tools' own (normal) dependency graph ever naming it — the seam stays clean."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Library-only: the shared test-support helpers (the in-process harness + the stdio MCP
+# client), consumed as `pub` API by the suites in mcp-tools/tests/.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+mcp-session.workspace = true
+mcp-tools.workspace = true
+lldb-backend.workspace = true
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
