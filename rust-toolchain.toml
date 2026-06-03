@@ -1,0 +1,9 @@
+# Pinned stable toolchain for the workspace.
+#
+# ThreadSanitizer runs (the Rust analog of Go's `-race`, used for the
+# `dap-client` concurrency suite in later phases) require nightly:
+#   rustup toolchain install nightly
+#   RUSTFLAGS="-Z sanitizer=thread" cargo +nightly test -p dap-client --target x86_64-unknown-linux-gnu
+[toolchain]
+channel = "1.90.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.90"
+
+[workspace.dependencies]
+# Neutral contract crate deps (must stay tokio/rmcp/DAP-free).
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "2.0"
+
+# Below-the-seam / runtime deps.
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# MCP SDK — only `mcp-tools` (and the binary) may use it.
+rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
+
+# Internal crates.
+debugger-core = { path = "crates/debugger-core" }
+dap-client = { path = "crates/dap-client" }
+lldb-backend = { path = "crates/lldb-backend" }
+mcp-session = { path = "crates/mcp-session" }
+mcp-tools = { path = "crates/mcp-tools" }

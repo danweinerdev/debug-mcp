@@ -1,0 +1,14 @@
+[package]
+name = "debugger-core"
+description = "Neutral debugger contract: DebuggerBackend + BackendFactory traits, neutral types, BackendError, BackendEvent. No tokio/rmcp/DAP."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+thiserror.workspace = true
