@@ -1,0 +1,13 @@
+[package]
+name = "mcp-session"
+description = "Neutral SessionManager: state machine, breakpoint tracking, frame-map cache, OutputBuffer. Depends only on debugger-core (the seam)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# SEAM: must NOT depend on dap-client or lldb-backend.
+[dependencies]
+debugger-core.workspace = true
+tokio.workspace = true
+futures.workspace = true
