@@ -285,6 +285,15 @@ impl SessionManager {
         self.write().bp_responses.insert(info.id, info);
     }
 
+    /// A read-only clone of the tracked breakpoint metadata for `id`, or `None` when no
+    /// breakpoint with that id is tracked. Lets a handler compute a proposed
+    /// breakpoint-list change (and pick the file/kind) *before* committing the session
+    /// mutation, so the mutation can be deferred until the DAP call succeeds (Spec FR-7.3,
+    /// transactional update).
+    pub fn breakpoint_info(&self, id: i64) -> Option<BreakpointInfo> {
+        self.read().bp_responses.get(&id).cloned()
+    }
+
     /// Remove a tracked breakpoint by debugger id (Spec FR-7.3). Returns
     /// `(file_path, was_function)`: source breakpoints are matched by **line only**,
     /// function breakpoints by **name only**, taking the first match in the active

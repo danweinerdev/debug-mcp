@@ -26,6 +26,43 @@ async fn read_memory_missing_params() {
 }
 
 #[tokio::test]
+async fn read_memory_rejects_non_positive_count() {
+    // Rust numeric-validation policy: zero/negative `count` is rejected at the boundary and
+    // never forwarded to the backend.
+    let h = Harness::connected(State::Stopped).await;
+    for bad in [json!(0), json!(-4), json!(-0.5)] {
+        let a = args(&[("address", json!("0x1000")), ("count", bad)]);
+        let out = h.server.handle_read_memory(&crate::Args::new(&a)).await;
+        assert_eq!(expect_error(&out), "'count' must be a positive integer");
+    }
+    // No ReadMemory call was made.
+    assert!(!h
+        .calls()
+        .iter()
+        .any(|c| matches!(c, Call::ReadMemory { .. })));
+}
+
+#[tokio::test]
+async fn read_memory_forwards_large_positive_count() {
+    // A large positive count is still forwarded unchanged (only clearly-invalid values are
+    // rejected — no caps).
+    let h = Harness::connected(State::Stopped).await;
+    h.state.lock().unwrap().read_memory_result = Some(Ok(MemoryRead {
+        address: "0x1000".to_string(),
+        data: Vec::new(),
+    }));
+    let a = args(&[("address", json!("0x1000")), ("count", json!(1_000_000))]);
+    let _ = h.server.handle_read_memory(&crate::Args::new(&a)).await;
+    assert!(h.calls().iter().any(|c| matches!(
+        c,
+        Call::ReadMemory {
+            count: 1_000_000,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn read_memory_normalizes_address_and_formats_hex_dump() {
     let h = Harness::connected(State::Stopped).await;
     h.state.lock().unwrap().read_memory_result = Some(Ok(MemoryRead {

@@ -173,6 +173,20 @@ async fn backtrace_levels_override_only_when_positive() {
         .any(|c| matches!(c, Call::StackTrace { levels: 5, .. })));
 }
 
+#[tokio::test]
+async fn backtrace_rejects_non_positive_explicit_thread_id() {
+    // Rust numeric-validation policy: a non-positive explicit thread_id errors before any
+    // StackTrace call.
+    let h = Harness::connected(State::Stopped).await;
+    let a = args(&[("thread_id", json!(0))]);
+    let out = h.server.handle_backtrace(&crate::Args::new(&a)).await;
+    assert_eq!(expect_error(&out), "'thread_id' must be a positive integer");
+    assert!(!h
+        .calls()
+        .iter()
+        .any(|c| matches!(c, Call::StackTrace { .. })));
+}
+
 // ---- threads ----
 
 #[tokio::test]

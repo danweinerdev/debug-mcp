@@ -4,8 +4,14 @@
 //! Pending-vs-stopped: in `idle` the breakpoint is buffered (pending JSON, no DAP); in
 //! `stopped` the backend is called and the matched response breakpoint recorded.
 //! `list_breakpoints` has no guard and id-sorts (`[]`, never `null`).
+//!
+//! The stopped-path mutations are **transactional** (review finding 4): each handler builds
+//! the proposed breakpoint list locally, sends it to DAP, and commits the session mutation
+//! only after the DAP call succeeds — so a backend rejection (or a no-breakpoints response)
+//! leaves the tracked lists unchanged. The success-path behavior is identical to the prior
+//! mutate-then-send order; only the failure path differs (robustness improvement).
 
-use debugger_core::SourceBp;
+use debugger_core::{FunctionBp, SourceBp};
 use mcp_session::{BreakpointInfo, State};
 use serde_json::{Map, Value};
 
@@ -27,7 +33,9 @@ impl ToolServer {
             Ok(f) => f,
             Err(e) => return ToolOutcome::error(e),
         };
-        let line = match args.require_int("line") {
+        // `line` must be a positive integer after truncation (Rust numeric-validation
+        // policy — rejects zero/negative/fractional-to-zero lines at the boundary).
+        let line = match args.require_positive_int("line") {
             Ok(l) => l,
             Err(e) => return ToolOutcome::error(e),
         };
@@ -48,13 +56,19 @@ impl ToolServer {
             );
         }
 
-        // Stopped: append to the file's tracked list, send the full list.
+        // Stopped: build the proposed list locally (current tracked + the new bp) and send
+        // it WITHOUT mutating the session first. The session is committed only after DAP
+        // confirms, so a backend rejection leaves the tracked list unchanged (transactional
+        // — review finding 4; happy-path behavior is identical to mutate-then-send).
         let backend = match self.current_backend().await {
             Some(b) => b,
             None => return ToolOutcome::error(errors::SET_BREAKPOINTS.request_failed.to_string()),
         };
-        self.session.add_source_breakpoint(&file, line, &condition);
-        let bps = self.session.source_breakpoints_for_file(&file);
+        let mut bps = self.session.source_breakpoints_for_file(&file);
+        bps.push(SourceBp {
+            line,
+            condition: condition.clone(),
+        });
 
         let results = match backend.set_source_breakpoints(&file, &bps).await {
             Ok(r) => r,
@@ -62,7 +76,8 @@ impl ToolServer {
         };
 
         // Select the response breakpoint matching the requested line; else the last; else
-        // error (no breakpoints).
+        // error (no breakpoints). Done before committing, so a no-breakpoints response also
+        // leaves the session unchanged.
         let matched = results
             .iter()
             .find(|bp| bp.line == line)
@@ -72,6 +87,8 @@ impl ToolServer {
             None => return ToolOutcome::error("setBreakpoints response contained no breakpoints"),
         };
 
+        // DAP succeeded — commit the session mutation now.
+        self.session.add_source_breakpoint(&file, line, &condition);
         self.session.add_breakpoint_response(BreakpointInfo {
             id: matched.id,
             ty: "source".to_string(),
@@ -127,6 +144,9 @@ impl ToolServer {
             );
         }
 
+        // Build the proposed full function list locally (current tracked + the new one) and
+        // send it WITHOUT mutating the session first; commit only after DAP success
+        // (transactional — review finding 4).
         let backend = match self.current_backend().await {
             Some(b) => b,
             None => {
@@ -135,15 +155,20 @@ impl ToolServer {
                 )
             }
         };
-        self.session.add_function_breakpoint(&name, &condition);
-        let bps = self.session.all_function_breakpoints();
+        let mut bps = self.session.all_function_breakpoints();
+        bps.push(FunctionBp {
+            name: name.clone(),
+            condition: condition.clone(),
+        });
 
         let results = match backend.set_function_breakpoints(&bps).await {
             Ok(r) => r,
             Err(e) => return ToolOutcome::error(errors::SET_FUNCTION_BREAKPOINTS.render(e)),
         };
 
-        // The new breakpoint is the last in the response (positional with the request).
+        // DAP succeeded — commit the session mutation. The new breakpoint is the last in
+        // the response (positional with the request).
+        self.session.add_function_breakpoint(&name, &condition);
         let (id, verified, mut message) = match results.last() {
             Some(bp) => {
                 self.session.add_breakpoint_response(BreakpointInfo {
@@ -178,8 +203,9 @@ impl ToolServer {
         )
     }
 
-    /// `remove_breakpoint` (Spec FR-7.3). Guard stopped. Remove from session tracking, then
-    /// re-send the remaining breakpoints (function list, or the file's source list).
+    /// `remove_breakpoint` (Spec FR-7.3). Guard stopped. Peek the tracked breakpoint, send
+    /// the proposed remaining list (function list, or the file's source list), and commit
+    /// the session removal only on DAP success (transactional — review finding 4).
     pub(crate) async fn handle_remove_breakpoint(&self, args: &Args<'_>) -> ToolOutcome {
         if let Err(e) = self.session.check_state(&[State::Stopped]) {
             return ToolOutcome::error(e);
@@ -190,10 +216,20 @@ impl ToolServer {
             Err(e) => return ToolOutcome::error(e),
         };
 
-        let (file_path, was_function) = match self.session.remove_breakpoint_by_id(id) {
-            Ok(v) => v,
-            Err(e) => return ToolOutcome::error(format!("failed to remove breakpoint: {e}")),
+        // Peek (read-only) at the tracked breakpoint, then compute the proposed remaining
+        // list and send it to DAP BEFORE committing the session removal. The session is
+        // mutated only after DAP confirms, so a backend rejection leaves the breakpoint
+        // tracked (transactional — review finding 4). Removal matching mirrors
+        // `remove_breakpoint_by_id`: source by line, function by name, first match.
+        let info = match self.session.breakpoint_info(id) {
+            Some(info) => info,
+            None => {
+                return ToolOutcome::error(format!(
+                    "failed to remove breakpoint: breakpoint ID {id} not found"
+                ))
+            }
         };
+        let was_function = info.ty == "function";
 
         let backend = match self.current_backend().await {
             Some(b) => b,
@@ -201,15 +237,24 @@ impl ToolServer {
         };
 
         if was_function {
-            let bps = self.session.all_function_breakpoints();
+            let bps =
+                remaining_function_breakpoints(&self.session.all_function_breakpoints(), &info);
             if let Err(e) = backend.set_function_breakpoints(&bps).await {
                 return ToolOutcome::error(errors::SET_FUNCTION_BREAKPOINTS.render(e));
             }
         } else {
-            let bps: Vec<SourceBp> = self.session.source_breakpoints_for_file(&file_path);
-            if let Err(e) = backend.set_source_breakpoints(&file_path, &bps).await {
+            let bps = remaining_source_breakpoints(
+                &self.session.source_breakpoints_for_file(&info.file),
+                &info,
+            );
+            if let Err(e) = backend.set_source_breakpoints(&info.file, &bps).await {
                 return ToolOutcome::error(errors::SET_BREAKPOINTS.render(e));
             }
+        }
+
+        // DAP succeeded — now commit the session removal.
+        if let Err(e) = self.session.remove_breakpoint_by_id(id) {
+            return ToolOutcome::error(format!("failed to remove breakpoint: {e}"));
         }
 
         ToolOutcome::Json(
@@ -266,4 +311,30 @@ fn remove_send_error(was_function: bool) -> String {
     } else {
         errors::SET_BREAKPOINTS.request_failed.to_string()
     }
+}
+
+/// The proposed source-breakpoint list for a file after removing `info` — the current list
+/// with the **first** entry whose line matches dropped (mirrors `remove_breakpoint_by_id`'s
+/// line-only, first-match rule). Computed without mutating the session, for the
+/// transactional remove path.
+fn remaining_source_breakpoints(current: &[SourceBp], info: &BreakpointInfo) -> Vec<SourceBp> {
+    let mut bps = current.to_vec();
+    if let Some(pos) = bps.iter().position(|bp| bp.line == info.line) {
+        bps.remove(pos);
+    }
+    bps
+}
+
+/// The proposed function-breakpoint list after removing `info` — the current list with the
+/// **first** entry whose name matches dropped (function breakpoints are matched by name
+/// only). Computed without mutating the session.
+fn remaining_function_breakpoints(
+    current: &[FunctionBp],
+    info: &BreakpointInfo,
+) -> Vec<FunctionBp> {
+    let mut bps = current.to_vec();
+    if let Some(pos) = bps.iter().position(|bp| bp.name == info.function) {
+        bps.remove(pos);
+    }
+    bps
 }

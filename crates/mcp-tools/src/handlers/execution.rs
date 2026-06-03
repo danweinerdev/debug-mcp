@@ -1,12 +1,15 @@
 //! Execution handlers: `continue`, `step_over`, `step_into`, `step_out`, `pause`, and the
 //! shared stop-outcome formatter (Spec FR-8, task 5.3).
 //!
-//! The resume tools guard `stopped`, resolve the thread id (explicit arg → last-stopped →
-//! 1), set state `running`, then await the backend racing the request cancellation token.
+//! The resume tools guard `stopped`, resolve the thread id (explicit positive arg →
+//! last-stopped → 1; a non-positive explicit `thread_id` is rejected per the Rust
+//! numeric-validation policy), set state `running`, then await the backend racing the
+//! request cancellation token.
 //! On a backend send error the state reverts to `stopped`; on cancellation the state is
-//! left `running` (Go parity — recover with `pause`). The post-stop transition is applied
-//! generation-guarded so a `continue` returning after a concurrent `disconnect` cannot
-//! clobber the reset idle state (design Decision 6).
+//! left `running` (Go parity — recover with `pause`). The post-stop transition AND the
+//! adjacent cache writes (`last_stopped`, exit code) are applied generation-guarded so a
+//! `continue` returning after a concurrent `disconnect` cannot clobber the reset idle state
+//! or leak stale stop metadata into the fresh session (design Decision 6).
 
 use debugger_core::{BackendError, Granularity, StepKind, StopInfo, StopOutcome};
 use mcp_session::State;
@@ -104,7 +107,10 @@ impl ToolServer {
             return ToolOutcome::error(e);
         }
 
-        let thread_id = self.resolve_thread_id(args);
+        let thread_id = match self.resolve_thread_id(args) {
+            Ok(tid) => tid,
+            Err(e) => return ToolOutcome::error(e),
+        };
 
         let backend = match self.current_backend().await {
             Some(b) => b,
@@ -172,28 +178,39 @@ impl ToolServer {
         )
     }
 
-    /// Resolve the thread id: explicit numeric `thread_id` arg → last-stopped thread → 1
-    /// (Go's `handleContinue` thread resolution).
-    fn resolve_thread_id(&self, args: &Args<'_>) -> i64 {
-        if let Some(raw) = args.get_raw("thread_id").filter(|v| !v.is_null()) {
-            if let Some(tid) = raw.as_f64() {
-                return tid as i64;
-            }
+    /// Resolve the thread id: explicit positive numeric `thread_id` arg → last-stopped
+    /// thread → 1 (Go's `handleContinue` thread resolution). An explicit, numeric, but
+    /// non-positive `thread_id` is rejected (`'thread_id' must be a positive integer`) per
+    /// the Rust numeric-validation policy; absent/non-numeric still falls back.
+    fn resolve_thread_id(&self, args: &Args<'_>) -> Result<i64, String> {
+        if let Some(tid) = args.explicit_positive_thread_id()? {
+            return Ok(tid);
         }
-        self.session
+        Ok(self
+            .session
             .last_stopped()
             .map(|e| e.thread_id)
-            .unwrap_or(1)
+            .unwrap_or(1))
     }
 
     /// The shared stop-result formatter (Go `handleStopResult`). Applies the post-stop
-    /// state transition generation-guarded, drains + merges output, caches last-stopped.
+    /// state transition generation-guarded; the `last_stopped`/exit-code cache writes are
+    /// applied only when the guard held (so a racing disconnect can't repopulate the reset
+    /// session). Output drain + response building are unconditional (the response is a
+    /// return value, not session state).
     fn handle_stop_result(&self, outcome: StopOutcome, generation: u64) -> ToolOutcome {
         match outcome {
             StopOutcome::Stopped(info) => {
-                self.session
+                // Only cache the stop metadata when the state write actually applied. A
+                // `disconnect` racing a blocked `continue` bumps the generation + resets;
+                // repopulating the fresh idle session's stop cache here would leak stale
+                // thread/frame state across sessions (review finding 2).
+                let applied = self
+                    .session
                     .set_state_if_generation(generation, State::Stopped);
-                self.session.set_last_stopped(info.clone());
+                if applied {
+                    self.session.set_last_stopped(info.clone());
+                }
 
                 let entries = self.session.output_buffer().drain();
                 let mut builder = stopped_response(&info);
@@ -201,8 +218,11 @@ impl ToolServer {
                 builder.into_outcome()
             }
             StopOutcome::Exited { code } => {
-                self.session
-                    .set_state_if_generation(generation, State::Terminated);
+                // Cache the exit code under the same generation guard as the state write,
+                // so an immediate `status` after an exited `continue` reports `exit_code`
+                // without waiting for the async Terminated event (review finding 1). The
+                // response still carries `code` directly regardless of the guard.
+                self.session.terminate_if_generation(generation, code);
 
                 let entries = self.session.output_buffer().drain();
                 let mut builder = RespBuilder::new().set("status", "exited");

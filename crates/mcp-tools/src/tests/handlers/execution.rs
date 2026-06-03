@@ -56,6 +56,59 @@ async fn continue_exited_sets_terminated_with_exit_code() {
 }
 
 #[tokio::test]
+async fn continue_exited_caches_exit_code_for_immediate_status() {
+    // Review finding 1: an exited `continue` must cache the exit code on the session so an
+    // immediate `status` (which reads only cached data) reports it — without waiting for the
+    // async Terminated event.
+    let h = Harness::connected(State::Stopped).await;
+    h.state.lock().unwrap().cont_result = Some(Ok(StopOutcome::Exited { code: Some(42) }));
+    let empty = args(&[]);
+    let out = h
+        .server
+        .handle_continue(&crate::Args::new(&empty), &token())
+        .await;
+    let v = expect_json(&out);
+    assert_eq!(v["status"], json!("exited"));
+    assert_eq!(v["exit_code"], json!(42));
+    assert_eq!(h.session.state(), State::Terminated);
+    // The session cached the exit code, so a status now reports it.
+    assert_eq!(h.session.exit_code(), Some(42));
+    let status = expect_json(&h.server.handle_status()).clone();
+    assert_eq!(status["state"], json!("terminated"));
+    assert_eq!(status["exit_code"], json!(42));
+}
+
+#[tokio::test]
+async fn continue_stopped_after_disconnect_does_not_repopulate_last_stopped() {
+    // Review finding 2: a Stopped outcome produced after a concurrent disconnect (which bumps
+    // the generation + resets) must NOT write last_stopped onto the fresh idle session.
+    let h = Harness::connected(State::Stopped).await;
+    let (tx, rx) = oneshot::channel::<StopOutcome>();
+    h.state.lock().unwrap().cont_gate = Some(rx);
+
+    let session = Arc::clone(&h.session);
+    let server = Arc::new(h.server);
+    let s2 = Arc::clone(&server);
+    let handle = tokio::spawn(async move {
+        let a = args(&[]);
+        let ct = token();
+        s2.handle_continue(&crate::Args::new(&a), &ct).await
+    });
+
+    // Let the continue reach its gate (state Running, generation N), then reset (the
+    // disconnect equivalent: bumps the generation, clears last_stopped, returns to Idle).
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    session.reset();
+    // Release the gated continue with a Stopped outcome carrying a stale thread id.
+    let _ = tx.send(StopOutcome::Stopped(stop("breakpoint", 9)));
+    let _ = handle.await.unwrap();
+
+    // The stale-generation stop must not have repopulated the reset session's stop cache.
+    assert_eq!(session.state(), State::Idle);
+    assert!(session.last_stopped().is_none());
+}
+
+#[tokio::test]
 async fn continue_terminated_sets_terminated_message() {
     let h = Harness::connected(State::Stopped).await;
     h.state.lock().unwrap().cont_result = Some(Ok(StopOutcome::Terminated));
@@ -135,6 +188,36 @@ async fn continue_thread_resolution_default_one() {
         .calls()
         .iter()
         .any(|c| matches!(c, Call::Cont { thread_id: 1 })));
+}
+
+#[tokio::test]
+async fn continue_rejects_non_positive_explicit_thread_id() {
+    // Rust numeric-validation policy: an explicit, numeric, non-positive thread_id is
+    // rejected at the boundary and no Cont call is made.
+    let h = Harness::connected(State::Stopped).await;
+    for bad in [json!(0), json!(-1), json!(-2.5)] {
+        let a = args(&[("thread_id", bad)]);
+        let out = h
+            .server
+            .handle_continue(&crate::Args::new(&a), &token())
+            .await;
+        assert_eq!(expect_error(&out), "'thread_id' must be a positive integer");
+    }
+    assert!(!h.calls().iter().any(|c| matches!(c, Call::Cont { .. })));
+    // State unchanged (the guard/validation ran before set_state(Running)).
+    assert_eq!(h.session.state(), State::Stopped);
+}
+
+#[tokio::test]
+async fn step_over_rejects_non_positive_explicit_thread_id() {
+    let h = Harness::connected(State::Stopped).await;
+    let a = args(&[("thread_id", json!(-1))]);
+    let out = h
+        .server
+        .handle_step_over(&crate::Args::new(&a), &token())
+        .await;
+    assert_eq!(expect_error(&out), "'thread_id' must be a positive integer");
+    assert!(!h.calls().iter().any(|c| matches!(c, Call::Step { .. })));
 }
 
 #[tokio::test]

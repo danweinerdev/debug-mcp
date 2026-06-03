@@ -8,6 +8,17 @@
 //! Every method returns `Result<T, String>` where `Err(String)` is the **exact**
 //! user-facing error text the Go handler would surface (FR-3.4). The handler layer
 //! (Phase 5.3/5.4) maps that string straight into a tool error result.
+//!
+//! **Numeric-validation policy (intentional deviation from Go).** Go is permissive: it
+//! coerces `float64 → int` and forwards clearly-invalid values (zero/negative `count`,
+//! non-positive `thread_id`, zero/fractional-to-zero `line`) straight to lldb-dap, which
+//! then fails with an adapter-specific (or surprising-default) result. This is a
+//! debugger-control surface exposed to agents, so the Rust port validates a *minimal* set
+//! of clearly-invalid values at the tool boundary with predictable errors — see
+//! [`Args::require_positive_int`] and [`Args::explicit_positive_thread_id`]. Valid values
+//! keep Go's `float64 → int` truncation unchanged (e.g. `line` `4.7 → 4`). The policy is
+//! applied only to `read_memory` `count`, explicit `thread_id`, and `set_breakpoint`
+//! `line`; all other numeric params keep the permissive behavior.
 
 use serde_json::{Map, Value};
 
@@ -80,6 +91,43 @@ impl<'a> Args<'a> {
     /// `> 0` / `int(...)` checks the Go handlers do inline (e.g. `disassemble`).
     pub fn get_f64(&self, key: &str) -> Option<f64> {
         self.map.get(key).and_then(value_as_f64)
+    }
+
+    /// Validate an explicit, numeric `thread_id` argument (Rust numeric-validation policy —
+    /// an intentional deviation from Go's permissive coercion). Returns:
+    /// - `Ok(None)` when the key is absent, null, or not a JSON number — the caller then
+    ///   falls back to the last-stopped thread → `1` (Go's resolution, preserved);
+    /// - `Ok(Some(n))` when present, numeric, and (after truncation) `> 0`;
+    /// - `Err("'thread_id' must be a positive integer")` when present and numeric but
+    ///   `<= 0` — a clear tool-boundary error instead of forwarding a bad id to DAP.
+    pub fn explicit_positive_thread_id(&self) -> Result<Option<i64>, String> {
+        match self.get_raw("thread_id").filter(|v| !v.is_null()) {
+            Some(raw) => match raw.as_f64() {
+                Some(f) => {
+                    let tid = f as i64;
+                    if tid <= 0 {
+                        Err("'thread_id' must be a positive integer".to_string())
+                    } else {
+                        Ok(Some(tid))
+                    }
+                }
+                // A non-numeric explicit value falls back (Go parity — never errored here).
+                None => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
+    /// A required integer parameter that must be `> 0` after the Go `float64 → int`
+    /// truncation (Rust numeric-validation policy — intentional deviation). Missing/non-
+    /// number errors are the standard `missing required parameter:` strings; a present,
+    /// numeric, but non-positive value errors `'<key>' must be a positive integer`.
+    pub fn require_positive_int(&self, key: &str) -> Result<i64, String> {
+        let value = self.require_int(key)?;
+        if value <= 0 {
+            return Err(format!("'{key}' must be a positive integer"));
+        }
+        Ok(value)
     }
 
     /// Parse a JSON-array-of-strings passed as a **string** parameter (Go

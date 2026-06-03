@@ -77,7 +77,10 @@ impl ToolServer {
             return ToolOutcome::error(e);
         }
 
-        let thread_id = self.resolve_backtrace_thread_id(args);
+        let thread_id = match self.resolve_backtrace_thread_id(args) {
+            Ok(tid) => tid,
+            Err(e) => return ToolOutcome::error(e),
+        };
 
         // levels default 20, overridden only when present and > 0.
         let mut levels = 20;
@@ -306,17 +309,18 @@ impl ToolServer {
         builder.into_outcome()
     }
 
-    /// Resolve the backtrace thread id: explicit `thread_id` → last-stopped → 1.
-    fn resolve_backtrace_thread_id(&self, args: &Args<'_>) -> i64 {
-        if let Some(raw) = args.get_raw("thread_id").filter(|v| !v.is_null()) {
-            if let Some(tid) = raw.as_f64() {
-                return tid as i64;
-            }
+    /// Resolve the backtrace thread id: explicit positive `thread_id` → last-stopped → 1.
+    /// An explicit, numeric, non-positive `thread_id` is rejected per the Rust
+    /// numeric-validation policy (`'thread_id' must be a positive integer`).
+    fn resolve_backtrace_thread_id(&self, args: &Args<'_>) -> Result<i64, String> {
+        if let Some(tid) = args.explicit_positive_thread_id()? {
+            return Ok(tid);
         }
-        self.session
+        Ok(self
+            .session
             .last_stopped()
             .map(|e| e.thread_id)
-            .unwrap_or(1)
+            .unwrap_or(1))
     }
 }
 

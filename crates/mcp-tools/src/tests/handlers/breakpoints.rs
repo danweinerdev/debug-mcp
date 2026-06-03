@@ -1,7 +1,7 @@
 //! Breakpoint handler tests: pending vs stopped, matched-breakpoint selection, synthesized
 //! function messages, removal, id-sorted list (Spec FR-7).
 
-use debugger_core::BreakpointResult;
+use debugger_core::{BackendError, BreakpointResult};
 use mcp_session::{BreakpointInfo, State};
 use serde_json::json;
 
@@ -41,6 +41,38 @@ async fn set_breakpoint_missing_file_and_line() {
     let a = args(&[("file", json!("/f.c"))]);
     let out = h.server.handle_set_breakpoint(&crate::Args::new(&a)).await;
     assert!(expect_error(&out).starts_with("missing required parameter:"));
+}
+
+#[tokio::test]
+async fn set_breakpoint_rejects_non_positive_line() {
+    // Rust numeric-validation policy: zero/negative/fractional-to-zero line is rejected at
+    // the boundary (checked before the pending/stopped split, so no DAP either way).
+    let h = Harness::connected(State::Stopped).await;
+    for bad in [json!(0), json!(-3), json!(0.4)] {
+        let a = args(&[("file", json!("/f.c")), ("line", bad)]);
+        let out = h.server.handle_set_breakpoint(&crate::Args::new(&a)).await;
+        assert_eq!(expect_error(&out), "'line' must be a positive integer");
+    }
+    assert!(!h
+        .calls()
+        .iter()
+        .any(|c| matches!(c, Call::SetSourceBreakpoints { .. })));
+}
+
+#[tokio::test]
+async fn set_breakpoint_accepts_fractional_line_truncating() {
+    // A valid fractional line truncates toward zero (Go parity preserved): 4.7 → 4.
+    let h = Harness::connected(State::Stopped).await;
+    h.state.lock().unwrap().source_bp_result = Some(Ok(vec![BreakpointResult {
+        id: 1,
+        verified: true,
+        line: 4,
+        message: String::new(),
+    }]));
+    let a = args(&[("file", json!("/f.c")), ("line", json!(4.7))]);
+    let out = h.server.handle_set_breakpoint(&crate::Args::new(&a)).await;
+    let v = expect_json(&out);
+    assert_eq!(v["line"], json!(4));
 }
 
 #[tokio::test]
@@ -112,6 +144,54 @@ async fn set_breakpoint_stopped_no_breakpoints_errors() {
         expect_error(&out),
         "setBreakpoints response contained no breakpoints"
     );
+}
+
+#[tokio::test]
+async fn set_breakpoint_dap_failure_leaves_session_unchanged() {
+    // Review finding 4 (transactional): a backend rejection must NOT add the breakpoint to
+    // the tracked source list and must NOT record a bp_response.
+    let h = Harness::connected(State::Stopped).await;
+    h.state.lock().unwrap().source_bp_result = Some(Err(BackendError::Dap {
+        message: "denied".to_string(),
+    }));
+    let a = args(&[("file", json!("/loop.c")), ("line", json!(9))]);
+    let out = h.server.handle_set_breakpoint(&crate::Args::new(&a)).await;
+    assert!(out.is_error());
+    // The proposed breakpoint was not committed: the file's tracked list is empty and no
+    // bp_response entry exists.
+    assert!(h.session.source_breakpoints_for_file("/loop.c").is_empty());
+    assert!(h.session.list_breakpoints().is_empty());
+}
+
+#[tokio::test]
+async fn set_function_breakpoint_dap_failure_leaves_session_unchanged() {
+    let h = Harness::connected(State::Stopped).await;
+    h.state.lock().unwrap().function_bp_result = Some(Err(BackendError::Dap {
+        message: "denied".to_string(),
+    }));
+    let a = args(&[("name", json!("foo"))]);
+    let out = h
+        .server
+        .handle_set_function_breakpoint(&crate::Args::new(&a))
+        .await;
+    assert!(out.is_error());
+    assert!(h.session.all_function_breakpoints().is_empty());
+    assert!(h.session.list_breakpoints().is_empty());
+}
+
+#[tokio::test]
+async fn set_breakpoint_no_breakpoints_response_leaves_session_unchanged() {
+    // The no-breakpoints-in-response error must also leave the tracked list unchanged (the
+    // commit happens only after a breakpoint is matched).
+    let h = Harness::connected(State::Stopped).await;
+    h.state.lock().unwrap().source_bp_result = Some(Ok(Vec::new()));
+    let a = args(&[("file", json!("/f.c")), ("line", json!(7))]);
+    let out = h.server.handle_set_breakpoint(&crate::Args::new(&a)).await;
+    assert_eq!(
+        expect_error(&out),
+        "setBreakpoints response contained no breakpoints"
+    );
+    assert!(h.session.source_breakpoints_for_file("/f.c").is_empty());
 }
 
 #[tokio::test]
@@ -256,6 +336,65 @@ async fn remove_function_breakpoint_resends_function_list() {
         .calls()
         .iter()
         .any(|c| matches!(c, Call::SetFunctionBreakpoints { .. })));
+}
+
+#[tokio::test]
+async fn remove_source_breakpoint_dap_failure_keeps_it_tracked() {
+    // Review finding 4 (transactional remove): a backend rejection of the proposed
+    // remaining list must leave the breakpoint tracked (id still removable later).
+    let h = Harness::connected(State::Stopped).await;
+    h.session.add_source_breakpoint("/f.c", 6, "");
+    h.session.add_breakpoint_response(BreakpointInfo {
+        id: 10,
+        ty: "source".to_string(),
+        file: "/f.c".to_string(),
+        line: 6,
+        function: String::new(),
+        condition: String::new(),
+        verified: true,
+    });
+    h.state.lock().unwrap().source_bp_result = Some(Err(BackendError::Dap {
+        message: "denied".to_string(),
+    }));
+
+    let a = args(&[("breakpoint_id", json!(10))]);
+    let out = h
+        .server
+        .handle_remove_breakpoint(&crate::Args::new(&a))
+        .await;
+    assert!(out.is_error());
+    // Still tracked: the response list and the active source list are unchanged.
+    assert_eq!(h.session.list_breakpoints().len(), 1);
+    assert_eq!(h.session.source_breakpoints_for_file("/f.c").len(), 1);
+    assert!(h.session.breakpoint_info(10).is_some());
+}
+
+#[tokio::test]
+async fn remove_function_breakpoint_dap_failure_keeps_it_tracked() {
+    let h = Harness::connected(State::Stopped).await;
+    h.session.add_function_breakpoint("main", "");
+    h.session.add_breakpoint_response(BreakpointInfo {
+        id: 5,
+        ty: "function".to_string(),
+        file: String::new(),
+        line: 0,
+        function: "main".to_string(),
+        condition: String::new(),
+        verified: true,
+    });
+    h.state.lock().unwrap().function_bp_result = Some(Err(BackendError::Dap {
+        message: "denied".to_string(),
+    }));
+
+    let a = args(&[("breakpoint_id", json!(5))]);
+    let out = h
+        .server
+        .handle_remove_breakpoint(&crate::Args::new(&a))
+        .await;
+    assert!(out.is_error());
+    assert_eq!(h.session.list_breakpoints().len(), 1);
+    assert_eq!(h.session.all_function_breakpoints().len(), 1);
+    assert!(h.session.breakpoint_info(5).is_some());
 }
 
 #[tokio::test]

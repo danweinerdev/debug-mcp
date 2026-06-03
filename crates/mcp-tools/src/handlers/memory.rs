@@ -30,7 +30,9 @@ impl ToolServer {
             Ok(a) => a,
             Err(e) => return ToolOutcome::error(e),
         };
-        let count = match args.require_int("count") {
+        // `count` must be a positive integer (Rust numeric-validation policy — a zero or
+        // negative count is rejected at the boundary rather than forwarded to DAP).
+        let count = match args.require_positive_int("count") {
             Ok(c) => c,
             Err(e) => return ToolOutcome::error(e),
         };

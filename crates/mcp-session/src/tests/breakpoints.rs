@@ -93,6 +93,25 @@ fn remove_breakpoint_by_id_not_found() {
 }
 
 #[test]
+fn breakpoint_info_peeks_without_mutating() {
+    // The read-only lookup used by the transactional remove path: it returns the tracked
+    // metadata for a known id (and `None` for an unknown id) WITHOUT removing anything.
+    let sm = SessionManager::new();
+    sm.add_source_breakpoint("/src/main.go", 10, "");
+    sm.add_breakpoint_response(source_info(1, "/src/main.go", 10));
+
+    let info = sm.breakpoint_info(1).expect("known id");
+    assert_eq!(info.id, 1);
+    assert_eq!(info.ty, "source");
+    assert_eq!(info.line, 10);
+    assert!(sm.breakpoint_info(999).is_none());
+
+    // The peek did not mutate: the breakpoint is still tracked and removable.
+    assert_eq!(sm.list_breakpoints().len(), 1);
+    assert!(sm.remove_breakpoint_by_id(1).is_ok());
+}
+
+#[test]
 fn list_breakpoints_sorted() {
     // Go `TestListBreakpointsSorted` — ascending by id regardless of insert order.
     let sm = SessionManager::new();

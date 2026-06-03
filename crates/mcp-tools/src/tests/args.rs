@@ -131,6 +131,70 @@ fn get_raw_present_and_absent() {
 }
 
 #[test]
+fn require_positive_int_accepts_positive_and_truncates() {
+    // A valid fractional value still truncates toward zero (Go parity preserved): 4.7 → 4.
+    let m = args_from(json!({ "line": 4.7 }));
+    let args = Args::new(&m);
+    assert_eq!(args.require_positive_int("line").unwrap(), 4);
+
+    let m2 = args_from(json!({ "count": 4096 }));
+    let args2 = Args::new(&m2);
+    assert_eq!(args2.require_positive_int("count").unwrap(), 4096);
+}
+
+#[test]
+fn require_positive_int_rejects_zero_negative_and_fractional_to_zero() {
+    for bad in [json!(0), json!(-3), json!(-0.5), json!(0.9)] {
+        let m = args_from(json!({ "count": bad }));
+        let args = Args::new(&m);
+        assert_eq!(
+            args.require_positive_int("count").unwrap_err(),
+            "'count' must be a positive integer"
+        );
+    }
+}
+
+#[test]
+fn require_positive_int_missing_keeps_required_prefix() {
+    // A missing/non-number value keeps the standard `missing required parameter:` error.
+    let m = args_from(json!({}));
+    let args = Args::new(&m);
+    assert!(args
+        .require_positive_int("count")
+        .unwrap_err()
+        .starts_with("missing required parameter:"));
+}
+
+#[test]
+fn explicit_positive_thread_id_absent_or_non_numeric_falls_back() {
+    // Absent → Ok(None) (caller falls back to last-stopped → 1).
+    let m = args_from(json!({}));
+    assert_eq!(Args::new(&m).explicit_positive_thread_id().unwrap(), None);
+    // Null → Ok(None).
+    let m = args_from(json!({ "thread_id": null }));
+    assert_eq!(Args::new(&m).explicit_positive_thread_id().unwrap(), None);
+    // Non-numeric (string) → Ok(None) (Go parity — never errored here).
+    let m = args_from(json!({ "thread_id": "1" }));
+    assert_eq!(Args::new(&m).explicit_positive_thread_id().unwrap(), None);
+}
+
+#[test]
+fn explicit_positive_thread_id_present_positive_and_non_positive() {
+    let m = args_from(json!({ "thread_id": 5 }));
+    assert_eq!(
+        Args::new(&m).explicit_positive_thread_id().unwrap(),
+        Some(5)
+    );
+    for bad in [json!(0), json!(-1), json!(-2.5)] {
+        let m = args_from(json!({ "thread_id": bad }));
+        assert_eq!(
+            Args::new(&m).explicit_positive_thread_id().unwrap_err(),
+            "'thread_id' must be a positive integer"
+        );
+    }
+}
+
+#[test]
 fn parse_json_array_absent_is_empty() {
     let m = args_from(json!({}));
     let args = Args::new(&m);
