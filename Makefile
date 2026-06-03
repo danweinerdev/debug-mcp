@@ -1,45 +1,57 @@
-BINARY := lldb-debug-mcp
-MODULE := github.com/danweinerdev/lldb-debug-mcp
-GOFLAGS := CGO_ENABLED=0
+# Workspace lint/test gates for the Rust port.
+#
+# Run from anywhere; all targets pin the workspace manifest so no `cd` is needed.
+MANIFEST := $(CURDIR)/Cargo.toml
+CARGO := cargo
 
-GOOS := $(shell go env GOOS)
-GOARCH := $(shell go env GOARCH)
-PLATFORM := $(GOOS)-$(GOARCH)
+.PHONY: all build clippy fmt fmt-check test integration tsan check seam
 
-PLATFORMS := linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64 windows-arm64
-
-.PHONY: build build-all $(PLATFORMS) test test-integration clean
+# The full gate, in the order the phase verification runs it.
+all: fmt-check build clippy test seam
 
 build:
-	$(GOFLAGS) go build -o bin/$(PLATFORM)/$(BINARY) ./cmd/$(BINARY)
+	$(CARGO) build --manifest-path $(MANIFEST) --workspace
 
-build-all: $(PLATFORMS)
+# No `#[allow]` suppressions — warnings are fixed at the source. `--all-features` so the
+# `integration` test code (behind the integration-tests crate's feature) is linted too.
+clippy:
+	$(CARGO) clippy --manifest-path $(MANIFEST) --workspace --all-targets --all-features -- -D warnings
 
-linux-amd64:
-	$(GOFLAGS) GOOS=linux GOARCH=amd64 go build -o bin/$@/$(BINARY) ./cmd/$(BINARY)
+fmt:
+	$(CARGO) fmt --manifest-path $(MANIFEST) --all
 
-linux-arm64:
-	$(GOFLAGS) GOOS=linux GOARCH=arm64 go build -o bin/$@/$(BINARY) ./cmd/$(BINARY)
-
-darwin-amd64:
-	$(GOFLAGS) GOOS=darwin GOARCH=amd64 go build -o bin/$@/$(BINARY) ./cmd/$(BINARY)
-
-darwin-arm64:
-	$(GOFLAGS) GOOS=darwin GOARCH=arm64 go build -o bin/$@/$(BINARY) ./cmd/$(BINARY)
-
-windows-amd64:
-	$(GOFLAGS) GOOS=windows GOARCH=amd64 go build -o bin/$@/$(BINARY).exe ./cmd/$(BINARY)
-
-windows-arm64:
-	$(GOFLAGS) GOOS=windows GOARCH=arm64 go build -o bin/$@/$(BINARY).exe ./cmd/$(BINARY)
+fmt-check:
+	$(CARGO) fmt --manifest-path $(MANIFEST) --all -- --check
 
 test:
-	go test -race ./...
+	$(CARGO) test --manifest-path $(MANIFEST) --workspace
 
-test-integration: build
-	$(MAKE) -C testdata
-	go test -tags integration -race ./internal/tools/ -v
+# Live integration + differential-parity suite (Phase 6). Requires lldb-dap and the
+# compiled C fixtures; run `make -C testdata` first. Each test skips cleanly (logs +
+# passes) when lldb-dap/fixtures are absent. Single-threaded: the suites share the
+# lldb-dap binary and the crash scenarios kill subprocesses by pid. The differential
+# Rust-vs-Go lane skips unless a Go `lldb-debug-mcp` binary is on PATH (or GO_DEBUG_MCP_BIN).
+integration:
+	$(CARGO) build --manifest-path $(MANIFEST) -p debug-mcp
+	$(CARGO) test --manifest-path $(MANIFEST) -p mcp-tools --features integration -- --test-threads=1
 
-clean:
-	rm -rf bin/
-	$(MAKE) -C testdata clean
+# ThreadSanitizer over the dap-client concurrency tests (stop waiter, read-loop EOF
+# recovery, send/correlate/cancel). Needs nightly + rust-src; builds std instrumented.
+tsan:
+	RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+		$(CARGO) +nightly test --manifest-path $(MANIFEST) -p dap-client \
+		-Zbuild-std --target x86_64-unknown-linux-gnu \
+		--test client --test read_loop --test stop_waiter
+
+check: build clippy fmt-check test
+
+# Seam guarantee (Spec FR-18): debugger-core must carry no tokio/rmcp/DAP edge, and
+# the neutral crates must not name a DAP/lldb crate.
+seam:
+	@! $(CARGO) tree --manifest-path $(MANIFEST) -p debugger-core | grep -E '\b(tokio|rmcp|dap-client|lldb-backend)\b' \
+		|| (echo "SEAM VIOLATION: debugger-core pulled in a runtime/DAP crate" && exit 1)
+	@! $(CARGO) tree --manifest-path $(MANIFEST) -p mcp-tools --edges normal | grep -E '\b(dap-client|lldb-backend)\b' \
+		|| (echo "SEAM VIOLATION: mcp-tools depends on a backend crate" && exit 1)
+	@! $(CARGO) tree --manifest-path $(MANIFEST) -p mcp-session --edges normal | grep -E '\b(dap-client|lldb-backend)\b' \
+		|| (echo "SEAM VIOLATION: mcp-session depends on a backend crate" && exit 1)
+	@echo "seam ok"

@@ -1,1 +1,2 @@
-bin/
+# Rust build output (CARGO_TARGET_DIR may relocate this elsewhere)
+/target
