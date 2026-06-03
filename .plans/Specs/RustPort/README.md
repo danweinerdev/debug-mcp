@@ -950,6 +950,24 @@ Testing & quality:
   FR-18.6: neutral types carry current values as opaque strings/ints, not
   normalized enums, preserving exact tool output. Normalization is deferred to the
   WinDbg backend.
+- **Numeric-validation policy → minimal tool-boundary guards (intentional deviation).**
+  Go is permissive (coerces `float64 → int` and forwards clearly-invalid values to
+  lldb-dap). Because the tool surface is exposed to agents, the Rust port rejects a
+  *minimal* set of clearly-invalid values at the boundary with predictable errors, while
+  keeping Go's truncation for valid values (and adding no caps): `read_memory` `count`
+  must be a positive integer (`'count' must be a positive integer`); an explicit, numeric
+  `thread_id` on `continue`/`step_*`/`backtrace` must be positive
+  (`'thread_id' must be a positive integer`) — an absent/non-numeric `thread_id` still
+  falls back to last-stopped → `1` (Go parity); `set_breakpoint` `line` must be a positive
+  integer after truncation (`'line' must be a positive integer`). This is the third
+  intentional deviation (after the server rename and OQ-1).
+- **Breakpoint mutation is now transactional (robustness; success-path parity preserved).**
+  The stopped-state breakpoint handlers (`set_breakpoint`, `set_function_breakpoint`,
+  `remove_breakpoint`) build the proposed breakpoint list locally and commit the session's
+  tracked state only after lldb-dap confirms the change. A backend rejection therefore
+  leaves the tracked lists unchanged (the Go order mutated first, then re-sent, leaving
+  stale/untracked entries on failure). This is an error-path robustness improvement only —
+  the success-path observable behavior is identical to the Go oracle.
 
 ## Open Questions
 

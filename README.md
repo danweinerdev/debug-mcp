@@ -4,8 +4,8 @@ An MCP (Model Context Protocol) server that gives AI agents interactive debuggin
 capabilities. This is the Rust port of `lldb-debug-mcp`, built on the official Rust MCP
 SDK ([`rmcp`](https://crates.io/crates/rmcp)). It is **behaviorally feature-identical** to
 the Go version — the same 21 tools, parameters, defaults, session state machine, DAP
-handshake, response shapes, and error semantics — with two intentional, documented
-deviations (see [Intentional deviations](#intentional-deviations)).
+handshake, response shapes, and error semantics — with three intentional, documented
+deviations (see [Deviations from the Go server](#deviations-from-the-go-server)).
 
 The motivation for the rewrite is a **pluggable debugger backend**: the tool and session
 layers depend on a debugger-neutral `DebuggerBackend` trait, so a future backend (e.g.
@@ -217,9 +217,9 @@ Example prompts:
 | `disassemble` | Disassemble at address or PC | `address`, `instruction_count` (default 20) |
 | `run_command` | Execute any LLDB command | `command` (required) |
 
-## Intentional deviations
+## Deviations from the Go server
 
-The Go implementation is the parity oracle. There are exactly two intentional, documented
+The Go implementation is the parity oracle. There are exactly three intentional, documented
 deviations from it:
 
 1. **Server identity.** The binary is `debug-mcp` (was `lldb-debug-mcp`) and the advertised
@@ -229,6 +229,26 @@ deviations from it:
 2. **`disassemble` default `instruction_count` = 20.** The design doc and README document
    20; the Go *code* defaults to 10, treated as a latent bug. The Rust port aligns to the
    documented intent (20). This is isolated to one default and its parity test.
+3. **Numeric-validation policy (tool-boundary guards).** Go is permissive: it coerces
+   `float64 → int` and forwards clearly-invalid values straight to lldb-dap. Since this is a
+   debugger-control surface exposed to agents, the Rust port validates a *minimal* set of
+   clearly-invalid values at the tool boundary with predictable errors instead:
+   - `read_memory` `count` must be a positive integer → `'count' must be a positive integer`;
+   - an explicit, numeric `thread_id` (on `continue`/`step_*`/`backtrace`) must be positive →
+     `'thread_id' must be a positive integer` (an absent or non-numeric `thread_id` still
+     falls back to the last-stopped thread, then `1` — Go parity);
+   - `set_breakpoint` `line` must be a positive integer after truncation →
+     `'line' must be a positive integer`.
+
+   Valid values keep Go's `float64 → int` truncation (e.g. `line` `4.7 → 4`), and large
+   positive values are still forwarded unchanged (no caps are added). No other numeric
+   parameter is affected.
+
+   Relatedly (a robustness improvement on the *error* path, not a deviation on the success
+   path): the stopped-state breakpoint mutations (`set_breakpoint`,
+   `set_function_breakpoint`, `remove_breakpoint`) are now **transactional** — the session's
+   tracked breakpoint list is committed only after lldb-dap confirms the change, so a backend
+   rejection leaves the tracked state unchanged. The success-path output is identical to Go.
 
 Everything else is byte-for-byte behavior parity at the level of observable MCP output
 (field names, types, presence rules, values, and error strings). Object key order and
@@ -236,32 +256,50 @@ whitespace may differ (structural JSON parity).
 
 ## Development
 
-```bash
-# Format, build, lint (no #[allow] — warnings are fixed at the source), unit tests, seam.
-make -C rust all
-# or individually:
-make -C rust fmt-check build clippy test seam
+There are two gates, and `make all` is **not** full coverage on its own:
 
-# Unit tests only
+- **`make all` — the hermetic gate.** Format check, build, `clippy -D warnings` (no
+  `#[allow]` — warnings are fixed at the source), unit tests, and the seam check. It needs
+  no `lldb-dap` and runs anywhere. Note it does **not** exercise the live runtime path: the
+  integration scenarios are behind the `integration` feature and compile as *zero tests*
+  under the default workspace test command, so a green `make all` does not prove launch /
+  debugging against real lldb-dap.
+- **`make integration` — the live lldb-dap gate.** Builds `debug-mcp`, then runs the ported
+  integration scenarios + the golden cross-check + the differential lane against real
+  lldb-dap. This is the gate that proves the actual product path.
+
+```bash
+# Hermetic gate: format, build, lint, unit tests, seam.
+make all
+# or individually:
+make fmt-check build clippy test seam
+
+# Unit tests only (hermetic; integration scenarios compile as zero tests here).
 cargo test --workspace
 
 # Live integration + differential-parity suite (Phase 6).
-# Requires lldb-dap + the compiled C fixtures; each test SKIPS cleanly (logs + passes)
+# Requires lldb-dap + the compiled C fixtures. Each test SKIPS cleanly (logs + passes)
 # when lldb-dap or a fixture is absent. Single-threaded (the suites share lldb-dap and
 # the crash scenarios kill subprocesses by pid).
 make -C testdata                 # build the C fixtures once
-make -C rust integration
+make integration
 
 # ThreadSanitizer over the dap-client concurrency tests (nightly + rust-src).
-make -C rust tsan
+make tsan
 ```
 
 The differential-parity harness (`mcp-tools/tests/integration_differential.rs`) replays
 identical MCP tool sequences against `debug-mcp` and the Go `lldb-debug-mcp` over stdio and
-diffs the parsed JSON structurally, asserting the two deviations above explicitly. It runs
-the Go lane only when a Go binary is available (on PATH as `lldb-debug-mcp`, or via
-`GO_DEBUG_MCP_BIN`); otherwise it skips cleanly and the always-on golden cross-check
-validates the documented response shapes against `debug-mcp` directly.
+diffs the parsed JSON structurally, asserting the deviations above explicitly. It needs a
+**Go oracle** — provided via `GO_DEBUG_MCP_BIN` (an explicit path) or `lldb-debug-mcp` on
+PATH. Behavior when the oracle is absent:
+
+- by default it **skips cleanly**, logging `SKIPPED (NOT compared)`, and the always-on
+  golden cross-check still validates the documented response shapes against `debug-mcp`;
+- set `REQUIRE_GO_DIFFERENTIAL=1` to make the absence of the oracle (or of lldb-dap / the
+  Rust binary) a **hard failure** — so a CI/merge job can't pass while the strongest parity
+  lane silently no-ops. CI (`.github/workflows/ci.yml`) builds the Go oracle from the `main`
+  branch and runs this lane with the gate set.
 
 ## License
 
