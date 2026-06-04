@@ -35,6 +35,12 @@ struct Inner {
     exit_code: Option<i64>,
     last_stopped: Option<StopInfo>,
 
+    /// Whether the active session is a crash-dump (static) session. A dump session is
+    /// `State::Stopped` but cannot be resumed — the execution handlers reject
+    /// `continue`/`step_*` against it. Set by `open_crash_dump`, cleared by `reset()`
+    /// (so a fresh session after disconnect is not a dump). Phase-1 contract (task 1.4b).
+    is_dump: bool,
+
     /// Frame index → debugger frame id.
     frame_mapping: HashMap<i64, i64>,
 
@@ -57,6 +63,7 @@ impl Inner {
             pid: 0,
             exit_code: None,
             last_stopped: None,
+            is_dump: false,
             frame_mapping: HashMap::new(),
             source_bps: HashMap::new(),
             function_bps: Vec::new(),
@@ -167,6 +174,7 @@ impl SessionManager {
         inner.pid = 0;
         inner.exit_code = None;
         inner.last_stopped = None;
+        inner.is_dump = false;
         inner.frame_mapping = HashMap::new();
         inner.source_bps = HashMap::new();
         inner.function_bps = Vec::new();
@@ -204,6 +212,19 @@ impl SessionManager {
 
     pub fn set_exit_code(&self, code: i64) {
         self.write().exit_code = Some(code);
+    }
+
+    /// Whether the active session is a crash-dump (static) session. `false` for a live
+    /// launch/attach session and for a fresh (reset) session (task 1.4b).
+    pub fn is_dump(&self) -> bool {
+        self.read().is_dump
+    }
+
+    /// Mark whether the active session is a crash-dump session. `open_crash_dump` sets this
+    /// `true`; the execution handlers reject `continue`/`step_*` while it holds. Cleared by
+    /// [`SessionManager::reset`] (task 1.4b).
+    pub fn set_dump(&self, is_dump: bool) {
+        self.write().is_dump = is_dump;
     }
 
     /// Atomically apply the async-termination transition (record the exit code, set state

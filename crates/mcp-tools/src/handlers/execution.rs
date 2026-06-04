@@ -107,6 +107,13 @@ impl ToolServer {
             return ToolOutcome::error(e);
         }
 
+        // A crash-dump session is Stopped but static — you cannot resume it. Reject
+        // continue/step_* with the frozen Phase-1 contract literal (task 1.4b), before
+        // touching the backend or the running-state transition.
+        if self.session.is_dump() {
+            return ToolOutcome::error(DUMP_NO_CONTINUE);
+        }
+
         let thread_id = match self.resolve_thread_id(args) {
             Ok(tid) => tid,
             Err(e) => return ToolOutcome::error(e),
@@ -293,6 +300,11 @@ fn parse_granularity(args: &Args<'_>) -> Option<Granularity> {
         _ => None,
     }
 }
+
+/// The frozen tool-error returned when `continue`/`step_*` is invoked on a crash-dump
+/// session (task 1.4b). This EXACT string is the Phase-1 contract that Phase 2's
+/// `dbgeng-sys` and the Phase-4 dump implementation are written against — do not reword.
+const DUMP_NO_CONTINUE: &str = "cannot continue a crash-dump session";
 
 const CONTINUE_TIMEOUT: &str = "continue timed out; process still running, use 'pause' to stop it";
 const STEP_OVER_TIMEOUT: &str =

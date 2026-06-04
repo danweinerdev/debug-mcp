@@ -121,6 +121,7 @@ fn reset_restores_idle_baseline() {
     });
     sm.set_frame_mapping(HashMap::from([(0, 100), (1, 200)]));
     sm.output_buffer().append("stdout", "hello");
+    sm.set_dump(true);
 
     sm.reset();
 
@@ -131,6 +132,32 @@ fn reset_restores_idle_baseline() {
     assert_eq!(sm.last_stopped(), None);
     assert!(sm.frame_mapping().is_empty());
     assert!(sm.output_buffer().drain().is_empty());
+    assert!(!sm.is_dump(), "reset must clear is_dump");
+}
+
+#[test]
+fn is_dump_defaults_false_round_trips_and_reset_clears() {
+    // Task 1.4b: the dump flag defaults false, round-trips through set_dump, and is cleared
+    // by reset (so a fresh session after disconnect is not a dump).
+    let sm = SessionManager::new();
+    assert!(!sm.is_dump(), "is_dump must default to false");
+
+    sm.set_dump(true);
+    assert!(
+        sm.is_dump(),
+        "set_dump(true) must be observable via is_dump"
+    );
+
+    sm.reset();
+    assert!(
+        !sm.is_dump(),
+        "reset must clear the dump flag back to false"
+    );
+
+    // set_dump(false) is also honored independently of reset.
+    sm.set_dump(true);
+    sm.set_dump(false);
+    assert!(!sm.is_dump());
 }
 
 #[test]

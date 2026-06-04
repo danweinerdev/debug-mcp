@@ -343,6 +343,83 @@ async fn continue_after_disconnect_does_not_clobber_idle() {
 }
 
 #[tokio::test]
+async fn dump_session_rejects_all_resume_handlers_with_frozen_string() {
+    // Task 1.4b: a crash-dump session is Stopped but static. Each of continue/step_* must
+    // return the EXACT frozen contract literal and must NOT reach the backend.
+    for which in ["continue", "step_over", "step_into", "step_out"] {
+        let h = Harness::connected(State::Stopped).await;
+        h.session.set_dump(true);
+        let empty = args(&[]);
+        let ct = token();
+        let out = match which {
+            "continue" => {
+                h.server
+                    .handle_continue(&crate::Args::new(&empty), &ct)
+                    .await
+            }
+            "step_over" => {
+                h.server
+                    .handle_step_over(&crate::Args::new(&empty), &ct)
+                    .await
+            }
+            "step_into" => {
+                h.server
+                    .handle_step_into(&crate::Args::new(&empty), &ct)
+                    .await
+            }
+            "step_out" => {
+                h.server
+                    .handle_step_out(&crate::Args::new(&empty), &ct)
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            expect_error(&out),
+            "cannot continue a crash-dump session",
+            "{which} must return the frozen dump-rejection literal"
+        );
+        // The backend was never invoked, and the dump session stays Stopped (the guard runs
+        // before set_state(Running)).
+        assert!(
+            !h.calls()
+                .iter()
+                .any(|c| matches!(c, Call::Cont { .. } | Call::Step { .. })),
+            "{which} must not reach the backend on a dump session"
+        );
+        assert_eq!(h.session.state(), State::Stopped);
+    }
+}
+
+#[tokio::test]
+async fn non_dump_session_continue_still_reaches_backend() {
+    // Regression guard for task 1.4b: with is_dump=false the resume path proceeds to the
+    // backend exactly as before (the dump guard must not affect live sessions). Covers both
+    // `continue` and a representative step handler so the guard is provably resume-wide.
+    let empty = args(&[]);
+
+    let h = Harness::connected(State::Stopped).await;
+    assert!(!h.session.is_dump());
+    h.state.lock().unwrap().cont_result = Some(Ok(StopOutcome::Stopped(stop("breakpoint", 1))));
+    let out = h
+        .server
+        .handle_continue(&crate::Args::new(&empty), &token())
+        .await;
+    assert_eq!(expect_json(&out)["status"], json!("stopped"));
+    assert!(h.calls().iter().any(|c| matches!(c, Call::Cont { .. })));
+
+    let hs = Harness::connected(State::Stopped).await;
+    assert!(!hs.session.is_dump());
+    hs.state.lock().unwrap().step_result = Some(Ok(StopOutcome::Stopped(stop("step", 1))));
+    let out = hs
+        .server
+        .handle_step_over(&crate::Args::new(&empty), &token())
+        .await;
+    assert_eq!(expect_json(&out)["status"], json!("stopped"));
+    assert!(hs.calls().iter().any(|c| matches!(c, Call::Step { .. })));
+}
+
+#[tokio::test]
 async fn pause_returns_pause_requested_without_state_change() {
     let h = Harness::connected(State::Running).await;
     let empty = args(&[]);

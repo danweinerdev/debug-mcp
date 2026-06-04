@@ -104,7 +104,9 @@ impl ToolServer {
         // a later `backtrace` falls back to the default thread. Phase 4 + the is_dump flag
         // (task 1.4b) refine dump-thread handling.
         self.session.set_state(State::Stopped);
-        // TODO(1.4b): mark session is_dump
+        // Freeze the dump-session contract (task 1.4b): a dump session is Stopped but cannot
+        // be resumed — the execution handlers reject continue/step_* while this flag holds.
+        self.session.set_dump(true);
 
         let mut builder = RespBuilder::new()
             .set("status", "dump_loaded")
