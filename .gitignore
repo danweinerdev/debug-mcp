@@ -7,3 +7,16 @@
 
 # Editor / IDE state.
 /.vscode
+
+# Compiled C test fixtures (built locally / in CI from the .c sources)
+testdata/*.exe
+testdata/**/*.exe
+testdata/**/*.pdb
+testdata/**/*.ilk
+testdata/**/*.obj
+# Unix fixtures have no extension; ignore the known built binaries by name.
+testdata/simple
+testdata/loop
+testdata/crash
+testdata/structs
+testdata/multithread
