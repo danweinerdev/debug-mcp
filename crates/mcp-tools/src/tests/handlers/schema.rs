@@ -6,7 +6,6 @@ use rmcp::ServerHandler;
 use serde_json::Value;
 
 use crate::tests::handlers::support::Harness;
-use crate::ToolServer;
 
 /// The verbatim (name, description) inventory from Spec FR-2.
 const INVENTORY: [(&str, &str); 21] = [
@@ -47,7 +46,9 @@ const INVENTORY: [(&str, &str); 21] = [
 
 #[test]
 fn exactly_21_tools_with_verbatim_names_and_descriptions() {
-    let tools = ToolServer::tools();
+    // The default test harness registers only the all-false-capability `fake` factory, so
+    // the advertised set is exactly the 21 base tools.
+    let tools = Harness::new().server.tools();
     assert_eq!(tools.len(), 21, "exactly 21 tools (Spec FR-2)");
     for (i, (name, desc)) in INVENTORY.iter().enumerate() {
         assert_eq!(tools[i].name, *name, "tool {i} name");
@@ -61,7 +62,7 @@ fn exactly_21_tools_with_verbatim_names_and_descriptions() {
 
 #[test]
 fn launch_schema_types_and_required() {
-    let tools = ToolServer::tools();
+    let tools = Harness::new().server.tools();
     let launch = tools.iter().find(|t| t.name == "launch").unwrap();
     let schema = Value::Object((*launch.input_schema).clone());
     assert_eq!(schema["type"], "object");
@@ -78,7 +79,7 @@ fn launch_schema_types_and_required() {
 
 #[test]
 fn enums_present_on_step_and_variables() {
-    let tools = ToolServer::tools();
+    let tools = Harness::new().server.tools();
     let step_over = tools.iter().find(|t| t.name == "step_over").unwrap();
     let schema = Value::Object((*step_over.input_schema).clone());
     let enum_vals = schema["properties"]["granularity"]["enum"]
@@ -104,7 +105,7 @@ fn enums_present_on_step_and_variables() {
 
 #[test]
 fn paramless_tools_have_no_required_array() {
-    let tools = ToolServer::tools();
+    let tools = Harness::new().server.tools();
     for name in [
         "status",
         "list_breakpoints",
@@ -123,7 +124,7 @@ fn paramless_tools_have_no_required_array() {
 
 #[test]
 fn read_memory_count_is_number_and_required() {
-    let tools = ToolServer::tools();
+    let tools = Harness::new().server.tools();
     let rm = tools.iter().find(|t| t.name == "read_memory").unwrap();
     let schema = Value::Object((*rm.input_schema).clone());
     assert_eq!(schema["properties"]["count"]["type"], "number");
@@ -149,4 +150,195 @@ fn get_tool_resolves_registered_names() {
     assert!(h.server.get_tool("launch").is_some());
     assert!(h.server.get_tool("run_command").is_some());
     assert!(h.server.get_tool("nonexistent").is_none());
+}
+
+// ---- task 1.3: capability-gated listing + the backend selector property ----
+
+/// The four capability-gated tool names, in `all_tools` append order.
+const GATED: [&str; 4] = [
+    "open_crash_dump",
+    "attach_kernel",
+    "analyze_crash",
+    "get_modules",
+];
+
+#[test]
+fn all_false_caps_yield_exactly_the_21_base_tools() {
+    use debugger_core::BackendCapabilities;
+    let tools = crate::schema::all_tools(BackendCapabilities::default());
+    assert_eq!(tools.len(), 21, "no capabilities ⇒ the 21 base tools");
+    for gated in GATED {
+        assert!(
+            !tools.iter().any(|t| t.name == gated),
+            "{gated} must be absent under all-false caps"
+        );
+    }
+}
+
+#[test]
+fn all_true_caps_append_the_four_gated_tools() {
+    use debugger_core::BackendCapabilities;
+    let caps = BackendCapabilities {
+        crash_dump: true,
+        kernel: true,
+        analyze: true,
+        modules: true,
+    };
+    let tools = crate::schema::all_tools(caps);
+    assert_eq!(tools.len(), 25, "all capabilities ⇒ 21 + 4 gated tools");
+    for gated in GATED {
+        assert!(
+            tools.iter().any(|t| t.name == gated),
+            "{gated} must be present under all-true caps"
+        );
+    }
+    // The base 21 still lead, unchanged in name/order.
+    for (i, (name, _)) in INVENTORY.iter().enumerate() {
+        assert_eq!(tools[i].name, *name, "base tool {i} unchanged");
+    }
+}
+
+#[test]
+fn each_capability_gates_only_its_own_tool() {
+    use debugger_core::BackendCapabilities;
+    let cases: [(BackendCapabilities, &str); 4] = [
+        (
+            BackendCapabilities {
+                crash_dump: true,
+                ..BackendCapabilities::default()
+            },
+            "open_crash_dump",
+        ),
+        (
+            BackendCapabilities {
+                kernel: true,
+                ..BackendCapabilities::default()
+            },
+            "attach_kernel",
+        ),
+        (
+            BackendCapabilities {
+                analyze: true,
+                ..BackendCapabilities::default()
+            },
+            "analyze_crash",
+        ),
+        (
+            BackendCapabilities {
+                modules: true,
+                ..BackendCapabilities::default()
+            },
+            "get_modules",
+        ),
+    ];
+    for (caps, expected) in cases {
+        let tools = crate::schema::all_tools(caps);
+        assert_eq!(tools.len(), 22, "exactly one gated tool appended");
+        assert!(
+            tools.iter().any(|t| t.name == expected),
+            "{expected} present for its flag"
+        );
+        for other in GATED.iter().filter(|g| **g != expected) {
+            assert!(
+                !tools.iter().any(|t| t.name == *other),
+                "{other} absent when only its sibling flag is set"
+            );
+        }
+    }
+}
+
+#[test]
+fn gated_tool_schemas_match_the_design_surface() {
+    use debugger_core::BackendCapabilities;
+    let caps = BackendCapabilities {
+        crash_dump: true,
+        kernel: true,
+        analyze: true,
+        modules: true,
+    };
+    let tools = crate::schema::all_tools(caps);
+    let by_name = |name: &str| {
+        let t = tools.iter().find(|t| t.name == name).unwrap();
+        Value::Object((*t.input_schema).clone())
+    };
+
+    // open_crash_dump: required dump_path (string) + optional backend enum.
+    let ocd = by_name("open_crash_dump");
+    assert_eq!(ocd["properties"]["dump_path"]["type"], "string");
+    assert_eq!(ocd["properties"]["backend"]["type"], "string");
+    let req = ocd["required"].as_array().unwrap();
+    assert!(req.iter().any(|v| v == "dump_path"));
+    assert!(!req.iter().any(|v| v == "backend"));
+
+    // attach_kernel: required connection (string) + optional backend enum.
+    let ak = by_name("attach_kernel");
+    assert_eq!(ak["properties"]["connection"]["type"], "string");
+    let req = ak["required"].as_array().unwrap();
+    assert!(req.iter().any(|v| v == "connection"));
+    assert!(!req.iter().any(|v| v == "backend"));
+
+    // analyze_crash / get_modules: no args ⇒ no required array.
+    for paramless in ["analyze_crash", "get_modules"] {
+        assert!(
+            by_name(paramless).get("required").is_none(),
+            "{paramless} takes no args"
+        );
+    }
+}
+
+#[test]
+fn launch_and_attach_gained_optional_backend_enum() {
+    use debugger_core::BackendCapabilities;
+    let tools = crate::schema::all_tools(BackendCapabilities::default());
+    for name in ["launch", "attach"] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        let schema = Value::Object((*tool.input_schema).clone());
+        assert_eq!(
+            schema["properties"]["backend"]["type"], "string",
+            "{name} backend is a string"
+        );
+        let enum_vals = schema["properties"]["backend"]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} backend has an enum"));
+        assert_eq!(
+            enum_vals,
+            &[Value::from("lldb"), Value::from("windbg")],
+            "{name} backend enum values"
+        );
+        // backend is NOT required. `attach` has no required props at all (its `required`
+        // array is omitted entirely), so absence-or-not-present both satisfy "optional".
+        let backend_required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|req| req.iter().any(|v| v == "backend"));
+        assert!(!backend_required, "{name} backend must be optional");
+    }
+}
+
+#[test]
+fn the_19_other_base_tool_schemas_are_unchanged() {
+    use debugger_core::BackendCapabilities;
+    // Snapshot guard: the base tool-name set (sorted) is exactly the existing 21. Only
+    // `launch`/`attach` gained the optional `backend` prop; every other tool keeps its
+    // exact property set, so the 19 untouched tools cannot drift. We assert no tool other
+    // than launch/attach exposes a `backend` property.
+    let tools = crate::schema::all_tools(BackendCapabilities::default());
+
+    let mut got: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    got.sort_unstable();
+    let mut expected: Vec<&str> = INVENTORY.iter().map(|(n, _)| *n).collect();
+    expected.sort_unstable();
+    assert_eq!(got, expected, "the base tool-name set is exactly the 21");
+
+    for tool in &tools {
+        if tool.name == "launch" || tool.name == "attach" {
+            continue;
+        }
+        let schema = Value::Object((*tool.input_schema).clone());
+        assert!(
+            schema["properties"].get("backend").is_none(),
+            "{} must not gain a backend property",
+            tool.name
+        );
+    }
 }

@@ -40,7 +40,7 @@ impl Harness {
         let h = Harness::new();
         h.session.set_state(session_state);
         let backend = Arc::new(FakeBackend::new(Arc::clone(&h.state)));
-        h.server.set_backend(backend).await;
+        h.server.set_backend(backend, "fake").await;
         h
     }
 

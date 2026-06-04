@@ -40,6 +40,12 @@ pub struct ToolServer {
     pub(crate) session: Arc<SessionManager>,
     pub(crate) registry: BackendRegistry,
     pub(crate) backend: RwLock<Option<Arc<dyn DebuggerBackend>>>,
+    /// The name of the factory selected for the active session (set at connect, cleared on
+    /// teardown). `status` reports this when a session is live so it reflects the backend
+    /// actually in use (e.g. an explicit `backend` arg), not just the per-OS default. A plain
+    /// `std::sync::Mutex` because `handle_status` is sync (no `.await`); it is held only for
+    /// an instant set/clear/read and never across the async backend lock.
+    pub(crate) active_backend_name: std::sync::Mutex<Option<&'static str>>,
 }
 
 impl ToolServer {
@@ -50,7 +56,17 @@ impl ToolServer {
             session,
             registry,
             backend: RwLock::new(None),
+            active_backend_name: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The factory name of the active session's backend, if one is connected. Sync-readable
+    /// for `handle_status`.
+    pub(crate) fn active_backend_name(&self) -> Option<&'static str> {
+        *self
+            .active_backend_name
+            .lock()
+            .expect("name lock not poisoned")
     }
 
     /// A clone of the connected backend, or `None` when no session is active. Held only
@@ -60,15 +76,25 @@ impl ToolServer {
         self.backend.read().await.clone()
     }
 
-    /// Store the connected backend (set during launch/attach connect).
-    pub(crate) async fn set_backend(&self, backend: Arc<dyn DebuggerBackend>) {
+    /// Store the connected backend and record the selected factory name (set during
+    /// launch/attach connect).
+    pub(crate) async fn set_backend(&self, backend: Arc<dyn DebuggerBackend>, name: &'static str) {
         *self.backend.write().await = Some(backend);
+        *self
+            .active_backend_name
+            .lock()
+            .expect("name lock not poisoned") = Some(name);
     }
 
     /// Drop the connected backend (disconnect / connect-failure cleanup). Dropping the
-    /// last `Arc` tears down the subprocess and ends the event-pump stream.
+    /// last `Arc` tears down the subprocess and ends the event-pump stream. Also clears the
+    /// recorded backend name.
     pub(crate) async fn clear_backend(&self) {
         *self.backend.write().await = None;
+        *self
+            .active_backend_name
+            .lock()
+            .expect("name lock not poisoned") = None;
     }
 
     /// Dispatch a parsed tool call to its handler. Returns the neutral [`ToolOutcome`];
@@ -123,9 +149,11 @@ impl ToolServer {
         &self.session
     }
 
-    /// The 21 tool definitions (verbatim names/descriptions + hand-built schemas).
-    pub fn tools() -> Vec<Tool> {
-        schema::all_tools()
+    /// The advertised tool definitions: the 21 base tools plus the capability-gated WinDbg
+    /// tools the registry's union exposes (verbatim names/descriptions + hand-built schemas).
+    /// Takes `&self` so it can read the registry's capability union (lldb-only ⇒ 21 tools).
+    pub fn tools(&self) -> Vec<Tool> {
+        schema::all_tools(self.registry.capabilities())
     }
 }
 
@@ -167,7 +195,7 @@ impl ServerHandler for ToolServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult {
-            tools: Self::tools(),
+            tools: self.tools(),
             ..Default::default()
         })
     }
@@ -187,6 +215,6 @@ impl ServerHandler for ToolServer {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        Self::tools().into_iter().find(|t| t.name == name)
+        self.tools().into_iter().find(|t| t.name == name)
     }
 }

@@ -39,6 +39,45 @@ async fn status_idle() {
 }
 
 #[tokio::test]
+async fn status_reports_default_and_available_backends() {
+    // task 1.3: the additive `backend` (the registry's per-OS default) and
+    // `available_backends` (registered names) fields, alongside the unchanged existing keys.
+    // The default `Harness` registers one `fake` factory whose name is also the default.
+    let h = Harness::new();
+    let v = expect_json(&h.server.handle_status()).clone();
+    assert_eq!(v["backend"], json!("fake"), "default backend name");
+    assert_eq!(
+        v["available_backends"],
+        json!(["fake"]),
+        "registered backends as a JSON array"
+    );
+    // Existing idle-state keys are unchanged.
+    assert_eq!(v["state"], json!("idle"));
+    assert_eq!(v["message"], json!("No active debug session"));
+}
+
+#[tokio::test]
+async fn status_backend_fields_appear_in_every_state() {
+    // The additive fields are state-independent (set before the per-state match), so they
+    // appear in EVERY state. With no backend connected, `backend` falls back to the registry
+    // default ("fake" for the Harness's single-factory registry).
+    for state in [
+        State::Idle,
+        State::Configuring,
+        State::Stopped,
+        State::Running,
+        State::Terminated,
+    ] {
+        let h = Harness::new();
+        h.set_state(state);
+        let v = expect_json(&h.server.handle_status()).clone();
+        assert_eq!(v["backend"], json!("fake"), "state {state:?}");
+        assert_eq!(v["available_backends"], json!(["fake"]), "state {state:?}");
+        assert_eq!(v["state"], json!(state.to_string()), "state {state:?}");
+    }
+}
+
+#[tokio::test]
 async fn status_configuring() {
     let h = Harness::new();
     h.set_state(State::Configuring);

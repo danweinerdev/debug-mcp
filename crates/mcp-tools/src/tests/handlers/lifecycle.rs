@@ -701,3 +701,191 @@ async fn disconnect_with_no_backend_still_succeeds() {
     assert_eq!(expect_json(&out)["status"], json!("disconnected"));
     assert_eq!(h.session.state(), State::Idle);
 }
+
+// ---- task 1.3: the `backend` selector arg threads into registry.select ----
+
+#[tokio::test]
+async fn launch_unknown_backend_arg_errors_and_resets() {
+    // An explicit unknown `backend` is rejected by the registry; the handler surfaces the
+    // tool-error and resets the session to idle (the connect-failure cleanup path). No
+    // connect is attempted (the named fake never records a Launch).
+    let state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let factory = crate::tests::fake::named_factory("lldb", Arc::clone(&state));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(factory),
+    );
+    let a = args(&[("program", json!("/bin/p")), ("backend", json!("nope"))]);
+    let out = server.handle_launch(&crate::Args::new(&a), &token()).await;
+    assert_eq!(
+        expect_error(&out),
+        "unknown backend 'nope'; available: lldb"
+    );
+    assert_eq!(session.state(), State::Idle);
+    assert!(
+        state.lock().unwrap().calls.is_empty(),
+        "no connect attempted"
+    );
+}
+
+#[tokio::test]
+async fn launch_explicit_backend_arg_selects_that_factory() {
+    // Two registered factories ("lldb" default, "alt"); an explicit `backend="alt"` must
+    // route the connect to the "alt" factory even though the default is "lldb". We prove the
+    // routing by gating the connect failure on the SELECTED factory: only "alt" is wired to
+    // fail (with its own name), so the verbatim error proves "alt" was chosen.
+    let lldb_state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let alt_state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let lldb = crate::tests::fake::named_factory("lldb", lldb_state);
+    let alt = Arc::new(crate::tests::fake::FakeFactory::with_named_connect_error(
+        Arc::clone(&alt_state),
+        "alt",
+        debugger_core::BackendError::Detect("boom".to_string()),
+    ));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::two_factory_registry("lldb", lldb, alt),
+    );
+    let a = args(&[("program", json!("/bin/p")), ("backend", json!("alt"))]);
+    let out = server.handle_launch(&crate::Args::new(&a), &token()).await;
+    // The generic connect_error wording keyed on the SELECTED factory's name ("alt").
+    assert_eq!(expect_error(&out), "failed to find alt: boom");
+    assert_eq!(session.state(), State::Idle);
+}
+
+#[tokio::test]
+async fn launch_explicit_backend_arg_routes_to_registered_factory_success() {
+    // The happy path: an explicit `backend` naming a registered factory connects through it
+    // and launches (the fake records a Launch and returns Running).
+    let lldb_state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let alt_state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    alt_state.lock().unwrap().launch_outcome = Some(Ok(LaunchOutcome::Running));
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let lldb = crate::tests::fake::named_factory("lldb", Arc::clone(&lldb_state));
+    let alt = crate::tests::fake::named_factory("alt", Arc::clone(&alt_state));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::two_factory_registry("lldb", lldb, alt),
+    );
+    let a = args(&[
+        ("program", json!("/bin/p")),
+        ("stop_on_entry", json!(false)),
+        ("backend", json!("alt")),
+    ]);
+    let out = server.handle_launch(&crate::Args::new(&a), &token()).await;
+    assert_eq!(expect_json(&out)["state"], json!("running"));
+    assert_eq!(session.state(), State::Running);
+    // The "alt" factory's backend ran the launch; the "lldb" factory was untouched.
+    assert!(alt_state.lock().unwrap().calls.contains(&Call::Launch));
+    assert!(lldb_state.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn attach_unknown_backend_arg_errors_and_resets() {
+    let state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let factory = crate::tests::fake::named_factory("lldb", Arc::clone(&state));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(factory),
+    );
+    let a = args(&[("pid", json!(1234)), ("backend", json!("nope"))]);
+    let out = server.handle_attach(&crate::Args::new(&a), &token()).await;
+    assert_eq!(
+        expect_error(&out),
+        "unknown backend 'nope'; available: lldb"
+    );
+    assert_eq!(session.state(), State::Idle);
+    assert!(
+        state.lock().unwrap().calls.is_empty(),
+        "no connect attempted"
+    );
+}
+
+#[tokio::test]
+async fn attach_explicit_backend_arg_routes_to_registered_factory_success() {
+    // Happy path for attach routing (symmetric with the launch routing test): an explicit
+    // `backend="alt"` connects through the "alt" factory, which records an Attach.
+    let lldb_state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let alt_state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    alt_state.lock().unwrap().attach_outcome = Some(Ok(AttachOutcome::Stopped(stop("entry", 1))));
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let lldb = crate::tests::fake::named_factory("lldb", Arc::clone(&lldb_state));
+    let alt = crate::tests::fake::named_factory("alt", Arc::clone(&alt_state));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::two_factory_registry("lldb", lldb, alt),
+    );
+    let a = args(&[("pid", json!(1234)), ("backend", json!("alt"))]);
+    let out = server.handle_attach(&crate::Args::new(&a), &token()).await;
+    assert_eq!(expect_json(&out)["state"], json!("stopped"));
+    assert_eq!(session.state(), State::Stopped);
+    assert!(alt_state.lock().unwrap().calls.contains(&Call::Attach));
+    assert!(lldb_state.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn status_reports_the_active_backend_then_default_after_disconnect() {
+    // The `status` `backend` field reflects the backend ACTUALLY in use (recorded at connect),
+    // not just the per-OS default — and reverts to the default after disconnect. Proves the
+    // active-name recording in set_backend / clear path.
+    let lldb_state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let alt_state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    alt_state.lock().unwrap().launch_outcome = Some(Ok(LaunchOutcome::Running));
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let lldb = crate::tests::fake::named_factory("lldb", Arc::clone(&lldb_state));
+    let alt = crate::tests::fake::named_factory("alt", Arc::clone(&alt_state));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::two_factory_registry("lldb", lldb, alt),
+    );
+
+    // Pre-connect: status reports the per-OS default ("lldb").
+    assert_eq!(
+        expect_json(&server.handle_status())["backend"],
+        json!("lldb")
+    );
+
+    // Connect via the non-default "alt" backend.
+    let a = args(&[
+        ("program", json!("/bin/p")),
+        ("stop_on_entry", json!(false)),
+        ("backend", json!("alt")),
+    ]);
+    let _ = server.handle_launch(&crate::Args::new(&a), &token()).await;
+    assert_eq!(
+        expect_json(&server.handle_status())["backend"],
+        json!("alt"),
+        "status must report the active backend, not the default"
+    );
+
+    // Disconnect clears it back to the default.
+    let d = args(&[]);
+    let _ = server.handle_disconnect(&crate::Args::new(&d)).await;
+    assert_eq!(
+        expect_json(&server.handle_status())["backend"],
+        json!("lldb")
+    );
+}

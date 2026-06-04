@@ -44,6 +44,9 @@ impl ToolServer {
             Err(e) => return ToolOutcome::error(e),
         };
         let stop_on_entry = args.get_bool("stop_on_entry", true);
+        // Optional explicit backend selector (empty ⇒ unset; registry falls through to
+        // DEBUG_BACKEND then the per-OS default).
+        let backend = args.get_string("backend", "");
 
         // Set state configuring (Go launch.go:76).
         self.session.set_state(State::Configuring);
@@ -64,8 +67,8 @@ impl ToolServer {
 
         // Resolve the backend factory (explicit arg → DEBUG_BACKEND → per-OS default). An
         // unknown/unregistered backend is a tool-error; reset the session like a connect
-        // failure. TODO(1.3): pass the parsed `backend` arg instead of `None`.
-        let factory = match self.registry.select(None) {
+        // failure.
+        let factory = match self.registry.select(backend_select(&backend)) {
             Ok(f) => f,
             Err(e) => {
                 self.session.reset();
@@ -89,7 +92,8 @@ impl ToolServer {
         // Terminated event during the handshake reaches the session (not dropped). The
         // pump captures the current generation; a later disconnect bumps it, so a stale
         // Terminated cannot clobber the reset idle state (design Decision 6).
-        self.set_backend(Arc::clone(&connection.backend)).await;
+        self.set_backend(Arc::clone(&connection.backend), factory.name())
+            .await;
         let generation = self.session.generation();
         spawn_event_pump(connection.events, Arc::clone(&self.session), generation);
 
@@ -214,9 +218,11 @@ impl ToolServer {
 
         self.session.set_state(State::Configuring);
 
+        // Optional explicit backend selector (empty ⇒ unset).
+        let backend = args.get_string("backend", "");
+
         // Resolve the backend factory (explicit arg → DEBUG_BACKEND → per-OS default).
-        // TODO(1.3): pass the parsed `backend` arg instead of `None`.
-        let factory = match self.registry.select(None) {
+        let factory = match self.registry.select(backend_select(&backend)) {
             Ok(f) => f,
             Err(e) => {
                 self.session.reset();
@@ -234,7 +240,8 @@ impl ToolServer {
             }
         };
 
-        self.set_backend(Arc::clone(&connection.backend)).await;
+        self.set_backend(Arc::clone(&connection.backend), factory.name())
+            .await;
         let generation = self.session.generation();
         spawn_event_pump(connection.events, Arc::clone(&self.session), generation);
 
@@ -328,6 +335,10 @@ impl ToolServer {
     /// connects anew (session reuse, Spec FR-6).
     async fn drop_backend_bounded(&self) {
         let backend = self.backend.write().await.take();
+        *self
+            .active_backend_name
+            .lock()
+            .expect("name lock not poisoned") = None;
         if let Some(backend) = backend {
             let (tx, rx) = oneshot::channel::<()>();
             tokio::spawn(async move {
@@ -343,6 +354,17 @@ impl ToolServer {
     async fn cleanup_after_cancel(&self) {
         self.clear_backend().await;
         self.session.reset();
+    }
+}
+
+/// Translate the optional `backend` arg into the registry's `select` request: an empty
+/// string (absent arg or `""`) is treated as unset (`None`) so the registry falls through to
+/// `DEBUG_BACKEND` then the per-OS default; a non-empty value is an explicit request.
+fn backend_select(backend: &str) -> Option<&str> {
+    if backend.is_empty() {
+        None
+    } else {
+        Some(backend)
     }
 }
 

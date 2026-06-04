@@ -28,6 +28,19 @@ impl ToolServer {
         let state = self.session.state();
         let mut builder = RespBuilder::new().set("state", state.to_string());
 
+        // Additive backend-awareness fields (task 1.3): `backend` is the factory actually in
+        // use for the active session (recorded at connect — reflects an explicit `backend`
+        // arg), falling back to the per-OS default a no-arg launch/attach would select when no
+        // session is connected. `available_backends` lists the registered backends. Neither
+        // changes any existing per-state key.
+        let backend = self
+            .active_backend_name()
+            .unwrap_or_else(|| self.registry.default_name());
+        builder = builder.set("backend", backend).set(
+            "available_backends",
+            Value::from(self.registry.available_names()),
+        );
+
         match state {
             State::Idle => {
                 builder = builder.set("message", "No active debug session");

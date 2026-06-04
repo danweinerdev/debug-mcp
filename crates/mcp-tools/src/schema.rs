@@ -10,8 +10,22 @@
 
 use std::sync::Arc;
 
+use debugger_core::BackendCapabilities;
 use rmcp::model::{JsonObject, Tool};
 use serde_json::{json, Map, Value};
+
+/// The `backend` property shared by `launch`/`attach` (and the capability-gated
+/// `open_crash_dump`/`attach_kernel`): an optional string enum selecting the debugger
+/// backend, never `required`. Defaults are resolved per-OS by the [`BackendRegistry`]
+/// (windbg on Windows, lldb on macOS/Linux).
+fn backend_prop() -> Prop {
+    string_enum_prop(
+        "backend",
+        "Which debugger backend to use; defaults per-OS (windbg on Windows, lldb on macOS/Linux)",
+        &["lldb", "windbg"],
+        false,
+    )
+}
 
 /// One property's `(name, schema-fragment, required)`. The fragment is the JSON-Schema for
 /// that property (type + description + optional enum).
@@ -87,8 +101,77 @@ fn tool(name: &'static str, description: &'static str, props: &[Prop]) -> Tool {
     Tool::new_with_raw(name, Some(description.into()), object_schema(props))
 }
 
-/// The 21 tools in Go registration order (Spec FR-2). Names and descriptions are verbatim.
-pub fn all_tools() -> Vec<Tool> {
+/// The advertised tool set: the 21 base tools (Go registration order, Spec FR-2; names and
+/// descriptions verbatim) followed by the capability-gated WinDbg tools appended only when
+/// the matching `caps` flag is set (design §"Capability-aware tool listing"). On a backend
+/// registry with no extra capabilities (lldb only) this returns exactly the 21 base tools.
+pub fn all_tools(caps: BackendCapabilities) -> Vec<Tool> {
+    let mut tools = base_tools();
+    if caps.crash_dump {
+        tools.push(open_crash_dump_tool());
+    }
+    if caps.kernel {
+        tools.push(attach_kernel_tool());
+    }
+    if caps.analyze {
+        tools.push(analyze_crash_tool());
+    }
+    if caps.modules {
+        tools.push(get_modules_tool());
+    }
+    tools
+}
+
+// The four capability-gated tool schemas (design §"Tool surface (additions)"), appended by
+// `all_tools` only when the corresponding `BackendCapabilities` flag is set.
+
+/// `open_crash_dump` (caps.crash_dump): postmortem dump analysis.
+fn open_crash_dump_tool() -> Tool {
+    tool(
+        "open_crash_dump",
+        "Open a crash/minidump for postmortem analysis",
+        &[
+            string_prop("dump_path", "Path to the crash/minidump file", true),
+            backend_prop(),
+        ],
+    )
+}
+
+/// `attach_kernel` (caps.kernel): live kernel debugging over KDNET.
+fn attach_kernel_tool() -> Tool {
+    tool(
+        "attach_kernel",
+        "Attach to a kernel target over KDNET",
+        &[
+            string_prop(
+                "connection",
+                "Kernel connection string, e.g. net:port=...,key=...",
+                true,
+            ),
+            backend_prop(),
+        ],
+    )
+}
+
+/// `analyze_crash` (caps.analyze): automated `!analyze -v`.
+fn analyze_crash_tool() -> Tool {
+    tool(
+        "analyze_crash",
+        "Run automated crash analysis (!analyze -v)",
+        &[],
+    )
+}
+
+/// `get_modules` (caps.modules): loaded-module listing.
+fn get_modules_tool() -> Tool {
+    tool(
+        "get_modules",
+        "List loaded modules with base/size/symbol status",
+        &[],
+    )
+}
+
+fn base_tools() -> Vec<Tool> {
     vec![
         tool(
             "launch",
@@ -102,6 +185,7 @@ pub fn all_tools() -> Vec<Tool> {
                     "stop_on_entry",
                     "Stop at program entry point (default true)",
                 ),
+                backend_prop(),
             ],
         ),
         tool(
@@ -110,6 +194,7 @@ pub fn all_tools() -> Vec<Tool> {
             &[
                 number_prop("pid", "Process ID to attach to", false),
                 string_prop("wait_for", "Process name to wait for", false),
+                backend_prop(),
             ],
         ),
         tool(

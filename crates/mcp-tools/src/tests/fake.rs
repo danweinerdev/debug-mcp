@@ -412,3 +412,31 @@ pub fn single_factory_registry(factory: Arc<dyn BackendFactory>) -> crate::Backe
     registry.register(factory);
     registry
 }
+
+/// A [`FakeFactory`] over `state` reporting the given `name` (so an explicit `backend` arg
+/// can resolve to it). Capabilities stay all-false (the default).
+pub fn named_factory(name: &'static str, state: Arc<Mutex<FakeState>>) -> Arc<FakeFactory> {
+    Arc::new(FakeFactory {
+        state,
+        connect_error: Mutex::new(None),
+        name,
+    })
+}
+
+/// Build a [`BackendRegistry`] over two factories, with `default_name` as the per-OS
+/// default. Lets a test thread an explicit `backend` arg to a *specific* registered factory
+/// (and assert an unknown name is rejected against the same available set).
+pub fn two_factory_registry(
+    default_name: &'static str,
+    a: Arc<dyn BackendFactory>,
+    b: Arc<dyn BackendFactory>,
+) -> crate::BackendRegistry {
+    debug_assert!(
+        default_name == a.name() || default_name == b.name(),
+        "two_factory_registry default '{default_name}' must be one of the registered factories",
+    );
+    let mut registry = crate::BackendRegistry::new(default_name);
+    registry.register(a);
+    registry.register(b);
+    registry
+}
