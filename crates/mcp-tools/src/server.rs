@@ -124,6 +124,10 @@ impl ToolServer {
             "read_memory" => self.handle_read_memory(args).await,
             "disassemble" => self.handle_disassemble(args).await,
             "run_command" => self.handle_run_command(args).await,
+            "open_crash_dump" => self.handle_open_crash_dump(args, ct).await,
+            "attach_kernel" => self.handle_attach_kernel(args, ct).await,
+            "analyze_crash" => self.handle_analyze_crash().await,
+            "get_modules" => self.handle_get_modules().await,
             other => ToolOutcome::error(format!("unknown tool: {other}")),
         }
     }

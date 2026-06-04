@@ -12,3 +12,4 @@ mod lifecycle;
 mod memory;
 mod schema;
 pub mod support;
+mod windbg;

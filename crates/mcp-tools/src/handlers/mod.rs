@@ -11,6 +11,8 @@
 //! - `memory`: `read_memory`, `disassemble`.
 //! - `output`: `read_output`.
 //! - `run_command`: `run_command`.
+//! - `windbg`: the capability-gated `open_crash_dump`, `attach_kernel`, `analyze_crash`,
+//!   `get_modules` (advertised only when a WinDbg-capable factory is registered).
 
 mod breakpoints;
 mod execution;
@@ -19,3 +21,4 @@ mod lifecycle;
 mod memory;
 mod output;
 mod run_command;
+mod windbg;

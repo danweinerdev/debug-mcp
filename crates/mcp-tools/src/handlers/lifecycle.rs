@@ -350,8 +350,9 @@ impl ToolServer {
     }
 
     /// Cleanup after a cancelled or failed launch/attach: drop the backend and reset to
-    /// idle (Go `cleanupSubprocess`). The backend's drop kills the subprocess.
-    async fn cleanup_after_cancel(&self) {
+    /// idle (Go `cleanupSubprocess`). The backend's drop kills the subprocess. Shared with
+    /// the WinDbg connect-point handlers (`open_crash_dump`/`attach_kernel`).
+    pub(crate) async fn cleanup_after_cancel(&self) {
         self.clear_backend().await;
         self.session.reset();
     }
@@ -374,8 +375,9 @@ fn backend_select(backend: &str) -> Option<&str> {
 /// For `"lldb"` the strings are **verbatim** the Go server's (Spec FR-4.4.2/4.4.3), so
 /// parity is preserved. For `"windbg"` the WinDbg wording is reserved (Phase 3 registers
 /// that factory). Any other backend name gets a generic `failed to find/spawn <name>`.
-/// The `Detect`/`Spawn` → string mapping shape is identical across backends.
-fn connect_error(backend: &str, err: BackendError) -> String {
+/// The `Detect`/`Spawn` → string mapping shape is identical across backends. Shared with
+/// the WinDbg connect-point handlers (`open_crash_dump`/`attach_kernel`).
+pub(crate) fn connect_error(backend: &str, err: BackendError) -> String {
     match err {
         BackendError::Detect(m) => match backend {
             // Verbatim Go string for lldb (parity preserved).
