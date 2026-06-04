@@ -10,7 +10,7 @@ deliverable: "A Windows-only `dbgeng-sys` crate that wraps the six DbgEng COM in
 tasks:
   - id: "2.1"
     title: "Crate scaffold + windows-crate interfaces (R1) + Engine::create + EngineError"
-    status: in-progress
+    status: complete
     verification: "`dbgeng-sys` is a `cfg(windows)` workspace member building on the `windows` crate; **R1 resolved** — the six interfaces (`IDebugClient5`/`Control4`/`Symbols3`/`DataSpaces4`/`Registers2`/`SystemObjects4`) are obtained via `DebugCreate` + `QueryInterface` (or a hand-rolled vtable for any missing method, documented); `Engine::create()` returns a live engine on a Windows host; the `unsafe`-confinement grep gate passes (`unsafe` appears only under `crates/dbgeng-sys/src/`); test files live in dedicated `tests/`/`src/tests/` folders (not inline `#[cfg(test)]`); `HRESULT`→`EngineError` mapping is unit-tested for success + a representative failure code. (Phase-entry task: the README phase-level `depends_on: [1]` gates the start — `dbgeng-sys` returns the `debugger-core` types added in Phase 1.)"
     depends_on: []
   - id: "2.2"
@@ -37,6 +37,13 @@ tasks:
 
 # Phase 2: dbgeng-sys — confined COM FFI → safe Engine
 
+> **Deviation (fixture pulled forward).** The Windows test fixture
+> `testdata/win/test_target.c` (+ `build.bat`) — originally slated for Phase 3 task 3.5 — was
+> created at the start of Phase 2, because tasks 2.2–2.5 need a live, PDB-bearing debuggable
+> target. Built with `cl /Zi /Od /MT` via vcvars (`.exe`/`.pdb` git-ignored). Scenarios:
+> `normal` (locals), `null` (null-deref AV), `av` (wild-pointer AV), `wait` (attach-by-pid).
+> Phase 3 task 3.5 now *reuses/extends* it rather than creating it.
+
 ## Overview
 
 Build the `dbgeng-sys` crate: the **only** place `unsafe` lives in the workspace. It wraps the
@@ -50,16 +57,19 @@ safe surface", §"`InterruptHandle`", and Migration Phase 1.
 ## 2.1: Crate scaffold + windows interfaces + Engine::create
 
 ### Subtasks
-- [ ] Add `crates/dbgeng-sys` as a `cfg(windows)` member; depend on `windows` (features for `Win32_System_Diagnostics_Debug` / `Extensions`) and `debugger-core` (neutral types only).
-- [ ] **Resolve R1:** confirm the six interfaces + the methods used are generated; for any gap, hand-roll a `#[repr(C)]` vtable in a `vtable` module (confined unsafe) and record it.
-- [ ] `Engine::create()`: `DebugCreate(IDebugClient5)` + 5×`QueryInterface` + `SetEventCallbacks`/`SetOutputCallbacks`; store the six pointers; set the symbol path + options.
-- [ ] Define `EngineError` (wraps `HRESULT` + context) and the `HRESULT`→`EngineError` mapper.
-- [ ] Add the `unsafe`-confinement grep gate (CI script) asserting `unsafe` only under `crates/dbgeng-sys/src/`.
+- [x] Add `crates/dbgeng-sys` as a `cfg(windows)` member; depend on `windows` (feature `Win32_System_Diagnostics_Debug_Extensions` + `Win32_Foundation` + `Win32_System_Diagnostics_Debug`) and `debugger-core`.
+- [x] **R1 RESOLVED:** the `windows` crate **v0.59** generates `DebugCreate` + all six interfaces (`IDebugClient5`/`Control4`/`Symbols3`/`DataSpaces4`/`Registers2`/`SystemObjects4`) and `.cast()` (QueryInterface); `DebugCreate` + the 6 QIs succeed at runtime on a Windows 11 host. **No hand-rolled vtables needed.**
+- [x] `Engine::create()`: `DebugCreate(IDebugClient5)` + 5×`QueryInterface` + symbol path (`s!("srv*")`, ANSI) + `SYMOPT_NO_IMAGE_SEARCH`; stores the six interface smart pointers (refcount via Clone/Drop). (`SetEventCallbacks`/`SetOutputCallbacks` deferred to 2.2 — callbacks don't exist yet.)
+- [x] Define `EngineError` (wraps `windows::core::Error` HRESULT + `&'static str` context) + `Display` mapping; unit-tested.
+- [x] Add the `unsafe`-confinement grep gate (`make unsafe-gate`, in `all:`/`check:`) asserting `unsafe` only under `crates/dbgeng-sys/`; added `#![forbid(unsafe_code)]` to all 7 other crate roots (none tripped it).
 
 ### Notes
-COM refcounting via the `windows` crate's `Drop` gives `AddRef`/`Release` for free; the C++
-`unique_ptr`-vs-COM-refcount footgun (callbacks AddRef'd by DbgEng) must be reproduced
-faithfully — model callback ownership so the refcount, not a Rust owner, drives teardown.
+COM refcounting via the `windows` crate's `Drop` gives `AddRef`/`Release` for free, so the C++
+manual-`Release` footgun does NOT apply — the six interfaces are held as smart pointers and drop
+in field order. The engine is `!Send`/`!Sync` (thread-confinement documented at the `DebugCreate`
+SAFETY block). **CI note for Phase 5:** `make unsafe-gate`/`make seam` use shell `!`-syntax that
+GNU Make-on-Windows (cmd.exe) can't execute — the Windows CI lane needs a bash shell or a
+PowerShell equivalent for these gates.
 
 ## 2.2: Callbacks + output sink
 

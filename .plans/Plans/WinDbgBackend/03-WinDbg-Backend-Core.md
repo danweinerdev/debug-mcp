@@ -104,7 +104,7 @@ the Phase-5 differential harness.
 
 ### Subtasks
 - [ ] Register `WinDbgFactory` in `main.rs` under `cfg(windows)`; flip the per-OS default.
-- [ ] Port `test/test_target.cpp` → `testdata/win/test_target.c` (+ a build script producing a PDB): normal run, null-deref, access-violation, infinite-wait-for-attach.
+- [x] ~~Port `test/test_target.cpp` → `testdata/win/test_target.c` (+ build script with PDB)~~ — **done early in Phase 2** (`testdata/win/test_target.c` + `build.bat`; normal/null/av/wait). Phase 3 *reuses* it; extend only if a scenario is missing.
 - [ ] Add the `integration-windbg` Cargo feature + `cfg(windows)` gate; port the Normal/Attach/Pause groups.
 - [ ] Run tsan over the engine-thread/`InterruptHandle` interaction.
 
