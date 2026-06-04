@@ -129,10 +129,16 @@ Carried from the approved design (see `Designs/WinDbgBackend` Design Decisions 1
    `gc`-can't-re-enter workaround; eval-fail ⇒ skip (documented footgun).
 6. **Reuse the neutral `BackendEvent` stream + `OutputBuffer`** unchanged — an output sink
    forwards DbgEng output onto a `tokio::mpsc`; process exit/EOF → `Terminated`.
-7. **`BackendRegistry` switcher** — agent selects at the connect points (`backend` arg → env →
-   per-OS default: windbg on Windows, lldb elsewhere); both factories registered.
-8. **Windows-only tests behind `integration-windbg` + `cfg(windows)`**; CI gains a Windows
-   lane; the existing Linux/macOS lane is untouched.
+7. **`BackendRegistry` switcher + platform-exclusive registration** — agent selects at the
+   connect points (`backend` arg → env → per-OS default: windbg on Windows, lldb elsewhere).
+   Each OS registers exactly one backend at compile time (`LldbFactory` under
+   `cfg(not(windows))`, `WinDbgFactory` under `cfg(windows)`); lldb-on-Windows is deferred and
+   the retained switcher makes it a one-line addition later.
+8. **Tests run only on the platform their backend supports.** lldb's platform-bound tests are
+   Unix-gated (`subprocess.rs` = `cfg(unix)`; the `integration` feature = `cfg(all(feature =
+   "integration", unix))`); WinDbg tests are `cfg(windows)` + the `integration-windbg` feature.
+   lldb's pure DAP-logic (duplex/`FakeEnv`) tests stay cross-platform. CI gains a Windows lane;
+   the Linux/macOS lane is untouched.
 
 ## Dependencies
 

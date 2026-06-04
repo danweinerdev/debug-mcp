@@ -33,10 +33,12 @@ above* the seam to unlock WinDbg's distinctive capabilities.
    are added and advertised only when a WinDbg-capable factory is registered. WinDbg's
    universal escape hatch (`execute_command`) maps onto the **existing** `run_command`
    tool (raw command → `evaluate(EvalMode::Repl)` → DbgEng `Execute`).
-2. **Runtime backend switcher.** Both factories are registered. The agent selects the
+2. **Runtime backend switcher, platform-exclusive registration.** The agent selects the
    backend at the **connect points** (`launch`/`attach`/`open_crash_dump`/`attach_kernel`)
-   via an optional `backend` argument. Default: **WinDbg on Windows, lldb on
-   Mac/Linux**; the WinDbg factory is `cfg(windows)`-only, lldb is everywhere.
+   via an optional `backend` argument; default **WinDbg on Windows, lldb on Mac/Linux**.
+   Each OS registers exactly one backend at compile time — `LldbFactory` under
+   `cfg(not(windows))`, `WinDbgFactory` under `cfg(windows)`. lldb-on-Windows is deferred; the
+   registry/switcher is retained so adding it later is a one-line registration (Decision 7).
 3. **Unsafe confined to a `-sys` crate.** A new `dbgeng-sys` crate owns *all* COM/FFI
    `unsafe` (built on Microsoft's official `windows` crate) and exposes a **safe,
    synchronous** `Engine` API. `windbg-backend` and every crate above it stay
@@ -97,7 +99,7 @@ only on `debugger-core` and still cannot name a DAP, lldb, or DbgEng type.
 | `dbgeng-sys` | **NEW** sys/FFI | COM vtable interop via `windows`; safe synchronous `Engine`. `cfg(windows)`. The **only** crate with `unsafe` | `windows`, `debugger-core` (neutral types only) |
 | `windbg-backend` | **NEW** backend | `WinDbgBackend: DebuggerBackend` + `WinDbgFactory: BackendFactory`; dedicated engine thread, marshaling, op→neutral translation. `cfg(windows)`. `#![forbid(unsafe_code)]` | `debugger-core`, `dbgeng-sys`, `tokio` |
 | `mcp-tools` | common | **additive**: `BackendRegistry`, `backend` selection arg, 4 new handlers, capability-gated `list_tools`, backend-aware connect-error wording | `debugger-core`, `mcp-session`, `rmcp` |
-| `debug-mcp` | binary | **additive**: register both factories into a registry; per-OS default | all of the above |
+| `debug-mcp` | binary | **additive**: build a registry; register the platform's backend (`LldbFactory` under `cfg(not(windows))`, `WinDbgFactory` under `cfg(windows)`); per-OS default | mcp-session/mcp-tools/rmcp always; lldb stack under `cfg(not(windows))` |
 | `dap-client`, `lldb-backend`, `mcp-session` | — | **unchanged** | — |
 
 `dbgeng-sys` depends on `debugger-core` only for the neutral result structs it returns
@@ -624,23 +626,39 @@ exit/`EndSession`/engine-thread death → `BackendEvent::Terminated{code}`. Comm
 truncated]` marker are inherited. One stream is the simplest thing a WinDbg backend can
 produce, as the RustPort design (Decision 5) anticipated.
 
-### Decision 7: `BackendRegistry` with per-OS default + per-call `backend` arg
+### Decision 7: `BackendRegistry` with per-OS default + per-call `backend` arg; **platform-exclusive registration**
 
-**Context:** Both backends can exist on Windows (lldb-dap speaks DAP there too). The user
-wants the agent to choose at the connect points, with a per-OS default, "based on what's
-available."
+**Context:** WinDbg is Windows-only; lldb-dap is the macOS/Linux backend. lldb-dap *can*
+technically run on Windows, but that is explicitly **deferred** (a later "lldb-on-Windows"
+addition). For now each OS ships exactly one backend.
 
 **Decision:** `ToolServer` holds a `BackendRegistry` (name→factory + resolved default).
 Selection per connect call: explicit `backend` arg → `DEBUG_BACKEND` env → per-OS default
-(windows⇒windbg, else⇒lldb). The WinDbg factory is registered only under `cfg(windows)`.
-`status` advertises `available_backends`.
+(windows⇒windbg, else⇒lldb). **Registration is platform-exclusive at compile time:** the
+binary registers `LldbFactory` only under `cfg(not(windows))` and `WinDbgFactory` only under
+`cfg(windows)`. The runtime switcher (the `backend` arg + the registry) is **retained** — not
+because two backends coexist today, but so lldb-on-Windows is a one-line additive change later
+(register `LldbFactory` under `cfg(windows)` too) with no further plumbing. `status` advertises
+`available_backends` (one entry per platform today).
 
-**Rationale:** Satisfies the requirement with a minimal, additive change confined to the
-wiring layer (`mcp-tools` + `bin`) — the seam and the trait are untouched by *selection*.
-Keeping both factories registered (rather than compile-time-exclusive) makes the switcher
-testable and lets a Windows user fall back to lldb-dap. The connect-error wording becomes
-backend-aware (`failed to find lldb-dap` vs `failed to find dbgeng` /
-`Debugging Tools for Windows not found`) keyed on the selected factory's `name()`.
+**Tests are platform-gated to match.** The lldb backend's platform-bound tests run on Unix
+only: `lldb-backend/tests/subprocess.rs` (spawns POSIX `sh`/`true`) is `#![cfg(unix)]`, and the
+live `integration`-feature suites in `mcp-tools` are `#![cfg(all(feature = "integration", unix))]`.
+The lldb backend's pure DAP-logic tests (framing/handshake/ops over `tokio::io::duplex` fakes,
+`detect` via `FakeEnv`) stay cross-platform — they exercise transport/logic, not the platform,
+so running them everywhere is free compile + behavior coverage. WinDbg's tests are
+`cfg(windows)` + the `integration-windbg` feature (Decision 8).
+
+**Rationale:** Platform-exclusive registration matches the product reality (one backend per
+OS) and removes the awkward interim where a Windows binary advertised an lldb path it shouldn't
+use yet; it also makes the Windows test run clean (no POSIX-spawning lldb tests). Keeping the
+registry/switcher costs nothing and turns lldb-on-Windows into a pure addition. The change is
+confined to the wiring layer (`mcp-tools` + `bin`) and the test cfg-gates — the seam and the
+trait are untouched. The connect-error wording stays backend-aware (`failed to find lldb-dap`
+vs `Debugging Tools for Windows not found` / `failed to initialize DbgEng`) keyed on the
+selected factory's `name()`. **Interim Windows note:** until Phase 3 registers `WinDbgFactory`,
+the Windows registry is empty and no backend is usable on Windows — expected, since WinDbg is
+the Windows backend and it does not exist yet.
 
 ### Decision 8: Windows-only integration tests behind a feature + `cfg(windows)`; CI matrix gains a Windows lane
 
