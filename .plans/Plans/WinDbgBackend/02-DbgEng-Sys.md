@@ -3,14 +3,14 @@ title: "dbgeng-sys — confined COM FFI → safe Engine"
 type: phase
 plan: WinDbgBackend
 phase: 2
-status: pending
+status: in-progress
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-06-04
 deliverable: "A Windows-only `dbgeng-sys` crate that wraps the six DbgEng COM interfaces and exposes a safe, synchronous `Engine` (launch/attach/go/step/break/breakpoints/inspect/memory/execute/detach) plus the `Send` `InterruptHandle` — with ALL unsafe confined to this crate and proven against a live target via a smoke test."
 tasks:
   - id: "2.1"
     title: "Crate scaffold + windows-crate interfaces (R1) + Engine::create + EngineError"
-    status: pending
+    status: in-progress
     verification: "`dbgeng-sys` is a `cfg(windows)` workspace member building on the `windows` crate; **R1 resolved** — the six interfaces (`IDebugClient5`/`Control4`/`Symbols3`/`DataSpaces4`/`Registers2`/`SystemObjects4`) are obtained via `DebugCreate` + `QueryInterface` (or a hand-rolled vtable for any missing method, documented); `Engine::create()` returns a live engine on a Windows host; the `unsafe`-confinement grep gate passes (`unsafe` appears only under `crates/dbgeng-sys/src/`); test files live in dedicated `tests/`/`src/tests/` folders (not inline `#[cfg(test)]`); `HRESULT`→`EngineError` mapping is unit-tested for success + a representative failure code. (Phase-entry task: the README phase-level `depends_on: [1]` gates the start — `dbgeng-sys` returns the `debugger-core` types added in Phase 1.)"
     depends_on: []
   - id: "2.2"

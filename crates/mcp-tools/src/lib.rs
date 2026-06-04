@@ -24,6 +24,9 @@
 //! - [`schema`]: the 21 hand-built tool definitions (Decision 3 / R2).
 //! - [`server`]: [`ToolServer`] — shared state + the rmcp `ServerHandler` (Decision 7 / R1).
 //! - [`handlers`]: the 21 tool handlers (`impl ToolServer`).
+//!
+//! No `unsafe`: all COM/FFI `unsafe` is confined to `dbgeng-sys` (design Decision 1).
+#![forbid(unsafe_code)]
 
 mod args;
 mod errors;

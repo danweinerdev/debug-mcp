@@ -21,6 +21,9 @@
 //! dependency edge never names `lldb-backend`, keeping the seam crate's production
 //! dependency graph clean (design §Crate layout / Spec FR-18). The dev-dependency cycle
 //! (`mcp-tools` →(dev) `integration-tests` →(normal) `mcp-tools`) is allowed by cargo.
+//!
+//! No `unsafe`: all COM/FFI `unsafe` is confined to `dbgeng-sys` (design Decision 1).
+#![forbid(unsafe_code)]
 
 pub mod harness;
 pub mod stdio;

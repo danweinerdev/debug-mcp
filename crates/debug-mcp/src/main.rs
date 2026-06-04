@@ -8,6 +8,9 @@
 //! `cfg(windows)` too). No factory is invoked at startup — the backend is spawned lazily on
 //! the first connect (Spec FR-1.6). On a fatal server error the process prints
 //! `Server error: <e>` to stderr and exits with code 1 (Spec FR-1.4).
+//!
+//! No `unsafe`: all COM/FFI `unsafe` is confined to `dbgeng-sys` (design Decision 1).
+#![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 use std::sync::Arc;

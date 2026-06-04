@@ -11,6 +11,9 @@
 //! handlers.
 //!
 //! [`BackendEvent`]: debugger_core::BackendEvent
+//!
+//! No `unsafe`: all COM/FFI `unsafe` is confined to `dbgeng-sys` (design Decision 1).
+#![forbid(unsafe_code)]
 
 mod breakpoint;
 mod manager;

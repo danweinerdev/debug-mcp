@@ -19,6 +19,9 @@
 //! tokio::spawn(read_loop.run());
 //! // drive `channels.output` / `channels.terminated` into a `BackendEvent` stream.
 //! ```
+//!
+//! No `unsafe`: all COM/FFI `unsafe` is confined to `dbgeng-sys` (design Decision 1).
+#![forbid(unsafe_code)]
 
 mod client;
 mod error;

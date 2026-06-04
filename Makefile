@@ -4,10 +4,10 @@
 MANIFEST := $(CURDIR)/Cargo.toml
 CARGO := cargo
 
-.PHONY: all build clippy fmt fmt-check test integration tsan check seam
+.PHONY: all build clippy fmt fmt-check test integration tsan check seam unsafe-gate
 
 # The full gate, in the order the phase verification runs it.
-all: fmt-check build clippy test seam
+all: fmt-check build clippy test seam unsafe-gate
 
 build:
 	$(CARGO) build --manifest-path $(MANIFEST) --workspace
@@ -43,7 +43,7 @@ tsan:
 		-Zbuild-std --target x86_64-unknown-linux-gnu \
 		--test client --test read_loop --test stop_waiter
 
-check: build clippy fmt-check test
+check: build clippy fmt-check test unsafe-gate
 
 # Seam guarantee (Spec FR-18): debugger-core must carry no tokio/rmcp/DAP edge, and
 # the neutral crates must not name a DAP/lldb crate.
@@ -55,3 +55,15 @@ seam:
 	@! $(CARGO) tree --manifest-path $(MANIFEST) -p mcp-session --edges normal | grep -E '\b(dap-client|lldb-backend)\b' \
 		|| (echo "SEAM VIOLATION: mcp-session depends on a backend crate" && exit 1)
 	@echo "seam ok"
+
+# Confined-unsafe guarantee (design Decision 1): the `unsafe` keyword may appear in
+# `crates/**/src/*.rs` ONLY under `crates/dbgeng-sys/`. Scans for the `unsafe` keyword in
+# real code (`unsafe {`, `unsafe fn`, `unsafe impl`, `unsafe trait`), excluding dbgeng-sys
+# and excluding line/doc comments that merely mention the word. Same shell style as `seam`.
+unsafe-gate:
+	@! grep -rnE '(^|[^[:alnum:]_])unsafe[[:space:]]*(\{|fn|impl|trait)' \
+		--include='*.rs' crates \
+		| grep -v 'crates/dbgeng-sys/' \
+		| grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|//!|/\*|\*)' \
+		|| (echo "UNSAFE-GATE VIOLATION: 'unsafe' found outside crates/dbgeng-sys/" && exit 1)
+	@echo "unsafe-gate ok"

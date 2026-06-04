@@ -13,7 +13,7 @@ phases:
     doc: "01-Seam-Additions.md"
   - id: 2
     title: "dbgeng-sys — confined COM FFI → safe Engine"
-    status: pending
+    status: in-progress
     doc: "02-DbgEng-Sys.md"
     depends_on: [1]
   - id: 3

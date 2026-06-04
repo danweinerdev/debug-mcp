@@ -19,6 +19,9 @@
 //!
 //! Built on `dap-client`; the launch/attach handshake uses its `send_and_await_both`
 //! (order-independent response + Initialized) and its stop waiter (register-before-resume).
+//!
+//! No `unsafe`: all COM/FFI `unsafe` is confined to `dbgeng-sys` (design Decision 1).
+#![forbid(unsafe_code)]
 
 mod args;
 mod backend;

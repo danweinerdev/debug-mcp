@@ -1,0 +1,15 @@
+[package]
+name = "dbgeng-sys"
+description = "Confined DbgEng (WinDbg) COM/FFI: a safe synchronous Engine. Windows-only; the only crate with unsafe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Windows-only: on other platforms this crate compiles to nothing (the lib is #![cfg(windows)]).
+[target.'cfg(windows)'.dependencies]
+# debugger-core supplies the neutral return types (`StopOutcome`, `Frame`, `ModuleInfo`, …) the
+# Engine methods produce starting in task 2.3; held now so the contract crate is wired in.
+debugger-core.workspace = true
+thiserror.workspace = true
+windows.workspace = true

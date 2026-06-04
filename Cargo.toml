@@ -23,6 +23,13 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # MCP SDK — only `mcp-tools` (and the binary) may use it.
 rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
 
+# Windows COM/FFI — only `dbgeng-sys` (the lone unsafe crate) may use it, and only on Windows.
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_Debug_Extensions",
+] }
+
 # Internal crates.
 debugger-core = { path = "crates/debugger-core" }
 dap-client = { path = "crates/dap-client" }
