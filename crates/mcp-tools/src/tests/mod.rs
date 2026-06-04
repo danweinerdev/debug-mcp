@@ -6,4 +6,5 @@ mod fake;
 mod flatten;
 mod format;
 mod handlers;
+mod registry;
 mod response;

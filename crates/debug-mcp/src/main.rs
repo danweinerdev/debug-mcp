@@ -11,15 +11,19 @@ use std::sync::Arc;
 
 use lldb_backend::LldbFactory;
 use mcp_session::SessionManager;
-use mcp_tools::ToolServer;
+use mcp_tools::{default_backend_for_os, BackendRegistry, ToolServer};
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let session = Arc::new(SessionManager::new());
-    let factory = Arc::new(LldbFactory::new());
-    let server = ToolServer::new(session, factory);
+    // Build the backend registry with the per-OS default. lldb is registered everywhere;
+    // the windbg factory is added under cfg(windows) in a later phase. No factory is
+    // invoked here — connect is lazy (Spec FR-1.6).
+    let mut registry = BackendRegistry::new(default_backend_for_os());
+    registry.register(Arc::new(LldbFactory::new()));
+    let server = ToolServer::new(session, registry);
 
     // serve over stdio; on a fatal error print to stderr + exit 1 (Go main.go:25-26).
     let running = match server.serve(stdio()).await {

@@ -1,8 +1,9 @@
 //! The `ToolServer` — shared state for the 21 handlers plus the rmcp `ServerHandler`
 //! wiring (Spec FR-1, design §"MCP tool surface", Decisions 3/7).
 //!
-//! It owns `Arc<SessionManager>`, the `Arc<dyn BackendFactory>` (lazily `connect()`-ed on
-//! the first `launch`/`attach`, never at startup — Spec FR-1.6), and the *connected*
+//! It owns `Arc<SessionManager>`, the [`BackendRegistry`](crate::BackendRegistry) (the
+//! runtime switcher; the selected factory is lazily `connect()`-ed on the first
+//! `launch`/`attach`, never at startup — Spec FR-1.6), and the *connected*
 //! `Arc<dyn DebuggerBackend>` for the active session (set on connect, cleared on
 //! disconnect). The backend slot is a `tokio::sync::RwLock` so handlers can read it across
 //! an `.await` without ever holding the session lock there (Decision 7) — this is what
@@ -15,7 +16,7 @@
 
 use std::sync::Arc;
 
-use debugger_core::{BackendFactory, DebuggerBackend};
+use debugger_core::DebuggerBackend;
 use mcp_session::SessionManager;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
@@ -31,22 +32,23 @@ use tokio_util::sync::CancellationToken;
 use crate::response::ToolOutcome;
 use crate::schema;
 use crate::Args;
+use crate::BackendRegistry;
 
-/// The shared state every handler operates on: the neutral session, the backend factory,
-/// and the currently-connected backend (if any).
+/// The shared state every handler operates on: the neutral session, the backend registry
+/// (the runtime switcher), and the currently-connected backend (if any).
 pub struct ToolServer {
     pub(crate) session: Arc<SessionManager>,
-    pub(crate) factory: Arc<dyn BackendFactory>,
+    pub(crate) registry: BackendRegistry,
     pub(crate) backend: RwLock<Option<Arc<dyn DebuggerBackend>>>,
 }
 
 impl ToolServer {
-    /// Build the server over a session and a backend factory. The factory is **not**
-    /// invoked here (lazy spawn, Spec FR-1.6).
-    pub fn new(session: Arc<SessionManager>, factory: Arc<dyn BackendFactory>) -> Self {
+    /// Build the server over a session and a backend registry. No factory is invoked here
+    /// (lazy spawn, Spec FR-1.6); the registry resolves a factory per connect call.
+    pub fn new(session: Arc<SessionManager>, registry: BackendRegistry) -> Self {
         ToolServer {
             session,
-            factory,
+            registry,
             backend: RwLock::new(None),
         }
     }

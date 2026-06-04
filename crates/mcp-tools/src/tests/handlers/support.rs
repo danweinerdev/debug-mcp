@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::server::ToolServer;
-use crate::tests::fake::{FakeBackend, FakeFactory, FakeState};
+use crate::tests::fake::{single_factory_registry, FakeBackend, FakeFactory, FakeState};
 use crate::ToolOutcome;
 
 /// A test harness: the server, the shared session, and the shared fake-backend state.
@@ -26,7 +26,7 @@ impl Harness {
         let state = Arc::new(Mutex::new(FakeState::default()));
         let session = Arc::new(SessionManager::new());
         let factory = Arc::new(FakeFactory::new(Arc::clone(&state)));
-        let server = ToolServer::new(Arc::clone(&session), factory);
+        let server = ToolServer::new(Arc::clone(&session), single_factory_registry(factory));
         Harness {
             server,
             session,

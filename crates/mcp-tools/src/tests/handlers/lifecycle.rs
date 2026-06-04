@@ -104,8 +104,10 @@ async fn launch_exit_during_returns_plain_text() {
 }
 
 #[tokio::test]
-async fn launch_connect_failure_maps_to_go_strings_and_resets() {
-    // Detect failure → `failed to find lldb-dap: …`; session reset to idle.
+async fn launch_connect_detect_failure_generic_path_resets() {
+    // Detect failure on a generically-named factory ("fake") exercises the generic branch of
+    // connect_error → `failed to find fake: …`; session reset to idle. (The verbatim lldb
+    // wording is pinned separately below.)
     let state = Arc::new(std::sync::Mutex::new(
         crate::tests::fake::FakeState::default(),
     ));
@@ -114,15 +116,19 @@ async fn launch_connect_failure_maps_to_go_strings_and_resets() {
         Arc::clone(&state),
         BackendError::Detect("no binary".to_string()),
     ));
-    let server = crate::ToolServer::new(Arc::clone(&session), factory);
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(factory),
+    );
     let a = args(&[("program", json!("/bin/p"))]);
     let out = server.handle_launch(&crate::Args::new(&a), &token()).await;
-    assert_eq!(expect_error(&out), "failed to find lldb-dap: no binary");
+    assert_eq!(expect_error(&out), "failed to find fake: no binary");
     assert_eq!(session.state(), State::Idle);
 }
 
 #[tokio::test]
-async fn launch_spawn_failure_maps_to_go_string() {
+async fn launch_spawn_failure_generic_path() {
+    // Spawn failure on a generically-named factory → `failed to spawn fake: …`.
     let state = Arc::new(std::sync::Mutex::new(
         crate::tests::fake::FakeState::default(),
     ));
@@ -131,10 +137,113 @@ async fn launch_spawn_failure_maps_to_go_string() {
         Arc::clone(&state),
         BackendError::Spawn("exec error".to_string()),
     ));
-    let server = crate::ToolServer::new(Arc::clone(&session), factory);
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(factory),
+    );
+    let a = args(&[("program", json!("/bin/p"))]);
+    let out = server.handle_launch(&crate::Args::new(&a), &token()).await;
+    assert_eq!(expect_error(&out), "failed to spawn fake: exec error");
+}
+
+#[tokio::test]
+async fn launch_connect_failure_lldb_strings_are_verbatim_go() {
+    // The backend-aware connect_error must still emit the EXACT Go lldb wording for the
+    // "lldb"-named factory (parity gate). Detect → "failed to find lldb-dap: …".
+    let state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let factory = Arc::new(crate::tests::fake::FakeFactory::with_named_connect_error(
+        Arc::clone(&state),
+        "lldb",
+        BackendError::Detect("no binary".to_string()),
+    ));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(factory),
+    );
+    let a = args(&[("program", json!("/bin/p"))]);
+    let out = server.handle_launch(&crate::Args::new(&a), &token()).await;
+    assert_eq!(expect_error(&out), "failed to find lldb-dap: no binary");
+    assert_eq!(session.state(), State::Idle);
+}
+
+#[tokio::test]
+async fn launch_spawn_failure_lldb_string_is_verbatim_go() {
+    let state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let factory = Arc::new(crate::tests::fake::FakeFactory::with_named_connect_error(
+        Arc::clone(&state),
+        "lldb",
+        BackendError::Spawn("exec error".to_string()),
+    ));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(factory),
+    );
     let a = args(&[("program", json!("/bin/p"))]);
     let out = server.handle_launch(&crate::Args::new(&a), &token()).await;
     assert_eq!(expect_error(&out), "failed to spawn lldb-dap: exec error");
+}
+
+#[tokio::test]
+async fn launch_connect_failure_windbg_reserved_strings() {
+    // The "windbg"-named branch of connect_error is dead until Phase 3 registers the factory;
+    // pin its reserved wording now so it cannot silently drift before then.
+    for (err, expected) in [
+        (
+            BackendError::Detect("missing".to_string()),
+            "Debugging Tools for Windows not found: missing",
+        ),
+        (
+            BackendError::Spawn("bad init".to_string()),
+            "failed to initialize DbgEng: bad init",
+        ),
+    ] {
+        let state = Arc::new(std::sync::Mutex::new(
+            crate::tests::fake::FakeState::default(),
+        ));
+        let session = Arc::new(mcp_session::SessionManager::new());
+        let factory = Arc::new(crate::tests::fake::FakeFactory::with_named_connect_error(
+            Arc::clone(&state),
+            "windbg",
+            err,
+        ));
+        let server = crate::ToolServer::new(
+            Arc::clone(&session),
+            crate::tests::fake::single_factory_registry(factory),
+        );
+        let a = args(&[("program", json!("/bin/p")), ("backend", json!("windbg"))]);
+        let out = server.handle_launch(&crate::Args::new(&a), &token()).await;
+        assert_eq!(expect_error(&out), expected);
+        assert_eq!(session.state(), State::Idle);
+    }
+}
+
+#[tokio::test]
+async fn attach_connect_failure_lldb_strings_are_verbatim_and_reset() {
+    // The attach path uses the same backend-aware connect_error + reset cleanup as launch;
+    // pin the verbatim lldb wording and the session reset through the attach handler too.
+    let state = Arc::new(std::sync::Mutex::new(
+        crate::tests::fake::FakeState::default(),
+    ));
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let factory = Arc::new(crate::tests::fake::FakeFactory::with_named_connect_error(
+        Arc::clone(&state),
+        "lldb",
+        BackendError::Detect("no binary".to_string()),
+    ));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(factory),
+    );
+    let a = args(&[("pid", json!(1234))]);
+    let out = server.handle_attach(&crate::Args::new(&a), &token()).await;
+    assert_eq!(expect_error(&out), "failed to find lldb-dap: no binary");
+    assert_eq!(session.state(), State::Idle);
 }
 
 #[tokio::test]
@@ -282,7 +391,10 @@ async fn launch_event_pump_runs_before_backend_launch() {
 
     let session = Arc::new(mcp_session::SessionManager::new());
     let _guard: Mutex<()> = Mutex::new(());
-    let server = crate::ToolServer::new(Arc::clone(&session), Arc::new(PumpFactory));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(Arc::new(PumpFactory)),
+    );
     let a = args(&[
         ("program", json!("/bin/p")),
         ("stop_on_entry", json!(false)),
@@ -401,7 +513,10 @@ async fn launch_cancellation_returns_timeout_string() {
     }
 
     let session = Arc::new(mcp_session::SessionManager::new());
-    let server = crate::ToolServer::new(Arc::clone(&session), Arc::new(HangFactory));
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(Arc::new(HangFactory)),
+    );
     let ct = token();
     ct.cancel();
     let a = args(&[("program", json!("/bin/p"))]);

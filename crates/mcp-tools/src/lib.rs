@@ -18,6 +18,8 @@
 //! rmcp glue on top of these helpers:
 //!
 //! - [`errors`]: per-call-site mapping of `BackendError` → the exact Go tool-error strings.
+//! - [`registry`]: [`BackendRegistry`] — the runtime backend switcher (name→factory +
+//!   per-OS default + cached capability union) `ToolServer` holds.
 //! - [`frame`]: `resolve_frame_id` (implicit `stack_trace(levels=20)` on a frame-map miss).
 //! - [`schema`]: the 21 hand-built tool definitions (Decision 3 / R2).
 //! - [`server`]: [`ToolServer`] — shared state + the rmcp `ServerHandler` (Decision 7 / R1).
@@ -29,6 +31,7 @@ mod flatten;
 mod format;
 mod frame;
 mod handlers;
+mod registry;
 mod response;
 mod schema;
 mod server;
@@ -36,6 +39,7 @@ mod server;
 pub use args::Args;
 pub use flatten::{flatten_variables, FlatVariable, VariableFetcher};
 pub use format::{format_hex_dump, format_output_entries};
+pub use registry::{default_backend_for_os, BackendRegistry};
 pub use response::{RespBuilder, ToolOutcome};
 pub use server::ToolServer;
 

@@ -350,6 +350,9 @@ impl DebuggerBackend for FakeBackend {
 pub struct FakeFactory {
     pub state: Arc<Mutex<FakeState>>,
     pub connect_error: Mutex<Option<BackendError>>,
+    /// The name reported via `BackendFactory::name()` — drives the registry key and the
+    /// backend-aware `connect_error` wording. Defaults to `"fake"`.
+    pub name: &'static str,
 }
 
 impl FakeFactory {
@@ -357,6 +360,7 @@ impl FakeFactory {
         FakeFactory {
             state,
             connect_error: Mutex::new(None),
+            name: "fake",
         }
     }
 
@@ -364,6 +368,22 @@ impl FakeFactory {
         FakeFactory {
             state,
             connect_error: Mutex::new(Some(err)),
+            name: "fake",
+        }
+    }
+
+    /// A factory whose `connect()` fails with `err` and which reports `name` (so the
+    /// backend-aware `connect_error` wording can be asserted per backend, e.g. the
+    /// verbatim `"lldb"` Go strings).
+    pub fn with_named_connect_error(
+        state: Arc<Mutex<FakeState>>,
+        name: &'static str,
+        err: BackendError,
+    ) -> Self {
+        FakeFactory {
+            state,
+            connect_error: Mutex::new(Some(err)),
+            name,
         }
     }
 }
@@ -371,7 +391,7 @@ impl FakeFactory {
 #[async_trait]
 impl BackendFactory for FakeFactory {
     fn name(&self) -> &'static str {
-        "fake"
+        self.name
     }
 
     async fn connect(&self) -> Result<Connection, BackendError> {
@@ -382,4 +402,13 @@ impl BackendFactory for FakeFactory {
         let events: BoxStream<'static, BackendEvent> = stream::empty().boxed();
         Ok(Connection { backend, events })
     }
+}
+
+/// Build a single-factory [`BackendRegistry`] whose default is the factory's `name()` — so
+/// `select(None)` resolves to it. Keeps the handler-test churn from the registry switch to
+/// one call.
+pub fn single_factory_registry(factory: Arc<dyn BackendFactory>) -> crate::BackendRegistry {
+    let mut registry = crate::BackendRegistry::new(factory.name());
+    registry.register(factory);
+    registry
 }

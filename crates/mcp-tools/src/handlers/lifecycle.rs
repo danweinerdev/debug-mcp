@@ -62,13 +62,26 @@ impl ToolServer {
             function_breakpoints: function_bps,
         };
 
-        // Connect (detect + spawn + read loop). Failure → Go find/spawn strings + reset.
-        let connection = match self.factory.connect().await {
+        // Resolve the backend factory (explicit arg → DEBUG_BACKEND → per-OS default). An
+        // unknown/unregistered backend is a tool-error; reset the session like a connect
+        // failure. TODO(1.3): pass the parsed `backend` arg instead of `None`.
+        let factory = match self.registry.select(None) {
+            Ok(f) => f,
+            Err(e) => {
+                self.session.reset();
+                self.clear_backend().await;
+                return ToolOutcome::error(e);
+            }
+        };
+
+        // Connect (detect + spawn + read loop). Failure → backend-keyed find/spawn strings
+        // + reset.
+        let connection = match factory.connect().await {
             Ok(c) => c,
             Err(e) => {
                 self.session.reset();
                 self.clear_backend().await;
-                return ToolOutcome::error(connect_error(e));
+                return ToolOutcome::error(connect_error(factory.name(), e));
             }
         };
 
@@ -201,12 +214,23 @@ impl ToolServer {
 
         self.session.set_state(State::Configuring);
 
-        let connection = match self.factory.connect().await {
+        // Resolve the backend factory (explicit arg → DEBUG_BACKEND → per-OS default).
+        // TODO(1.3): pass the parsed `backend` arg instead of `None`.
+        let factory = match self.registry.select(None) {
+            Ok(f) => f,
+            Err(e) => {
+                self.session.reset();
+                self.clear_backend().await;
+                return ToolOutcome::error(e);
+            }
+        };
+
+        let connection = match factory.connect().await {
             Ok(c) => c,
             Err(e) => {
                 self.session.reset();
                 self.clear_backend().await;
-                return ToolOutcome::error(connect_error(e));
+                return ToolOutcome::error(connect_error(factory.name(), e));
             }
         };
 
@@ -322,11 +346,27 @@ impl ToolServer {
     }
 }
 
-/// Map a `connect()` failure to the Go find/spawn strings (Spec FR-4.4.2/4.4.3).
-fn connect_error(err: BackendError) -> String {
+/// Map a `connect()` failure to the backend-keyed find/spawn strings, keyed on the
+/// selected factory's `name()` (design §"Wiring changes to `ToolServer`", Decision 7).
+///
+/// For `"lldb"` the strings are **verbatim** the Go server's (Spec FR-4.4.2/4.4.3), so
+/// parity is preserved. For `"windbg"` the WinDbg wording is reserved (Phase 3 registers
+/// that factory). Any other backend name gets a generic `failed to find/spawn <name>`.
+/// The `Detect`/`Spawn` → string mapping shape is identical across backends.
+fn connect_error(backend: &str, err: BackendError) -> String {
     match err {
-        BackendError::Detect(m) => format!("failed to find lldb-dap: {m}"),
-        BackendError::Spawn(m) => format!("failed to spawn lldb-dap: {m}"),
+        BackendError::Detect(m) => match backend {
+            // Verbatim Go string for lldb (parity preserved).
+            "lldb" => format!("failed to find lldb-dap: {m}"),
+            // Reserved WinDbg wording (Phase 3 registers the windbg factory).
+            "windbg" => format!("Debugging Tools for Windows not found: {m}"),
+            other => format!("failed to find {other}: {m}"),
+        },
+        BackendError::Spawn(m) => match backend {
+            "lldb" => format!("failed to spawn lldb-dap: {m}"),
+            "windbg" => format!("failed to initialize DbgEng: {m}"),
+            other => format!("failed to spawn {other}: {m}"),
+        },
         // connect() only produces Detect/Spawn; anything else surfaces verbatim.
         other => other.to_string(),
     }

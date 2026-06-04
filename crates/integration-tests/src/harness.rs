@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use lldb_backend::LldbFactory;
 use mcp_session::{SessionManager, State};
-use mcp_tools::{ToolOutcome, ToolServer};
+use mcp_tools::{BackendRegistry, ToolOutcome, ToolServer};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -48,8 +48,9 @@ impl Harness {
     /// Build a server over a fresh session + the **real** lldb factory.
     pub fn new() -> Harness {
         let session = Arc::new(SessionManager::new());
-        let factory = Arc::new(LldbFactory::new());
-        let server = ToolServer::new(Arc::clone(&session), factory);
+        let mut registry = BackendRegistry::new("lldb");
+        registry.register(Arc::new(LldbFactory::new()));
+        let server = ToolServer::new(Arc::clone(&session), registry);
         Harness {
             server,
             session,
