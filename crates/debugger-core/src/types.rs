@@ -192,6 +192,38 @@ pub struct MemoryRead {
     pub data: Vec<u8>,
 }
 
+/// One loaded module. C++ origin: the `get_modules` tool / `DebugEngine::GetModules`
+/// in the `windbg-mcp` plugin (no lldb analog — surfaced only by the WinDbg backend).
+/// Opaque pass-through (Spec FR-18.6): every field is a free-form string carried
+/// verbatim to the tool layer.
+///
+/// - `base` is a hex string formatted `"0x{:016X}"` (the parity convention for
+///   IP/address fields, matching [`Frame::instruction_pointer`]).
+/// - `size` is the module's size in bytes as a decimal string.
+/// - `symbol_status` ∈ {`"pdb"`, `"export"`, `"deferred"`, `"none"`} — the C++
+///   `SymbolType` map, passed through unmodified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleInfo {
+    pub name: String,
+    pub base: String,
+    pub size: String,
+    pub symbol_status: String,
+}
+
+/// Outcome of `open_dump`. C++ origin: `DebugEngine::OpenDumpFile` in the `windbg-mcp`
+/// plugin, followed by `GetCurrentSourceLocation` (no lldb analog).
+///
+/// - `stop` is the stop snapshot produced when the dump's `WaitForEvent` returns, or
+///   `None` if the dump did not yield a stopped context.
+/// - `crash_location` is `"<file>:<line>"` sourced from the backend's
+///   `current_source_location()` called *inside* `open_dump` after the dump loads;
+///   `None` when no source line maps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DumpOutcome {
+    pub stop: Option<StopInfo>,
+    pub crash_location: Option<String>,
+}
+
 /// One disassembled instruction. Go origin: the per-instruction fields built in
 /// `internal/tools/memory.go` (`disassemble`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

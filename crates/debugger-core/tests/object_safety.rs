@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use debugger_core::{
-    AttachOutcome, AttachSpec, BackendError, BackendEvent, BackendFactory, BreakpointResult,
-    Connection, DebuggerBackend, EvalMode, EvalResult, Frame, FunctionBp, Granularity, Instruction,
-    LaunchOutcome, LaunchSpec, MemoryRead, Scope, SourceBp, StepKind, StopOutcome, ThreadInfo,
-    Variable,
+    AttachOutcome, AttachSpec, BackendCapabilities, BackendError, BackendEvent, BackendFactory,
+    BreakpointResult, Connection, DebuggerBackend, EvalMode, EvalResult, Frame, FunctionBp,
+    Granularity, Instruction, LaunchOutcome, LaunchSpec, MemoryRead, Scope, SourceBp, StepKind,
+    StopOutcome, ThreadInfo, Variable,
 };
 use futures::executor::block_on;
 use futures::stream::{self, StreamExt};
@@ -186,6 +186,50 @@ fn backend_error_variants_surface_through_the_trait() {
             Err(BackendError::Timeout)
         ));
     });
+}
+
+// `NullBackend` deliberately does **not** override `open_dump`/`attach_kernel`/`analyze`/
+// `modules` — that it still implements `DebuggerBackend` (above) proves the four new trait
+// methods' default bodies keep existing impls compiling unchanged. Here we exercise those
+// defaults through the trait object to pin the default-`Unsupported` contract.
+#[test]
+fn default_capability_methods_return_unsupported_through_the_trait() {
+    block_on(async {
+        let backend: Arc<dyn DebuggerBackend> = Arc::new(NullBackend);
+
+        assert!(matches!(
+            backend.open_dump("c:/crash.dmp").await,
+            Err(BackendError::Unsupported("open_crash_dump"))
+        ));
+        assert!(matches!(
+            backend.attach_kernel("net:port=50000,key=1.2.3.4").await,
+            Err(BackendError::Unsupported("attach_kernel"))
+        ));
+        assert!(matches!(
+            backend.analyze().await,
+            Err(BackendError::Unsupported("analyze_crash"))
+        ));
+        assert!(matches!(
+            backend.modules().await,
+            Err(BackendError::Unsupported("get_modules"))
+        ));
+    });
+}
+
+// `NullFactory` does not override `capabilities()`, so it inherits the all-false default
+// (the lldb posture). Exercised through the `dyn BackendFactory` trait object.
+#[test]
+fn factory_default_capabilities_are_all_false() {
+    let factory: Box<dyn BackendFactory> = Box::new(NullFactory);
+    assert_eq!(
+        factory.capabilities(),
+        BackendCapabilities {
+            crash_dump: false,
+            kernel: false,
+            analyze: false,
+            modules: false,
+        }
+    );
 }
 
 fn sample_launch_spec() -> LaunchSpec {

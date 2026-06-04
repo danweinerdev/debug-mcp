@@ -13,12 +13,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+use crate::capabilities::BackendCapabilities;
 use crate::error::BackendError;
 use crate::event::BackendEvent;
 use crate::types::{
-    AttachOutcome, AttachSpec, BreakpointResult, EvalMode, EvalResult, Frame, FunctionBp,
-    Granularity, Instruction, LaunchOutcome, LaunchSpec, MemoryRead, Scope, SourceBp, StepKind,
-    StopOutcome, ThreadInfo, Variable,
+    AttachOutcome, AttachSpec, BreakpointResult, DumpOutcome, EvalMode, EvalResult, Frame,
+    FunctionBp, Granularity, Instruction, LaunchOutcome, LaunchSpec, MemoryRead, ModuleInfo, Scope,
+    SourceBp, StepKind, StopOutcome, ThreadInfo, Variable,
 };
 
 /// A debugger-neutral backend. Every concrete debugger (lldb-dap today, WinDbg later)
@@ -148,6 +149,43 @@ pub trait DebuggerBackend: Send + Sync {
     fn debugger_pid(&self) -> Option<i64> {
         None
     }
+
+    // --- capability-gated, default-Unsupported (WinDbg-only verbs) ---
+    //
+    // These four methods have **default bodies returning `Unsupported`**, so existing
+    // impls (lldb) compile unchanged and inherit the default. A WinDbg backend overrides
+    // them; the tool layer gates them behind `BackendCapabilities` and maps `Unsupported`
+    // to a clean tool-error.
+
+    /// Open a crash/minidump and block until the dump's first stop. Default:
+    /// `Unsupported`. C++ origin: `DebugEngine::OpenDumpFile`
+    /// (`IDebugClient::OpenDumpFile`) in the `windbg-mcp` plugin. lldb inherits the
+    /// default.
+    async fn open_dump(&self, _path: &str) -> Result<DumpOutcome, BackendError> {
+        Err(BackendError::Unsupported("open_crash_dump"))
+    }
+
+    /// Attach to a kernel target (KDNET `net:port=,key=`); block until the first stop.
+    /// Default: `Unsupported`. C++ origin: `DebugEngine::AttachKernel`
+    /// (`IDebugClient::AttachKernel`) in the `windbg-mcp` plugin. lldb inherits the
+    /// default.
+    async fn attach_kernel(&self, _connection: &str) -> Result<AttachOutcome, BackendError> {
+        Err(BackendError::Unsupported("attach_kernel"))
+    }
+
+    /// Run automated crash analysis (`!analyze -v`) and return its raw text. Default:
+    /// `Unsupported`. C++ origin: `DebugEngine::AnalyzeCrash` (`Execute("!analyze -v")`)
+    /// in the `windbg-mcp` plugin. lldb inherits the default.
+    async fn analyze(&self) -> Result<String, BackendError> {
+        Err(BackendError::Unsupported("analyze_crash"))
+    }
+
+    /// List loaded modules. Default: `Unsupported`. C++ origin:
+    /// `DebugEngine::GetModules` (`IDebugSymbols::GetNumberModules`) in the `windbg-mcp`
+    /// plugin. lldb inherits the default.
+    async fn modules(&self) -> Result<Vec<ModuleInfo>, BackendError> {
+        Err(BackendError::Unsupported("get_modules"))
+    }
 }
 
 /// A connected-but-not-yet-launched backend plus its async event stream. Returned by
@@ -168,6 +206,14 @@ pub struct Connection {
 pub trait BackendFactory: Send + Sync {
     /// A short backend name, e.g. `"lldb"`.
     fn name(&self) -> &'static str;
+
+    /// Static, per-backend capability descriptor (known *without* connecting). Drives
+    /// which optional tools `list_tools` advertises (the union across all registered
+    /// factories). Default: all-false — lldb inherits it; the WinDbg factory overrides it
+    /// to all-true. Design §Trait extension.
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
 
     /// Detect + spawn + start the transport; returns a *not-yet-launched* backend plus
     /// its event stream. Go origin: the lazy lldb-dap spawn in

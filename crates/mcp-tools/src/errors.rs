@@ -58,6 +58,13 @@ impl OpError {
                 let label = ty.split_once(':').map(|(_, rest)| rest).unwrap_or(&ty);
                 format!("{}{label}", self.unexpected)
             }
+
+            // None of the 21 base tools that route through `OpError::render` can return
+            // `Unsupported` (it is produced only by the capability-gated WinDbg verbs,
+            // whose handlers build their own `"<tool> is not supported …"` string). The arm
+            // exists only to keep the match exhaustive; render the variant's own message
+            // under this call site's request-failed verb.
+            BackendError::Unsupported(_) => format!("{}{err}", self.request_failed),
         }
     }
 

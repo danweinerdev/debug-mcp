@@ -88,5 +88,9 @@ fn map_implicit_error(err: BackendError) -> String {
                 message
             }
         }
+        // `stack_trace` never returns `Unsupported` (it is a base trait method, not one of
+        // the capability-gated WinDbg verbs), but the match must stay exhaustive; fall back
+        // to the variant's own message under the implicit-stackTrace wording.
+        BackendError::Unsupported(_) => format!("implicit stackTrace request failed: {err}"),
     }
 }

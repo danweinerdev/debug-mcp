@@ -8,17 +8,19 @@
 //! (Spec FR-18, design Decision 1).
 
 mod backend;
+mod capabilities;
 mod error;
 mod event;
 mod types;
 
 pub use backend::{BackendFactory, Connection, DebuggerBackend};
+pub use capabilities::BackendCapabilities;
 pub use error::BackendError;
 pub use event::BackendEvent;
 pub use types::{
-    AttachOutcome, AttachSpec, BreakpointResult, EvalMode, EvalResult, Frame, FunctionBp,
-    Granularity, Instruction, LaunchOutcome, LaunchSpec, MemoryRead, Scope, SourceBp, StepKind,
-    StopInfo, StopOutcome, ThreadInfo, Variable,
+    AttachOutcome, AttachSpec, BreakpointResult, DumpOutcome, EvalMode, EvalResult, Frame,
+    FunctionBp, Granularity, Instruction, LaunchOutcome, LaunchSpec, MemoryRead, ModuleInfo, Scope,
+    SourceBp, StepKind, StopInfo, StopOutcome, ThreadInfo, Variable,
 };
 
 #[cfg(test)]

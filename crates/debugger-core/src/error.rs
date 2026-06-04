@@ -40,4 +40,13 @@ pub enum BackendError {
     /// An operation exceeded its bound (Go: the per-tool `<op> timed out` strings).
     #[error("operation timed out")]
     Timeout,
+
+    /// The active backend does not implement a capability-gated tool (the four
+    /// WinDbg-only methods: `open_dump`/`attach_kernel`/`analyze`/`modules`). The
+    /// payload is the **tool name** (e.g. `"open_crash_dump"`); the tool layer builds
+    /// the full user-facing string `"<tool> is not supported by the <backend> backend"`
+    /// from it (design §Error Handling). C++ origin: the WinDbg-only verbs that have no
+    /// lldb analog — lldb returns this via the trait's default method bodies.
+    #[error("{0} is not supported by the active backend")]
+    Unsupported(&'static str),
 }

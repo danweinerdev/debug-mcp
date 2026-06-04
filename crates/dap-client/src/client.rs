@@ -427,5 +427,8 @@ fn clone_backend_error(err: &BackendError) -> BackendError {
         BackendError::Dap { message } => BackendError::Dap {
             message: message.clone(),
         },
+        // Carries a `&'static str`, so the "clone" is a copy. This variant never reaches
+        // the transport's pending-waiter path, but the match must stay exhaustive.
+        BackendError::Unsupported(tool) => BackendError::Unsupported(tool),
     }
 }

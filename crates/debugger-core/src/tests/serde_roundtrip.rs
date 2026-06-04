@@ -146,6 +146,46 @@ fn inspection_types_roundtrip() {
 }
 
 #[test]
+fn module_info_roundtrip() {
+    roundtrip(&ModuleInfo {
+        name: "ntdll.dll".to_string(),
+        base: "0x00007FFA1B2C0000".to_string(),
+        size: "2138112".to_string(),
+        symbol_status: "pdb".to_string(),
+    });
+    roundtrip(&ModuleInfo {
+        name: "app.exe".to_string(),
+        base: "0x0000000140000000".to_string(),
+        size: "0".to_string(),
+        symbol_status: "deferred".to_string(),
+    });
+    roundtrip(&ModuleInfo {
+        name: "kernel32.dll".to_string(),
+        base: "0x00007FFA19A10000".to_string(),
+        size: "770048".to_string(),
+        symbol_status: "export".to_string(),
+    });
+    roundtrip(&ModuleInfo {
+        name: "plugin.dll".to_string(),
+        base: "0x0000000180000000".to_string(),
+        size: "131072".to_string(),
+        symbol_status: "none".to_string(),
+    });
+}
+
+#[test]
+fn dump_outcome_roundtrip() {
+    roundtrip(&DumpOutcome {
+        stop: Some(sample_stop_info()),
+        crash_location: Some("crash.c:42".to_string()),
+    });
+    roundtrip(&DumpOutcome {
+        stop: None,
+        crash_location: None,
+    });
+}
+
+#[test]
 fn backend_events_roundtrip() {
     roundtrip(&BackendEvent::Output {
         category: "stdout".to_string(),
