@@ -48,17 +48,28 @@ seam is **compiler-enforced**: `mcp-tools`/`mcp-session` depend only on the neut
 | `lldb-backend` | `LldbBackend`/`LldbFactory`: lldb-dap detect/spawn, the launch/attach handshake, op→neutral translation |
 | `mcp-session` | state machine (incl. the `is_dump` flag), breakpoint tracking, output buffer, frame-map cache, the `BackendEvent` event-pump |
 | `mcp-tools` | the MCP tool handlers, `BackendRegistry` (runtime backend switcher), `Args` accessor, response/format/flatten helpers, the rmcp server |
-| `debug-mcp` | the binary: builds a `BackendRegistry` (registers `LldbFactory`; `WinDbgFactory` under `cfg(windows)` once it lands), serves stdio |
+| `debug-mcp` | the binary: builds a `BackendRegistry`, registers the platform's backend (`LldbFactory` under `cfg(not(windows))`; `WinDbgFactory` under `cfg(windows)` once it lands), serves stdio |
 
 `crates/integration-tests/` holds the live-suite harness (dev-dependency only, so the seam stays intact).
 
+**Backends are platform-exclusive.** lldb (lldb-dap) is the **macOS/Linux** backend; WinDbg
+is the **Windows** backend. lldb-on-Windows is deferred (a later addition). The binary
+registers `LldbFactory` only under `cfg(not(windows))` and `WinDbgFactory` only under
+`cfg(windows)`. Each backend's platform-bound tests run only on that platform:
+`lldb-backend/tests/subprocess.rs` and the `integration`-feature suites are Unix-gated
+(`cfg(unix)` / `cfg(all(feature = "integration", unix))`); WinDbg tests are `cfg(windows)` +
+the `integration-windbg` feature. lldb's pure DAP-logic tests (duplex fakes, `FakeEnv`) stay
+cross-platform (free compile/behavior coverage).
+
 **Backend selection (runtime switcher).** `ToolServer` holds a `BackendRegistry` instead of
-a single factory. The connect points pick a factory per call: `launch`/`attach` honor an
-optional `backend` arg (`"lldb"`/`"windbg"`), then `DEBUG_BACKEND`, then the per-OS default
-(`windbg` on Windows, `lldb` elsewhere); `open_crash_dump`/`attach_kernel` force-select
-`windbg`. The advertised tool list is capability-gated: the 21 base tools always, plus the
-four WinDbg-only tools (`open_crash_dump`, `attach_kernel`, `analyze_crash`, `get_modules`)
-when a registered factory's `BackendCapabilities` enables them (so non-Windows = exactly 21).
+a single factory; the switcher is retained even though one backend ships per OS, so
+lldb-on-Windows is a one-line additive registration later. The connect points pick a factory
+per call: `launch`/`attach` honor an optional `backend` arg (`"lldb"`/`"windbg"`), then
+`DEBUG_BACKEND`, then the per-OS default (`windbg` on Windows, `lldb` elsewhere);
+`open_crash_dump`/`attach_kernel` force-select `windbg`. The advertised tool list is
+capability-gated: the 21 base tools always, plus the four WinDbg-only tools (`open_crash_dump`,
+`attach_kernel`, `analyze_crash`, `get_modules`) when a registered factory's
+`BackendCapabilities` enables them (so non-Windows = exactly 21).
 
 **WinDbg port (in progress; see `.plans/{Designs,Plans}/WinDbgBackend`).** Adds two
 `cfg(windows)` crates *below* the seam: `dbgeng-sys` (the **only** crate with `unsafe` — all

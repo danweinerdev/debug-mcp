@@ -22,7 +22,8 @@
 //! default flips the backtick prefix, which the diff would catch. OQ-4 (`xcrun`) is
 //! macOS-only and is not exercised on Linux.
 
-#![cfg(feature = "integration")]
+// Unix-gated: the lldb differential/golden lane is a macOS/Linux backend lane.
+#![cfg(all(feature = "integration", unix))]
 
 use integration_tests::harness::{fixture_path, lldb_dap_available};
 use integration_tests::stdio::{go_reference_binary, rust_binary, StdioMcp, ToolCallResult};

@@ -1,9 +1,11 @@
 //! Phase 6.1 smoke test: launch `testdata/simple` and assert it reaches stopped.
 //!
 //! Gated behind the `integration` feature; without it this file is empty. The test skips
-//! cleanly (logs + returns) when lldb-dap or the fixtures are absent.
+//! cleanly (logs + returns) when lldb-dap or the fixtures are absent. lldb is a macOS/Linux
+//! backend, so the live lldb suite is additionally Unix-gated (WinDbg integration lives behind
+//! a separate `integration-windbg` feature on Windows — Phase 4).
 
-#![cfg(feature = "integration")]
+#![cfg(all(feature = "integration", unix))]
 
 use integration_tests::harness::{fixture_path, should_skip, Harness};
 use mcp_session::State;

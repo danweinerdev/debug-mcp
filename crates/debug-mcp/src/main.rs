@@ -1,14 +1,18 @@
 //! `debug-mcp` — the published binary (task 5.5, Spec FR-1).
 //!
-//! Constructs the neutral [`SessionManager`] and the lldb [`LldbFactory`], wires them into
-//! the [`ToolServer`], and serves the 21 MCP tools over stdio via rmcp. The factory is
-//! **not** invoked at startup — lldb-dap is spawned lazily on the first `launch`/`attach`
-//! (Spec FR-1.6). On a fatal server error the process prints `Server error: <e>` to stderr
-//! and exits with code 1 (Spec FR-1.4).
+//! Constructs the neutral [`SessionManager`] and a [`BackendRegistry`], wires them into the
+//! [`ToolServer`], and serves the MCP tools over stdio via rmcp. **Backend registration is
+//! platform-exclusive:** the lldb backend (lldb-dap) is registered on macOS/Linux only; the
+//! WinDbg backend is registered on Windows only (Phase 3). The runtime `backend`-arg switcher
+//! is retained so lldb-on-Windows can be added later (it would register `LldbFactory` under
+//! `cfg(windows)` too). No factory is invoked at startup — the backend is spawned lazily on
+//! the first connect (Spec FR-1.6). On a fatal server error the process prints
+//! `Server error: <e>` to stderr and exits with code 1 (Spec FR-1.4).
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
+#[cfg(not(windows))]
 use lldb_backend::LldbFactory;
 use mcp_session::SessionManager;
 use mcp_tools::{default_backend_for_os, BackendRegistry, ToolServer};
@@ -18,11 +22,25 @@ use rmcp::ServiceExt;
 #[tokio::main]
 async fn main() -> ExitCode {
     let session = Arc::new(SessionManager::new());
-    // Build the backend registry with the per-OS default. lldb is registered everywhere;
-    // the windbg factory is added under cfg(windows) in a later phase. No factory is
-    // invoked here — connect is lazy (Spec FR-1.6).
-    let mut registry = BackendRegistry::new(default_backend_for_os());
-    registry.register(Arc::new(LldbFactory::new()));
+
+    // Platform-exclusive backend registration. The per-OS default (`windbg` on Windows, `lldb`
+    // elsewhere) is set on the registry; only the native backend is registered. (Bound without
+    // `mut` on platforms with no registration so there is no unused-`mut` warning.)
+    #[cfg(not(windows))]
+    let registry = {
+        let mut registry = BackendRegistry::new(default_backend_for_os());
+        registry.register(Arc::new(LldbFactory::new()));
+        registry
+    };
+    #[cfg(windows)]
+    let registry = {
+        // Phase 3 registers `WinDbgFactory` here:
+        //   let mut registry = BackendRegistry::new(default_backend_for_os());
+        //   registry.register(Arc::new(WinDbgFactory::new()));
+        // Until then the Windows registry is empty (no backend yet).
+        BackendRegistry::new(default_backend_for_os())
+    };
+
     let server = ToolServer::new(session, registry);
 
     // serve over stdio; on a fatal error print to stderr + exit 1 (Go main.go:25-26).

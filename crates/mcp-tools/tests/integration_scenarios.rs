@@ -2,9 +2,9 @@
 //! fixtures. Each test mirrors a function in `internal/tools/integration_test.go` and its
 //! assertions exactly (stop reasons, locations, exit codes, the within-N-continues /
 //! no-hang timing guards). Gated behind the `integration` feature; skips cleanly when
-//! lldb-dap or the fixtures are absent.
+//! lldb-dap or the fixtures are absent. Unix-gated: lldb is a macOS/Linux backend.
 
-#![cfg(feature = "integration")]
+#![cfg(all(feature = "integration", unix))]
 
 use std::time::Duration;
 

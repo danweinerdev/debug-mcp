@@ -3,6 +3,10 @@
 //! The spawn tests use `sh`/`true` (no real lldb-dap needed), exactly like the Go tests.
 //! The `--repl-mode=command`-only-when-capable check is observable via the round-trip /
 //! exit behavior; capability is carried through `Subprocess::is_lldb_dap`.
+//!
+//! **Unix-only:** lldb is a macOS/Linux backend, and these tests spawn POSIX binaries
+//! (`sh`/`true`) absent on Windows. The whole file compiles out off Unix.
+#![cfg(unix)]
 
 use std::sync::Arc;
 

@@ -12,9 +12,17 @@ path = "src/main.rs"
 
 [dependencies]
 debugger-core.workspace = true
-dap-client.workspace = true
-lldb-backend.workspace = true
 mcp-session.workspace = true
 mcp-tools.workspace = true
 rmcp.workspace = true
 tokio = { workspace = true }
+
+# lldb is a macOS/Linux backend — the binary only links/registers it (and its DAP transport)
+# off Windows. lldb-on-Windows can be added later by also registering it under cfg(windows).
+[target.'cfg(not(windows))'.dependencies]
+lldb-backend.workspace = true
+dap-client.workspace = true
+
+# The WinDbg backend (Phase 3) is Windows-only:
+# [target.'cfg(windows)'.dependencies]
+# windbg-backend.workspace = true
