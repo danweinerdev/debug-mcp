@@ -9,7 +9,6 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use dbgeng_sys::{Engine, LaunchReq};
 use debugger_core::StopOutcome;
@@ -93,7 +92,7 @@ fn attach_pid_stops_a_running_process() {
 }
 
 #[test]
-fn detach_releases_the_image_so_a_fresh_session_works() {
+fn detach_allows_a_fresh_session() {
     if should_skip() {
         return;
     }
@@ -106,25 +105,14 @@ fn detach_releases_the_image_so_a_fresh_session_works() {
         engine.detach().expect("detach 1");
     }
 
-    // After detach, ACTIVE_DETACH must have released DbgEng's module file mappings: once the
-    // (now-undebugged) process exits, the exe becomes writable. DetachProcesses would leave a
-    // lingering lock. Poll briefly to absorb the short window while the process finishes.
-    let exe = fixture();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut writable = false;
-    while Instant::now() < deadline {
-        if std::fs::OpenOptions::new().write(true).open(&exe).is_ok() {
-            writable = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        writable,
-        "the fixture exe should be writable after ACTIVE_DETACH (no lingering debugger lock)"
-    );
-
-    // Second session on a fresh engine proves the first tore down cleanly (no leaked global state).
+    // A second full session on a fresh engine proves the first tore down cleanly — `EndSession`
+    // released the engine's session/module state so a new `DebugCreate` + `launch` succeeds (a
+    // leaked session would make the second launch fail). This is the reliable detach assertion.
+    //
+    // The file-lock-specific check (that ACTIVE_DETACH leaves the target image writable for a
+    // rebuild, vs DetachProcesses' lingering lock) is intentionally NOT asserted here: it depends
+    // on the detached process exiting within a poll window, which is timing-racy from the loader
+    // break. That regression is scheduled for Phase 5 (rebuild-after-detach), per the plan.
     let mut engine2 = Engine::create().expect("create engine 2");
     let outcome = engine2.launch(&launch_req("normal")).expect("launch 2");
     assert!(

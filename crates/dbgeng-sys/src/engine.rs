@@ -122,6 +122,7 @@ pub struct Engine {
 /// latency: the engine's `go` loop polls every 200 ms, so an off-thread `interrupt()` is acted on
 /// within ≤200 ms — well inside any human/agent interaction budget. Because the handle is pure
 /// atomic state it is trivially `Send` with no `unsafe`.
+#[derive(Clone)]
 pub struct InterruptHandle {
     flag: Arc<AtomicBool>,
 }
@@ -480,6 +481,20 @@ impl Engine {
     /// The interrupt flag is reset to `false` at entry — `go` is the sole writer of `false`, and
     /// resetting here (rather than after the loop) closes the spurious-interrupt race: a stale
     /// `true` left by a previous run cannot break this run before it starts.
+    ///
+    /// Timing/contract details:
+    /// - `timeout_ms` is a *budget*, not a hard wall-clock deadline: the 200 ms poll granularity
+    ///   means the actual elapsed time may exceed `timeout_ms` by up to one ~200 ms slice plus OS
+    ///   scheduling jitter. `timeout_ms = 0` means "return almost immediately if nothing is ready"
+    ///   (still servicing a pending interrupt); it does NOT mean "run forever" — pass a large
+    ///   value for a long budget.
+    /// - When an off-thread interrupt fires, `go` drives the break in-thread via the same loop as
+    ///   [`Engine::break_in`], so it may block for up to an additional ~10 s (50 × 200 ms) before
+    ///   returning the regained stop.
+    /// - An `Err` from the interrupt-break path (break-in exhausted its ~10 s budget) leaves the
+    ///   target **still running**, just like `Ok(None)`: treat it the same for recovery (the
+    ///   engine holds no valid context; `break_in` again or restart). A COM `Err` likewise leaves
+    ///   engine state undefined from the caller's view.
     pub fn go(&mut self, timeout_ms: u32) -> Result<Option<StopOutcome>, EngineError> {
         self.ensure_runnable()?;
 
@@ -566,6 +581,9 @@ impl Engine {
     /// Returns the regained stop (`Ok(StopOutcome)`); a target that never breaks within the poll
     /// budget yields an `EngineError::engine("break: timed out")`.
     pub fn break_in(&mut self) -> Result<StopOutcome, EngineError> {
+        // Consistent with `go`/`step`: refuse on a dump session (which has no running target to
+        // break into) with the frozen literal rather than letting SetInterrupt fail opaquely.
+        self.ensure_runnable()?;
         self.break_loop()
     }
 

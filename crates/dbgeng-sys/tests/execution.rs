@@ -118,6 +118,33 @@ fn step_into_from_initial_break_stops() {
     let _ = engine.detach();
 }
 
+/// `step` Out exercises the distinct `Execute("gu")` path (no `DEBUG_STATUS_STEP_OUT` exists).
+/// From the loader break we first step *into* a frame, then step *out* of it; the exact landing
+/// is loader/CRT-dependent, so we only assert the `gu` path runs end-to-end and returns a stop
+/// (Stopped, or Exited if "go up" unwound to process exit) — never an error or a hang.
+#[test]
+fn step_out_runs_gu_and_returns_a_stop() {
+    if should_skip() {
+        return;
+    }
+    let _guard = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+
+    let mut engine = Engine::create().expect("create engine");
+    engine.launch(&launch_req("normal")).expect("launch");
+
+    // Get one frame deep so "step out" has a frame to return from.
+    let _ = engine.step(StepKind::Into).expect("step into");
+    let outcome = engine.step(StepKind::Out).expect("step out (gu)");
+    assert!(
+        matches!(
+            outcome,
+            StopOutcome::Stopped(_) | StopOutcome::Exited { .. }
+        ),
+        "step-out via `gu` should return a stop, got {outcome:?}"
+    );
+    let _ = engine.detach();
+}
+
 /// `go` with a short timeout against `test_target wait` (an infinite Sleep loop) must time out
 /// still-running (`Ok(None)` — R3), after which `break_in()` must regain a real `Stopped`.
 #[test]
