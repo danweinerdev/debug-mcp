@@ -3,9 +3,9 @@ title: "dbgeng-sys — confined COM FFI → safe Engine"
 type: phase
 plan: WinDbgBackend
 phase: 2
-status: in-progress
+status: complete
 created: 2026-06-03
-updated: 2026-06-04
+updated: 2026-06-05
 deliverable: "A Windows-only `dbgeng-sys` crate that wraps the six DbgEng COM interfaces and exposes a safe, synchronous `Engine` (launch/attach/go/step/break/breakpoints/inspect/memory/execute/detach) plus the `Send` `InterruptHandle` — with ALL unsafe confined to this crate and proven against a live target via a smoke test."
 tasks:
   - id: "2.1"
@@ -30,7 +30,7 @@ tasks:
     depends_on: ["2.3"]
   - id: "2.5"
     title: "Breakpoints / inspection / memory / commands"
-    status: in-progress
+    status: complete
     verification: "Against the fixture at a known stop: a breakpoint set by function (with the `module!sym` fallback), by `file:line`, and by `0x<addr>` each resolves and is hit; `remove`/`list` reflect ids/offsets/hit-counts; `threads()`/`stack_trace()`/`locals()` (via `SetScope`+`GetScopeSymbolGroup2`)/`evaluate(\"?? expr\")` return correct values; `read_memory()` (`ReadVirtual`) returns the expected bytes and short-reads truncate cleanly; `disassemble()` returns the requested instruction count; `execute(\"r\")` returns register text via the output sink; `modules()` lists the exe with its PDB status; `current_source_location()` maps the IP to file:line."
     depends_on: ["2.4"]
 ---
@@ -123,19 +123,34 @@ budget (may overshoot ~200 ms); `timeout_ms = 0` ≠ infinite.
 ## 2.5: Breakpoints / inspection / memory / commands
 
 ### Subtasks
-- [ ] `set_breakpoint(loc, condition)`: dispatch `0x<addr>` / `file:line` (`GetOffsetByLine`) / function (`GetOffsetByName` + module-qualify fallback) → `AddBreakpoint` + `SetOffset` + `ENABLED`; store the condition in the engine-side map (eval deferred to Phase 5).
-- [ ] `remove_breakpoint`/`list_breakpoints` (ids, offsets, flags, pass-count, symbolicated).
-- [ ] `threads`/`stack_trace`/`locals`/`evaluate`/`read_memory`/`disassemble`/`execute`/`modules`/`current_source_location` → neutral types (all `&mut self`).
-- [ ] Build the sorted module table + binary search used for fast symbol resolution (R5).
+- [x] `set_breakpoint(BpLoc, condition)`: dispatch address / `file:line` (`GetOffsetByLine`) / function (`GetOffsetByName` + module-qualify fallback) → `AddBreakpoint` + `SetOffset` + `ENABLED`; condition stored in `breakpoint_conditions: HashMap<u32,String>` (eval deferred to Phase 5; cleared on launch/attach/detach).
+- [x] `remove_breakpoint`/`list_breakpoints` (ids, offsets, symbolicated message).
+- [x] `threads`/`stack_trace`(restores current thread)/`locals`(SetScope+GetScopeSymbolGroup2)/`evaluate`(`?? expr`)/`read_memory`(ReadVirtual, u32-capped)/`disassemble`(`IDebugControl::Disassemble`)/`execute`/`modules`/`current_source_location` → neutral types, all `&mut self`.
+- [x] **COM footgun fixed:** DbgEng breakpoint objects are engine-owned — wrapped in `Bp(ManuallyDrop<IDebugBreakpoint>)` so `Release` never fires (calling it is an AV). (The fast module-table/binary-search optimization from C++ `get_all_stacks` is not needed yet — `stack_trace` resolves per frame; deferred unless latency proves material.)
 
 ### Notes
-`execute`/`evaluate`/`analyze` clear the output buffer, `Execute(DEBUG_OUTCTL_THIS_CLIENT,…)`,
-then `GetAndClear`. `EnsureExtensionsLoaded` (for later `!analyze`) discovers the ext path at
-runtime (R8) rather than hard-coding it.
+`execute`/`evaluate` clear the output buffer, `Execute(DEBUG_OUTCTL_THIS_CLIENT,…)`, then
+`take_output`. `EnsureExtensionsLoaded` (for `!analyze`) + runtime ext-path discovery (R8) is
+**Phase 4** — plain `execute` here runs ordinary commands without extensions. 11 live inspection
+tests pass against the fixture (breakpoint set→hit→remove, threads, stack incl. `compute`/`main`,
+locals(0) + locals(1) scoped path, evaluate, read_memory, disassemble, execute, modules, source
+location).
 
 ## Acceptance Criteria
-- [ ] `dbgeng-sys` builds on Windows on the `windows` crate; R1 resolved (interfaces available or vtable-backed); the `unsafe`-confinement grep gate passes.
-- [ ] `Engine::create` + the output/event callbacks work against a live target; first/second-chance exception handling is correct.
-- [ ] `launch`/`attach_pid`/`detach` work; INITIAL_BREAK is removed; detach leaves no file lock (rebuild test).
-- [ ] `go`/`step`/`InterruptHandle` work; the flag resets at entry; R4 resolved (cited guarantee or fallback).
-- [ ] Breakpoints (addr/file:line/func), inspection, memory, disassemble, execute, modules, and source-location return correct neutral values against the fixture; `dbgeng-sys` unit tests + the live smoke pass; clippy `-D warnings`/`fmt` clean.
+- [x] `dbgeng-sys` builds on Windows on the `windows` crate v0.59; **R1 resolved** (all six interfaces generated; no vtables); the `unsafe`-confinement grep gate passes; the 7 other crates carry `#![forbid(unsafe_code)]`.
+- [x] `Engine::create` + the output/event callbacks work against a live target; first/second-chance exception handling correct; `Drop` unregisters callbacks.
+- [x] `launch`/`attach_pid`/`detach` work; INITIAL_BREAK removed (proven by go-to-exit); detach allows a fresh session (the file-lock rebuild regression is scheduled for Phase 5).
+- [x] `go`/`step`/`InterruptHandle` work; the flag resets at entry; **R4 resolved — flag-only** (no off-thread COM; `InterruptHandle` holds only `Arc<AtomicBool>`).
+- [x] Breakpoints (addr/file:line/func + module-qualify), inspection, memory, disassemble, execute, modules, and source-location return correct neutral values against the fixture; all `dbgeng-sys` tests pass; clippy `-D warnings`/`fmt` clean; `cargo test --workspace` 0 failures on Windows.
+
+## Outcome
+
+Phase 2 delivered the confined `dbgeng-sys` crate end-to-end on a live Windows host. Every task
+passed an independent `quality-scanner` review with findings addressed (incl. real catches: the
+2.2 `Drop`-teardown, the 2.5 `ManuallyDrop` breakpoint guard, the `stack_trace` thread restore).
+**Resolved risks:** R1 (windows-crate coverage — done), R4 (cross-thread interrupt — flag-only),
+R3 (`go` `S_FALSE`/no-context — `break_in` recovery), R5 (symbol latency — `srv*` cache +
+`SYMOPT_NO_IMAGE_SEARCH`). **Still open for later:** R2 (kernel orphan thread — Phase 4/5), R6
+(ASLR address BP — Phase 5), R8 (ext-path discovery — Phase 4), R7 (CI Windows lane — Phase 5),
+plus the deferred conditional-BP eval (Phase 5) and nested variable expansion. The fixture was
+pulled forward from Phase 3.

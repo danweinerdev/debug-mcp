@@ -3,7 +3,7 @@ title: "WinDbg Backend — debug-mcp"
 type: plan
 status: active
 created: 2026-06-03
-updated: 2026-06-04
+updated: 2026-06-05
 tags: [rust, windbg, dbgeng, com, backend, debugging, kernel, crash-dump, ffi, port, tokio]
 related: [Designs/WinDbgBackend, Designs/RustPort, Specs/RustPort]
 phases:
@@ -13,7 +13,7 @@ phases:
     doc: "01-Seam-Additions.md"
   - id: 2
     title: "dbgeng-sys — confined COM FFI → safe Engine"
-    status: in-progress
+    status: complete
     doc: "02-DbgEng-Sys.md"
     depends_on: [1]
   - id: 3
