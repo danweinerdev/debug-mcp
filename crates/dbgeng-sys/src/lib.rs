@@ -33,5 +33,5 @@ mod error;
 mod tests;
 
 pub use callbacks::{exception_breaks, OutputKind, OutputSink};
-pub use engine::Engine;
+pub use engine::{Engine, LaunchReq};
 pub use error::EngineError;
