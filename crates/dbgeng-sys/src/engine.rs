@@ -15,9 +15,11 @@
 //! six interfaces in field order with no hand-written cleanup.
 
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use debugger_core::{DumpOutcome, StopInfo, StopOutcome};
+use debugger_core::{DumpOutcome, StepKind, StopInfo, StopOutcome};
 use windows::core::{s, Interface, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Security::{
@@ -28,14 +30,11 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DebugCreate, IDebugClient5, IDebugControl, IDebugControl4, IDebugDataSpaces4,
     IDebugEventCallbacks, IDebugOutputCallbacks, IDebugRegisters2, IDebugSymbols3,
     IDebugSystemObjects4, DEBUG_ATTACH_DEFAULT, DEBUG_CREATE_PROCESS_OPTIONS,
-    DEBUG_END_ACTIVE_DETACH, DEBUG_END_PASSIVE, DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_MODNAME_MODULE,
+    DEBUG_END_ACTIVE_DETACH, DEBUG_END_PASSIVE, DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT,
+    DEBUG_INTERRUPT_ACTIVE, DEBUG_MODNAME_MODULE, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_STATUS_BREAK,
     DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED,
     DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO,
     DEBUG_STATUS_STEP_OVER,
-};
-#[cfg(test)]
-use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_THIS_CLIENT,
 };
 use windows::Win32::System::Diagnostics::Debug::SYMOPT_NO_IMAGE_SEARCH;
 use windows::Win32::System::Threading::{
@@ -96,6 +95,45 @@ pub struct Engine {
     /// Whether the active session is a crash dump (set by `open_dump` in Phase 4). A dump cannot
     /// be resumed; `ensure_runnable` (called by go/step in 2.4) refuses when this is set.
     is_dump: bool,
+    /// The cooperative interrupt flag shared with every [`InterruptHandle`] minted by
+    /// [`Engine::interrupt_handle`]. `go` resets it to `false` at entry (it is the only writer at
+    /// that point), then its 200 ms poll loop observes a later `true` written off-thread by a
+    /// handle's `interrupt()` and converts it into a real `SetInterrupt`-driven break. This is the
+    /// crate's *only* shared mutable state reachable from another thread; all access is through a
+    /// single `AtomicBool` with `Acquire`/`Release` ordering (see [`Engine::go`] and
+    /// [`InterruptHandle::interrupt`]) — no DbgEng COM call ever crosses a thread boundary.
+    interrupt_flag: Arc<AtomicBool>,
+}
+
+/// A `Send` interrupt token for one [`Engine`], the *only* part of this crate that crosses a
+/// thread boundary. It carries a clone of the engine's `interrupt_flag` `Arc<AtomicBool>` and
+/// nothing else: calling [`InterruptHandle::interrupt`] from any thread sets the flag, which the
+/// engine's own [`Engine::go`] poll loop (running on the engine-owning thread) observes within one
+/// 200 ms poll and turns into a `SetInterrupt`-driven break.
+///
+/// ## Why flag-only (the R4 decision)
+///
+/// `IDebugControl::SetInterrupt` is in fact documented as callable from a thread other than the
+/// one that owns the DbgEng session — it is the one DbgEng method intended for that — so a
+/// cross-thread `SetInterrupt` would be defensible. We deliberately do **not** take that path:
+/// this handle holds no COM interface at all, so *no* DbgEng pointer is ever touched off the
+/// engine-owning thread, and the crate's confinement invariant ("every DbgEng call runs on the
+/// engine's thread") is preserved with zero exceptions to reason about. The cost is bounded
+/// latency: the engine's `go` loop polls every 200 ms, so an off-thread `interrupt()` is acted on
+/// within ≤200 ms — well inside any human/agent interaction budget. Because the handle is pure
+/// atomic state it is trivially `Send` with no `unsafe`.
+pub struct InterruptHandle {
+    flag: Arc<AtomicBool>,
+}
+
+impl InterruptHandle {
+    /// Request that the engine's in-flight `go` break in. Sets the shared flag with `Release`
+    /// ordering so the engine thread's `Acquire` load in `go`'s poll loop observes it. Safe to
+    /// call from any thread and at any time (a request while nothing is running is simply consumed
+    /// — `go` resets the flag at entry, closing the spurious-interrupt race).
+    pub fn interrupt(&self) {
+        self.flag.store(true, Ordering::Release);
+    }
 }
 
 impl Engine {
@@ -191,6 +229,7 @@ impl Engine {
             _output_callbacks: output_cb,
             _event_callbacks: event_cb,
             is_dump: false,
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -407,6 +446,163 @@ impl Engine {
         unsafe { self.client.EndSession(flags) }.map_err(|e| EngineError::op("EndSession", e))?;
         self.is_dump = false;
         Ok(())
+    }
+
+    // --- execution control (task 2.4) ---
+
+    /// Mint a `Send` [`InterruptHandle`] for this engine. The handle shares this engine's
+    /// `interrupt_flag` (a clone of the same `Arc<AtomicBool>`), so a `handle.interrupt()` on any
+    /// thread is the exact flag `go`'s poll loop reads. See [`InterruptHandle`] for the R4 (flag-
+    /// only, no cross-thread COM) rationale. Multiple handles may be minted; they all share the
+    /// one flag.
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            flag: Arc::clone(&self.interrupt_flag),
+        }
+    }
+
+    /// Resume the target and run until it stops, is interrupted, or `timeout_ms` elapses. Ports
+    /// the C++ `Go`: reset the interrupt flag, `SetExecutionStatus(DEBUG_STATUS_GO)`, then poll
+    /// `wait_for_event(200)` so the loop stays responsive to an off-thread interrupt.
+    ///
+    /// Return contract (the R3 still-running case): `Ok(Some(stop))` when the target stopped or
+    /// exited; `Ok(None)` when `timeout_ms` elapsed with the target **still running**. There is no
+    /// "running" variant of the neutral `StopOutcome`, so `None` carries that state — `Option` is
+    /// chosen over a bespoke enum because it adds no type and reads naturally ("maybe a stop").
+    ///
+    /// After a `None` (still-running) return the engine's `WaitForEvent` loop has stopped, so it
+    /// holds **no valid stop context** (R3 — the C++ `S_FALSE` limitation): the target is running
+    /// freely and the engine cannot answer stack/register/locals queries. The caller must call
+    /// [`Engine::break_in`] (or `interrupt()` a handle and re-`go`) to regain a real break with
+    /// context before inspecting. Phase 3's `windbg-backend` maps `None` onto the neutral
+    /// "continue timed out" path.
+    ///
+    /// The interrupt flag is reset to `false` at entry — `go` is the sole writer of `false`, and
+    /// resetting here (rather than after the loop) closes the spurious-interrupt race: a stale
+    /// `true` left by a previous run cannot break this run before it starts.
+    pub fn go(&mut self, timeout_ms: u32) -> Result<Option<StopOutcome>, EngineError> {
+        self.ensure_runnable()?;
+
+        // Reset the shared flag before resuming: any interrupt request that arrives from here on
+        // is for *this* run. `Relaxed` is sufficient for the reset (the engine thread is the only
+        // writer of `false`, and the subsequent `Acquire` loads below establish the ordering with
+        // off-thread `Release` stores); we use `Release` for symmetry and to flush eagerly.
+        self.interrupt_flag.store(false, Ordering::Release);
+
+        // SAFETY: `self.control` is a live `IDebugControl4` from `create`; `SetExecutionStatus`
+        // takes the documented `DEBUG_STATUS_GO` u32 by value. No pointers cross the boundary.
+        unsafe { self.control.SetExecutionStatus(DEBUG_STATUS_GO) }
+            .map_err(|e| EngineError::op("SetExecutionStatus(GO)", e))?;
+
+        // Poll with short timeouts so an off-thread interrupt is acted on within one 200 ms slice.
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        while Instant::now() < deadline && !self.interrupt_flag.load(Ordering::Acquire) {
+            match self.wait_for_event(200)? {
+                WaitResult::Event(o) => return Ok(Some(o)),
+                WaitResult::TimedOut => {} // keep polling
+            }
+        }
+
+        if self.interrupt_flag.load(Ordering::Acquire) {
+            // An interrupt was requested off-thread. The flag carried the cross-thread signal;
+            // now drive the real DbgEng interrupt from THIS (engine-owning) thread, where every
+            // COM call stays confined. We use the same robust re-issue loop as `break_in` (a
+            // single `SetInterrupt` + one wait can be raced — the interrupt is consumed without
+            // surfacing a break — so re-issuing per poll is the reliable recovery; the C++ `Go`
+            // used a single wait and deferred the loop to its caller's `Break`, we fold that loop
+            // in here so an interrupted `go` returns a real stop directly).
+            return self.break_loop().map(Some);
+        }
+
+        // Overall deadline exceeded with no stop and no interrupt: the target is still running.
+        // The engine now holds no valid stop context (R3); the caller must `break_in` to regain it.
+        Ok(None)
+    }
+
+    /// Step the target one source step and return the resulting stop. Ports the C++
+    /// `StepOver`/`StepInto`/`StepOut`: Over/Into set the matching `DEBUG_STATUS_STEP_*` execution
+    /// status; Out has no DbgEng status, so it runs the `gu` ("go up") command — exactly the C++
+    /// approach. All three then wait (a generous 10 s) for the step to land.
+    pub fn step(&mut self, kind: StepKind) -> Result<StopOutcome, EngineError> {
+        self.ensure_runnable()?;
+
+        match kind {
+            StepKind::Over => {
+                // SAFETY: live control interface; documented `DEBUG_STATUS_STEP_OVER` u32 flag.
+                unsafe { self.control.SetExecutionStatus(DEBUG_STATUS_STEP_OVER) }
+                    .map_err(|e| EngineError::op("SetExecutionStatus(STEP_OVER)", e))?;
+            }
+            StepKind::Into => {
+                // SAFETY: live control interface; documented `DEBUG_STATUS_STEP_INTO` u32 flag.
+                unsafe { self.control.SetExecutionStatus(DEBUG_STATUS_STEP_INTO) }
+                    .map_err(|e| EngineError::op("SetExecutionStatus(STEP_INTO)", e))?;
+            }
+            StepKind::Out => {
+                // DbgEng has no `DEBUG_STATUS_STEP_OUT`; the C++ oracle runs the `gu` command to
+                // step out of the current frame. Route output to this client's callbacks.
+                // SAFETY: live control interface; `s!("gu")` is a 'static NUL-terminated ANSI
+                // string valid for the call (the engine copies it); `DEBUG_OUTCTL_THIS_CLIENT`
+                // and `DEBUG_EXECUTE_DEFAULT` are documented u32 flags. No pointers are retained.
+                unsafe {
+                    self.control
+                        .Execute(DEBUG_OUTCTL_THIS_CLIENT, s!("gu"), DEBUG_EXECUTE_DEFAULT)
+                }
+                .map_err(|e| EngineError::op("Execute(gu)", e))?;
+            }
+        }
+
+        match self.wait_for_event(10_000)? {
+            WaitResult::Event(o) => Ok(o),
+            WaitResult::TimedOut => Err(EngineError::engine("step: timed out")),
+        }
+    }
+
+    /// Forcibly break a running target back into a state with a valid stop context — the recovery
+    /// the agent runs after a `go` still-running timeout (R3). Ports the C++ `Break`:
+    /// `SetInterrupt(DEBUG_INTERRUPT_ACTIVE)` then up to ~50 × `wait_for_event(200)`, re-issuing
+    /// the interrupt each poll (it can be consumed without surfacing a break) until the execution
+    /// status reaches `DEBUG_STATUS_BREAK`/`NO_DEBUGGEE` or the polls are exhausted.
+    ///
+    /// Returns the regained stop (`Ok(StopOutcome)`); a target that never breaks within the poll
+    /// budget yields an `EngineError::engine("break: timed out")`.
+    pub fn break_in(&mut self) -> Result<StopOutcome, EngineError> {
+        self.break_loop()
+    }
+
+    /// The shared `SetInterrupt` + re-issue poll loop behind both [`Engine::break_in`] and `go`'s
+    /// flag-interrupt branch. Issues `SetInterrupt(DEBUG_INTERRUPT_ACTIVE)`, then up to ~50 ×
+    /// `wait_for_event(200)`, re-issuing the interrupt each poll (a single interrupt can be
+    /// consumed without surfacing a break) until a break surfaces — as a `WaitForEvent` event, or
+    /// as a `DEBUG_STATUS_BREAK`/`NO_DEBUGGEE` status `WaitForEvent` did not surface (the C++
+    /// `Break` check). The regained stop is relabeled "Execution paused".
+    fn break_loop(&mut self) -> Result<StopOutcome, EngineError> {
+        // SAFETY: live control interface; documented `DEBUG_INTERRUPT_ACTIVE` u32 flag.
+        unsafe { self.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }
+            .map_err(|e| EngineError::op("SetInterrupt(ACTIVE)", e))?;
+
+        for _ in 0..50 {
+            // Drain one pending event slice. A real break may surface here as an Event…
+            match self.wait_for_event(200)? {
+                WaitResult::Event(o) => return Ok(with_reason(o, "Execution paused")),
+                WaitResult::TimedOut => {}
+            }
+
+            // …or only as a status change WaitForEvent did not surface (the C++ check). Read it.
+            // SAFETY: live control interface; returns the execution status u32 by value.
+            let status = unsafe { self.control.GetExecutionStatus() }
+                .map_err(|e| EngineError::op("GetExecutionStatus", e))?;
+            if status == DEBUG_STATUS_BREAK || status == DEBUG_STATUS_NO_DEBUGGEE {
+                let outcome = self.build_stop_outcome(status)?;
+                return Ok(with_reason(outcome, "Execution paused"));
+            }
+
+            // Still running — re-issue the interrupt in case the previous one was consumed.
+            // SAFETY: live control interface; documented `DEBUG_INTERRUPT_ACTIVE` u32 flag.
+            unsafe { self.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }
+                .map_err(|e| EngineError::op("SetInterrupt(ACTIVE)", e))?;
+        }
+
+        Err(EngineError::engine("break: timed out"))
     }
 
     /// Open a crash/minidump. STUB until Phase 4 — present now so the `Engine` surface (and the
