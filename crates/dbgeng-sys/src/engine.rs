@@ -14,12 +14,17 @@
 //! has to `Release()` all six by hand) does not apply here: dropping an `Engine` releases all
 //! six interfaces in field order with no hand-written cleanup.
 
-use std::ffi::CString;
+use std::collections::HashMap;
+use std::ffi::{c_void, CString};
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use debugger_core::{DumpOutcome, StepKind, StopInfo, StopOutcome};
+use debugger_core::{
+    BreakpointResult, DumpOutcome, EvalResult, Frame, Instruction, MemoryRead, ModuleInfo,
+    StepKind, StopInfo, StopOutcome, ThreadInfo, Variable,
+};
 use windows::core::{s, Interface, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Security::{
@@ -27,14 +32,17 @@ use windows::Win32::Security::{
     SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
 };
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    DebugCreate, IDebugClient5, IDebugControl, IDebugControl4, IDebugDataSpaces4,
+    DebugCreate, IDebugBreakpoint, IDebugClient5, IDebugControl, IDebugControl4, IDebugDataSpaces4,
     IDebugEventCallbacks, IDebugOutputCallbacks, IDebugRegisters2, IDebugSymbols3,
-    IDebugSystemObjects4, DEBUG_ATTACH_DEFAULT, DEBUG_CREATE_PROCESS_OPTIONS,
-    DEBUG_END_ACTIVE_DETACH, DEBUG_END_PASSIVE, DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT,
-    DEBUG_INTERRUPT_ACTIVE, DEBUG_MODNAME_MODULE, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_STATUS_BREAK,
-    DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED,
-    DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO,
-    DEBUG_STATUS_STEP_OVER,
+    IDebugSystemObjects4, DEBUG_ANY_ID, DEBUG_ATTACH_DEFAULT, DEBUG_BREAKPOINT_CODE,
+    DEBUG_BREAKPOINT_ENABLED, DEBUG_CREATE_PROCESS_OPTIONS, DEBUG_END_ACTIVE_DETACH,
+    DEBUG_END_PASSIVE, DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT, DEBUG_INTERRUPT_ACTIVE,
+    DEBUG_MODNAME_MODULE, DEBUG_MODULE_PARAMETERS, DEBUG_OUTCTL_THIS_CLIENT,
+    DEBUG_SCOPE_GROUP_LOCALS, DEBUG_STACK_FRAME, DEBUG_STATUS_BREAK, DEBUG_STATUS_GO,
+    DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_NO_DEBUGGEE,
+    DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO, DEBUG_STATUS_STEP_OVER,
+    DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
+    DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM,
 };
 use windows::Win32::System::Diagnostics::Debug::SYMOPT_NO_IMAGE_SEARCH;
 use windows::Win32::System::Threading::{
@@ -51,6 +59,23 @@ pub struct LaunchReq {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
+}
+
+/// Where a breakpoint should be placed. The pre-parsed form `set_breakpoint` accepts so the
+/// engine does not have to guess between an address literal, a `file:line`, and a function name
+/// (the three location kinds the C++ `SetBreakpointBy{Address,Line,Function}` overloads cover).
+/// The `windbg-backend` (Phase 3) parses the neutral tool arguments into this; the resolution
+/// logic (symbol lookup, the module-qualify fallback) stays here next to the COM calls.
+pub enum BpLoc {
+    /// An absolute code address (the C++ `SetBreakpointByAddress`). Used verbatim.
+    Address(u64),
+    /// A `file:line` source location (the C++ `SetBreakpointByLine`): resolved via
+    /// `GetOffsetByLine`.
+    FileLine { file: String, line: u32 },
+    /// A function name, optionally module-qualified `module!func` (the C++
+    /// `SetBreakpointByFunction`): resolved via `GetOffsetByName`, with the per-module
+    /// `module!func` fallback when an unqualified name does not resolve.
+    Function(String),
 }
 
 /// The outcome of one `wait_for_event`: either an event fired (with the neutral stop outcome) or
@@ -103,6 +128,12 @@ pub struct Engine {
     /// single `AtomicBool` with `Acquire`/`Release` ordering (see [`Engine::go`] and
     /// [`InterruptHandle::interrupt`]) — no DbgEng COM call ever crosses a thread boundary.
     interrupt_flag: Arc<AtomicBool>,
+    /// Engine-side breakpoint conditions, keyed by DbgEng breakpoint id. Ports the C++
+    /// `breakpointConditions_` map: DbgEng's command-string conditions (`bp /c`) cannot work with
+    /// our `WaitForEvent` poll loop (`g`/`gc` can't re-enter the event loop), so the condition is
+    /// stored here and the conditional-break re-loop is deferred to Phase 5 (the `wait_for_event`
+    /// hook). `set_breakpoint` inserts, `remove_breakpoint` drops, and `detach` clears the map.
+    breakpoint_conditions: HashMap<u32, String>,
 }
 
 /// A `Send` interrupt token for one [`Engine`], the *only* part of this crate that crosses a
@@ -231,6 +262,7 @@ impl Engine {
             _event_callbacks: event_cb,
             is_dump: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
+            breakpoint_conditions: HashMap::new(),
         })
     }
 
@@ -300,23 +332,637 @@ impl Engine {
         self.callback_state().last_exit_code()
     }
 
-    /// Run a raw DbgEng command line through `IDebugControl::Execute`, routed to *this client*
-    /// so its output flows through our registered [`callbacks::OutputCallbacks`]. This is the
-    /// minimal command path the task-2.2 output-capture test needs (no-target commands such as
-    /// `version`/`.echo`); the full neutral `execute()` surface lands in task 2.5, which will
-    /// supersede this. `#[cfg(test)]` + `pub(crate)`: it exists only to drive the 2.2 test and
-    /// never forms part of the crate's public (or even non-test) surface.
-    #[cfg(test)]
-    pub(crate) fn execute_raw(&mut self, command: PCSTR) -> Result<(), EngineError> {
-        // SAFETY: `self.control` is the live `IDebugControl4` from `create`. `command` is a
-        // NUL-terminated ANSI `PCSTR` owned by the caller for the duration of the call (the
-        // engine copies it). `DEBUG_OUTCTL_THIS_CLIENT` routes output to this client's output
-        // callbacks; no pointers are retained past the call.
-        unsafe {
-            self.control
-                .Execute(DEBUG_OUTCTL_THIS_CLIENT, command, DEBUG_EXECUTE_DEFAULT)
+    /// Run a raw DbgEng command line through `IDebugControl::Execute`, routed to *this client* so
+    /// its output flows through our registered [`callbacks::OutputCallbacks`], and return the
+    /// captured output. Ports the C++ `ExecuteCommand`: drain any stale output, `Execute(
+    /// DEBUG_OUTCTL_THIS_CLIENT, command, DEBUG_EXECUTE_DEFAULT)`, then drain and return what the
+    /// command emitted.
+    ///
+    /// `!analyze`/extension commands need the runtime extension-path discovery (R8) the C++
+    /// `EnsureExtensionsLoaded` performs first; that is Phase 4, so a plain `execute` here does
+    /// *not* load extensions — ordinary commands (`r`, `dd`, `version`, `.echo`, …) work unchanged.
+    ///
+    /// Mirrors the C++ tolerance for a command that fails but still produced output: a failing
+    /// `HRESULT` is only surfaced as an error when nothing was captured; otherwise the captured
+    /// text is returned (some DbgEng commands return a non-`S_OK` status yet print useful output).
+    pub fn execute(&mut self, command: &str) -> Result<String, EngineError> {
+        let cmd = CString::new(command)
+            .map_err(|_| EngineError::engine("execute: command contains an interior NUL byte"))?;
+        // Drop any output buffered before this command so the returned text is just this command's.
+        let _ = self.take_output();
+        // SAFETY: `self.control` is the live `IDebugControl4` from `create`. `cmd` is a
+        // NUL-terminated ANSI string owned here for the duration of the call (the engine copies
+        // it); the `PCSTR` borrows it and does not outlive this statement.
+        // `DEBUG_OUTCTL_THIS_CLIENT` routes output to this client's output callbacks; no pointers
+        // are retained past the call.
+        let hr = unsafe {
+            self.control.Execute(
+                DEBUG_OUTCTL_THIS_CLIENT,
+                PCSTR(cmd.as_ptr().cast()),
+                DEBUG_EXECUTE_DEFAULT,
+            )
+        };
+        let output = self.take_output();
+        if let Err(e) = hr {
+            if output.is_empty() {
+                return Err(EngineError::op("Execute", e));
+            }
         }
-        .map_err(|e| EngineError::op("Execute", e))
+        Ok(output)
+    }
+
+    // --- breakpoints (task 2.5) ---
+
+    /// Set a code breakpoint at `loc` and store its `condition` (if any) engine-side. Ports the
+    /// C++ `SetBreakpointBy{Address,Line,Function}` + `SetBreakpointByAddress`: resolve `loc` to an
+    /// absolute offset, then `AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)` →
+    /// `SetOffset(addr)` → `AddFlags(DEBUG_BREAKPOINT_ENABLED)` → `GetId()`.
+    ///
+    /// The `condition` is *stored* (keyed by breakpoint id) but not yet evaluated: DbgEng's
+    /// command-string conditions cannot work with our `WaitForEvent` poll loop, so the conditional
+    /// re-loop in `wait_for_event` is deferred to Phase 5. An empty `condition` stores nothing.
+    pub fn set_breakpoint(
+        &mut self,
+        loc: &BpLoc,
+        condition: &str,
+    ) -> Result<BreakpointResult, EngineError> {
+        let (addr, line) = self.resolve_bp_loc(loc)?;
+
+        // SAFETY: live control interface; `DEBUG_BREAKPOINT_CODE`/`DEBUG_ANY_ID` are documented
+        // u32 flags. Returns an `IDebugBreakpoint`. DbgEng breakpoint objects are owned by the
+        // engine (their lifetime is `AddBreakpoint`..`RemoveBreakpoint`); their `IUnknown::Release`
+        // must NOT be called — so the smart pointer is wrapped in [`Bp`] (a `ManuallyDrop` guard)
+        // immediately so its `Drop`/`Release` never fires (see [`Bp`]). Calling `Release` on a
+        // DbgEng breakpoint is an access violation.
+        let bp = Bp::new(
+            unsafe {
+                self.control
+                    .AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)
+            }
+            .map_err(|e| EngineError::op("AddBreakpoint", e))?,
+        );
+
+        // SAFETY: `bp` is the live breakpoint just created; `SetOffset` takes the address by value.
+        unsafe { bp.get().SetOffset(addr) }.map_err(|e| EngineError::op("SetOffset", e))?;
+        // SAFETY: live breakpoint; `DEBUG_BREAKPOINT_ENABLED` is a documented u32 flag.
+        unsafe { bp.get().AddFlags(DEBUG_BREAKPOINT_ENABLED) }
+            .map_err(|e| EngineError::op("AddFlags(ENABLED)", e))?;
+        // SAFETY: live breakpoint; returns the id (u32) by value.
+        let id = unsafe { bp.get().GetId() }.map_err(|e| EngineError::op("GetId", e))?;
+
+        if !condition.is_empty() {
+            self.breakpoint_conditions.insert(id, condition.to_string());
+        }
+
+        Ok(BreakpointResult {
+            id: id as i64,
+            verified: true,
+            line: line.unwrap_or(0) as i64,
+            message: String::new(),
+        })
+    }
+
+    /// Resolve a [`BpLoc`] to an absolute code offset (and, for a `file:line`, the line number).
+    /// Splits out the C++ resolution paths: address → verbatim; `file:line` → `GetOffsetByLine`;
+    /// function → `GetOffsetByName` with the per-module `module!func` fallback.
+    fn resolve_bp_loc(&mut self, loc: &BpLoc) -> Result<(u64, Option<u32>), EngineError> {
+        match loc {
+            BpLoc::Address(addr) => Ok((*addr, None)),
+            BpLoc::FileLine { file, line } => {
+                let file_c = CString::new(file.as_str()).map_err(|_| {
+                    EngineError::engine("set_breakpoint: file path contains an interior NUL byte")
+                })?;
+                // SAFETY: live symbols interface; `file_c` is NUL-terminated and outlives the call
+                // (the engine copies it). Returns the resolved offset (u64) by value.
+                let offset = unsafe {
+                    self.symbols
+                        .GetOffsetByLine(*line, PCSTR(file_c.as_ptr().cast()))
+                }
+                .map_err(|e| EngineError::op("GetOffsetByLine", e))?;
+                Ok((offset, Some(*line)))
+            }
+            BpLoc::Function(name) => Ok((self.resolve_function(name)?, None)),
+        }
+    }
+
+    /// Resolve a function name to an offset via `GetOffsetByName`, falling back to trying each
+    /// loaded module as `module!func` when an unqualified name (no `!`) does not resolve. Ports the
+    /// C++ `SetBreakpointByFunction` module-qualify loop.
+    fn resolve_function(&mut self, name: &str) -> Result<u64, EngineError> {
+        let name_c = CString::new(name).map_err(|_| {
+            EngineError::engine("set_breakpoint: function name contains an interior NUL byte")
+        })?;
+        // SAFETY: live symbols interface; `name_c` is NUL-terminated and outlives the call.
+        let direct = unsafe { self.symbols.GetOffsetByName(PCSTR(name_c.as_ptr().cast())) };
+        if let Ok(offset) = direct {
+            return Ok(offset);
+        }
+
+        // Unqualified name failed: try `<module>!<func>` for each loaded module (C++ fallback).
+        if !name.contains('!') {
+            let mut loaded = 0u32;
+            let mut unloaded = 0u32;
+            // SAFETY: live symbols interface; both out-params are valid &mut u32 locals.
+            if unsafe { self.symbols.GetNumberModules(&mut loaded, &mut unloaded) }.is_ok() {
+                for i in 0..loaded {
+                    let Some(module) = self.module_name(i) else {
+                        continue;
+                    };
+                    let Ok(qualified) = CString::new(format!("{module}!{name}")) else {
+                        continue;
+                    };
+                    // SAFETY: live symbols interface; `qualified` is NUL-terminated and outlives
+                    // the call. Returns the resolved offset (u64) by value on success.
+                    if let Ok(offset) = unsafe {
+                        self.symbols
+                            .GetOffsetByName(PCSTR(qualified.as_ptr().cast()))
+                    } {
+                        return Ok(offset);
+                    }
+                }
+            }
+        }
+
+        // Re-issue the direct lookup so the caller gets the real resolution HRESULT.
+        direct.map_err(|e| EngineError::op("GetOffsetByName", e))?;
+        unreachable!("direct was Err in this branch")
+    }
+
+    /// Remove the breakpoint with the given engine id and drop its stored condition. Ports the C++
+    /// `RemoveBreakpoint`: `GetBreakpointById` then `RemoveBreakpoint`.
+    pub fn remove_breakpoint(&mut self, id: i64) -> Result<(), EngineError> {
+        let bp_id = id as u32;
+        // SAFETY: live control interface; `bp_id` is a u32. Returns an engine-owned
+        // `IDebugBreakpoint` whose `Release` must not run (see [`Bp`]), so it is wrapped at once.
+        let bp = Bp::new(
+            unsafe { self.control.GetBreakpointById(bp_id) }
+                .map_err(|e| EngineError::op("GetBreakpointById", e))?,
+        );
+        self.breakpoint_conditions.remove(&bp_id);
+        // SAFETY: live control interface; `bp` is the live breakpoint just fetched.
+        // `RemoveBreakpoint` consumes the engine's ownership of the object (after this the pointer
+        // is dangling), which is exactly why `bp` is never `Release`d.
+        unsafe { self.control.RemoveBreakpoint(bp.get()) }
+            .map_err(|e| EngineError::op("RemoveBreakpoint", e))
+    }
+
+    /// List the currently set breakpoints. Ports the C++ `ListBreakpoints`: `GetNumberBreakpoints`
+    /// then per-index `GetBreakpointByIndex` → id/offset, symbolicating the offset via
+    /// `GetNameByOffset` (with a `+0x…` displacement suffix) for the `message` field; an
+    /// unresolved offset falls back to its `0x…` hex address.
+    pub fn list_breakpoints(&mut self) -> Result<Vec<BreakpointResult>, EngineError> {
+        // SAFETY: live control interface; returns the breakpoint count (u32) by value.
+        let count = unsafe { self.control.GetNumberBreakpoints() }
+            .map_err(|e| EngineError::op("GetNumberBreakpoints", e))?;
+
+        let mut result = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            // SAFETY: live control interface; `i` is a valid index `< count`. A failure for one
+            // index is skipped (the breakpoint set can change between calls); ports the C++ skip.
+            // The returned object is engine-owned (its `Release` must not run — see [`Bp`]), so it
+            // is wrapped immediately.
+            let Ok(bp) = (unsafe { self.control.GetBreakpointByIndex(i) }) else {
+                continue;
+            };
+            let bp = Bp::new(bp);
+            // SAFETY: `bp` is the live breakpoint; both reads return their value by value.
+            let id = unsafe { bp.get().GetId() }.unwrap_or(0);
+            // SAFETY: live breakpoint; returns the offset (u64) by value.
+            let offset = unsafe { bp.get().GetOffset() }.unwrap_or(0);
+            let message = self
+                .symbolicate(offset)
+                .unwrap_or_else(|| format!("0x{offset:016X}"));
+            result.push(BreakpointResult {
+                id: id as i64,
+                verified: true,
+                line: 0,
+                message,
+            });
+        }
+        Ok(result)
+    }
+
+    // --- inspection (task 2.5) ---
+
+    /// Enumerate the target's threads. Ports the C++ `GetThreads`: `GetNumberThreads` +
+    /// `GetThreadIdsByIndex` for the engine and system thread ids. `id` is the *engine* thread id
+    /// (what `SetCurrentThreadId`/the stop outcome use); `name` carries the system (OS) thread id
+    /// as `"sys=<systemId>"` (the C++ surfaced both; we keep the engine id authoritative and fold
+    /// the OS id into the neutral `name` rather than walking each thread's stack here).
+    pub fn threads(&mut self) -> Result<Vec<ThreadInfo>, EngineError> {
+        // SAFETY: live system-objects interface; returns the thread count (u32) by value.
+        let count = unsafe { self.system_objects.GetNumberThreads() }
+            .map_err(|e| EngineError::op("GetNumberThreads", e))?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut engine_ids = vec![0u32; count as usize];
+        let mut system_ids = vec![0u32; count as usize];
+        // SAFETY: live system-objects interface; both buffers are valid `&mut [u32]` of length
+        // `count`, passed as the documented out-arrays for `[0, count)`.
+        unsafe {
+            self.system_objects.GetThreadIdsByIndex(
+                0,
+                count,
+                Some(engine_ids.as_mut_ptr()),
+                Some(system_ids.as_mut_ptr()),
+            )
+        }
+        .map_err(|e| EngineError::op("GetThreadIdsByIndex", e))?;
+
+        Ok(engine_ids
+            .iter()
+            .zip(system_ids.iter())
+            .map(|(&eng, &sys)| ThreadInfo {
+                id: eng as i64,
+                name: format!("sys={sys}"),
+            })
+            .collect())
+    }
+
+    /// Walk the call stack of `thread_id` (engine thread id), up to `max` frames. Ports the C++
+    /// `GetCallStack`: switch to the thread (`SetCurrentThreadId`), `GetStackTrace` into a frame
+    /// buffer, then per frame fill `index`, `instruction_pointer` (`0x{:016X}` of the IP), the
+    /// symbolicated `name` (`GetNameByOffset` + `+0x…` displacement, else the hex address), and the
+    /// source `source_path`/`line` (`GetLineByOffset`, left `None`/0 when no line maps).
+    pub fn stack_trace(&mut self, thread_id: i64, max: i64) -> Result<Vec<Frame>, EngineError> {
+        let max_frames = max.clamp(1, 1024) as usize;
+
+        // Save the engine's current thread so we can restore it: switching here would otherwise
+        // leave the *wrong* current thread for a later `locals`/`current_source_location`/stop
+        // query (the C++ thread-switching helpers restore it too). SAFETY: live system-objects
+        // interface; returns a u32 by value.
+        let prev_thread =
+            unsafe { self.system_objects.GetCurrentThreadId() }.unwrap_or(thread_id as u32);
+
+        // SAFETY: live system-objects interface; `thread_id as u32` selects the engine thread.
+        unsafe { self.system_objects.SetCurrentThreadId(thread_id as u32) }
+            .map_err(|e| EngineError::op("SetCurrentThreadId", e))?;
+
+        let mut frames = vec![DEBUG_STACK_FRAME::default(); max_frames];
+        let mut filled = 0u32;
+        // SAFETY: live control interface; `frames` is a valid `&mut [DEBUG_STACK_FRAME]` the engine
+        // fills (default frame/stack/instruction offsets = "current context"); `filled` is a valid
+        // &mut u32 out-param. No pointers are retained past the call.
+        let trace = unsafe {
+            self.control
+                .GetStackTrace(0, 0, 0, &mut frames, Some(&mut filled))
+        };
+
+        // Restore the previous current thread before surfacing any GetStackTrace error.
+        // SAFETY: live system-objects interface; `prev_thread` is the id we read above.
+        let _ = unsafe { self.system_objects.SetCurrentThreadId(prev_thread) };
+
+        trace.map_err(|e| EngineError::op("GetStackTrace", e))?;
+
+        let mut result = Vec::with_capacity(filled as usize);
+        for (i, frame) in frames.iter().take(filled as usize).enumerate() {
+            let ip = frame.InstructionOffset;
+            let name = self
+                .symbolicate(ip)
+                .unwrap_or_else(|| format!("0x{ip:016X}"));
+            let (source_path, line) = self.line_at(ip);
+            result.push(Frame {
+                index: i as i64,
+                id: i as i64,
+                name,
+                source_path,
+                line,
+                instruction_pointer: Some(format!("0x{ip:016X}")),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Read the local variables in scope at `frame_index`. Ports the C++ `GetLocals`: for a frame
+    /// above 0, `GetStackTrace` + `SetScope` to that frame; `GetScopeSymbolGroup2(
+    /// DEBUG_SCOPE_GROUP_LOCALS)` → per-symbol `GetSymbolName`/`GetSymbolValueText`/
+    /// `GetSymbolTypeName`; `ResetScope` after. Nested child expansion is later, so
+    /// `variables_reference`/`named`/`indexed` are 0.
+    pub fn locals(&mut self, frame_index: i64) -> Result<Vec<Variable>, EngineError> {
+        let scoped = frame_index > 0;
+        if scoped {
+            let want = (frame_index + 1) as usize;
+            let mut frames = vec![DEBUG_STACK_FRAME::default(); want];
+            let mut filled = 0u32;
+            // SAFETY: live control interface; `frames` is a valid `&mut [DEBUG_STACK_FRAME]`; the
+            // engine fills the current thread's frames and writes `filled`.
+            unsafe {
+                self.control
+                    .GetStackTrace(0, 0, 0, &mut frames, Some(&mut filled))
+            }
+            .map_err(|e| EngineError::op("GetStackTrace", e))?;
+            if (filled as i64) <= frame_index {
+                return Err(EngineError::engine(format!(
+                    "locals: frame {frame_index} is out of range ({filled} frames)"
+                )));
+            }
+            let frame = frames[frame_index as usize];
+            // SAFETY: live symbols interface; `&frame` points to a valid `DEBUG_STACK_FRAME` for
+            // the duration of the call (the engine copies the scope), no context blob is supplied.
+            unsafe {
+                self.symbols
+                    .SetScope(0, Some(&frame as *const DEBUG_STACK_FRAME), None, 0)
+            }
+            .map_err(|e| EngineError::op("SetScope", e))?;
+        }
+
+        let result = self.read_scope_locals();
+
+        if scoped {
+            // SAFETY: live symbols interface; restores the default (frame-0) scope. Best-effort —
+            // a ResetScope failure does not invalidate the locals already read.
+            let _ = unsafe { self.symbols.ResetScope() };
+        }
+        result
+    }
+
+    /// Read the `DEBUG_SCOPE_GROUP_LOCALS` symbol group of the *current* scope into neutral
+    /// [`Variable`]s. Factored out of [`Engine::locals`] so the `ResetScope` cleanup runs on every
+    /// path (including an error mid-read).
+    fn read_scope_locals(&mut self) -> Result<Vec<Variable>, EngineError> {
+        // SAFETY: live symbols interface; `DEBUG_SCOPE_GROUP_LOCALS` is a documented u32 flag and
+        // `None` requests a fresh group (no group to update). Returns an owned
+        // `IDebugSymbolGroup2` smart pointer.
+        let group = unsafe {
+            self.symbols
+                .GetScopeSymbolGroup2(DEBUG_SCOPE_GROUP_LOCALS, None)
+        }
+        .map_err(|e| EngineError::op("GetScopeSymbolGroup2", e))?;
+
+        // SAFETY: `group` is the live symbol group; returns the symbol count (u32) by value.
+        let count = unsafe { group.GetNumberSymbols() }
+            .map_err(|e| EngineError::op("GetNumberSymbols", e))?;
+
+        let mut result = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let mut name_buf = [0u8; 256];
+            // SAFETY: live symbol group; `name_buf` is a valid &mut buffer the engine fills with a
+            // NUL-terminated ANSI symbol name; `i < count`; the size out-param is omitted.
+            let name = if unsafe { group.GetSymbolName(i, Some(&mut name_buf), None) }.is_ok() {
+                cstr_from_buf(&name_buf)
+            } else {
+                String::new()
+            };
+
+            let mut value_buf = [0u8; 1024];
+            // SAFETY: live symbol group; `value_buf` is a valid &mut buffer the engine fills with
+            // the NUL-terminated value text; `i < count`.
+            let value =
+                if unsafe { group.GetSymbolValueText(i, Some(&mut value_buf), None) }.is_ok() {
+                    cstr_from_buf(&value_buf)
+                } else {
+                    String::new()
+                };
+
+            let mut type_buf = [0u8; 256];
+            // SAFETY: live symbol group; `type_buf` is a valid &mut buffer the engine fills with
+            // the NUL-terminated type name; `i < count`.
+            let ty = if unsafe { group.GetSymbolTypeName(i, Some(&mut type_buf), None) }.is_ok() {
+                cstr_from_buf(&type_buf)
+            } else {
+                String::new()
+            };
+
+            result.push(Variable {
+                name,
+                value,
+                ty,
+                variables_reference: 0,
+                named: 0,
+                indexed: 0,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Evaluate `expr` as a C++ expression and return its rendered value. Ports the C++
+    /// `EvaluateExpression`: run `?? <expr>` (the readable C++-expression evaluator) through
+    /// [`Engine::execute`] and return the trimmed captured output. `ty`/`variables_reference` are
+    /// left empty/0 (the `??` text carries the type inline; structured type extraction is later).
+    pub fn evaluate(&mut self, expr: &str) -> Result<EvalResult, EngineError> {
+        let output = self.execute(&format!("?? {expr}"))?;
+        Ok(EvalResult {
+            result: output.trim().to_string(),
+            ty: String::new(),
+            variables_reference: 0,
+        })
+    }
+
+    // --- memory / disassembly (task 2.5) ---
+
+    /// Read `size` bytes of the target's virtual memory at `address`. Ports the C++ `ReadMemory`:
+    /// `ReadVirtual`, then truncate to the bytes actually read (a short read at a page boundary
+    /// yields fewer bytes rather than an error). `size` is capped so the `u32` ReadVirtual length
+    /// cannot silently truncate (callers should bound it further; the tool layer clamps small).
+    pub fn read_memory(&mut self, address: u64, size: usize) -> Result<MemoryRead, EngineError> {
+        // ReadVirtual takes a u32 length; clamp so a huge `size` neither wraps the length nor
+        // over-allocates the buffer beyond what the call could ever fill.
+        let size = size.min(u32::MAX as usize);
+        let mut buf = vec![0u8; size];
+        let mut read = 0u32;
+        // SAFETY: live data-spaces interface; `buf` is a valid `size`-byte allocation we pass as a
+        // raw `*mut c_void` with its true length (`size` fits a u32 after the clamp above); the
+        // engine writes at most `size` bytes and reports the count in `read` (a valid &mut u32
+        // out-param). `buf` outlives the call.
+        unsafe {
+            self.data_spaces.ReadVirtual(
+                address,
+                buf.as_mut_ptr() as *mut c_void,
+                size as u32,
+                Some(&mut read),
+            )
+        }
+        .map_err(|e| EngineError::op("ReadVirtual", e))?;
+        buf.truncate(read as usize);
+        Ok(MemoryRead {
+            address: format!("0x{address:016X}"),
+            data: buf,
+        })
+    }
+
+    /// Disassemble `count` instructions starting at `address`. The C++ plugin has no disassemble;
+    /// this drives `IDebugControl::Disassemble`, which renders one instruction into a text buffer
+    /// and returns the offset of the *next* instruction. We loop `count` times, advancing `offset`
+    /// to the returned end offset each time, and parse the rendered line for the mnemonic text
+    /// (the bytes/symbol fields are best-effort and left empty — the text line carries the
+    /// mnemonic). Disassembly stops early (no error) once a step fails or fails to advance.
+    pub fn disassemble(
+        &mut self,
+        address: u64,
+        count: i64,
+    ) -> Result<Vec<Instruction>, EngineError> {
+        let n = count.max(0) as usize;
+        let mut result = Vec::with_capacity(n);
+        let mut offset = address;
+        for _ in 0..n {
+            let mut buf = [0u8; 512];
+            let mut disasm_size = 0u32;
+            let mut end_offset = 0u64;
+            // SAFETY: live control interface; `buf` is a valid 512-byte &mut buffer the engine
+            // fills with the NUL-terminated disassembly text; `disasm_size`/`end_offset` are valid
+            // out-params. Flags 0 = no effective-address annotation. Errors stop the loop.
+            let ok = unsafe {
+                self.control.Disassemble(
+                    offset,
+                    0,
+                    Some(&mut buf),
+                    Some(&mut disasm_size),
+                    &mut end_offset,
+                )
+            }
+            .is_ok();
+            if !ok {
+                break;
+            }
+
+            let text = cstr_from_buf(&buf);
+            result.push(Instruction {
+                address: format!("0x{offset:016X}"),
+                instruction: parse_disasm_text(&text),
+                bytes: String::new(),
+                symbol: String::new(),
+                source_path: None,
+                line: 0,
+            });
+
+            // Guard against a non-advancing step (would otherwise spin emitting the same address).
+            if end_offset <= offset {
+                break;
+            }
+            offset = end_offset;
+        }
+        Ok(result)
+    }
+
+    // --- modules / source location (task 2.5) ---
+
+    /// Enumerate the loaded modules. Ports the C++ `GetModules`: `GetNumberModules` +
+    /// per-index `GetModuleByIndex` (base) + `GetModuleNameString` (name) + `GetModuleParameters`
+    /// (size, `SymbolType`). `base` is `0x{:016X}`, `size` a decimal string, and `symbol_status`
+    /// the neutral token mapped from `SymbolType` (PDB→`pdb`, EXPORT→`export`, DEFERRED→`deferred`,
+    /// else `none`).
+    pub fn modules(&mut self) -> Result<Vec<ModuleInfo>, EngineError> {
+        let mut loaded = 0u32;
+        let mut unloaded = 0u32;
+        // SAFETY: live symbols interface; both out-params are valid &mut u32 locals.
+        unsafe { self.symbols.GetNumberModules(&mut loaded, &mut unloaded) }
+            .map_err(|e| EngineError::op("GetNumberModules", e))?;
+
+        let mut result = Vec::with_capacity(loaded as usize);
+        for i in 0..loaded {
+            // SAFETY: live symbols interface; `i < loaded` is a valid module index. Returns the
+            // module base (u64) by value.
+            let Ok(base) = (unsafe { self.symbols.GetModuleByIndex(i) }) else {
+                continue;
+            };
+            let name = self.module_name(i).unwrap_or_default();
+
+            let mut params = DEBUG_MODULE_PARAMETERS::default();
+            // SAFETY: live symbols interface; `bases` points to the single `base` (count 1), and
+            // `params` is a valid &mut `DEBUG_MODULE_PARAMETERS` the engine fills. `start` = 0.
+            let (size, symbol_status) = if unsafe {
+                self.symbols
+                    .GetModuleParameters(1, Some(&base as *const u64), 0, &mut params)
+            }
+            .is_ok()
+            {
+                (params.Size as u64, symbol_status(params.SymbolType))
+            } else {
+                (0, "none".to_string())
+            };
+
+            result.push(ModuleInfo {
+                name,
+                base: format!("0x{base:016X}"),
+                size: size.to_string(),
+                symbol_status,
+            });
+        }
+        Ok(result)
+    }
+
+    /// The current instruction's source location, if one maps. Ports the C++
+    /// `GetCurrentSourceLocation`: `GetInstructionOffset` (the IP) → `GetLineByOffset` →
+    /// `Some((file, line))`, or `None` when no source line is available. Phase 4's `open_dump`
+    /// calls this for `crash_location`.
+    pub fn current_source_location(&mut self) -> Result<Option<(String, i64)>, EngineError> {
+        // SAFETY: live registers interface; returns the instruction pointer (u64) by value.
+        let ip = unsafe { self.registers.GetInstructionOffset() }
+            .map_err(|e| EngineError::op("GetInstructionOffset", e))?;
+        let (file, line) = self.line_at(ip);
+        Ok(file.map(|f| (f, line)))
+    }
+
+    // --- inspection helpers (task 2.5) ---
+
+    /// The module name at index `i` via `GetModuleNameString(DEBUG_MODNAME_MODULE)`, or `None`.
+    fn module_name(&self, i: u32) -> Option<String> {
+        let mut buf = [0u8; 256];
+        // SAFETY: live symbols interface; `buf` is a valid &mut buffer the engine fills with a
+        // NUL-terminated ANSI module name; `base` 0 means "use the index"; size out-param omitted.
+        if unsafe {
+            self.symbols
+                .GetModuleNameString(DEBUG_MODNAME_MODULE, i, 0, Some(&mut buf), None)
+        }
+        .is_ok()
+        {
+            Some(cstr_from_buf(&buf))
+        } else {
+            None
+        }
+    }
+
+    /// Symbolicate an offset via `GetNameByOffset`, appending a `+0x…` displacement when the offset
+    /// is not exactly at a symbol. Returns `None` when no symbol resolves (the caller falls back to
+    /// the raw hex address). Ports the C++ `GetNameByOffset` + displacement formatting.
+    fn symbolicate(&self, offset: u64) -> Option<String> {
+        let mut buf = [0u8; 512];
+        let mut displacement = 0u64;
+        // SAFETY: live symbols interface; `buf` is a valid &mut buffer the engine fills with the
+        // NUL-terminated symbol name; `displacement` is a valid &mut u64 out-param; size omitted.
+        if unsafe {
+            self.symbols
+                .GetNameByOffset(offset, Some(&mut buf), None, Some(&mut displacement))
+        }
+        .is_ok()
+        {
+            let mut name = cstr_from_buf(&buf);
+            if name.is_empty() {
+                return None;
+            }
+            if displacement > 0 {
+                name.push_str(&format!("+0x{displacement:X}"));
+            }
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// The source `(file, line)` for an offset via `GetLineByOffset`: `(Some(file), line)` when a
+    /// line maps, else `(None, 0)`. Shared by `stack_trace` and `current_source_location`.
+    fn line_at(&self, offset: u64) -> (Option<String>, i64) {
+        let mut buf = [0u8; 260]; // MAX_PATH
+        let mut line = 0u32;
+        // SAFETY: live symbols interface; `line` is a valid &mut u32 out-param; `buf` is a valid
+        // &mut file-path buffer the engine fills with a NUL-terminated path; size/displacement
+        // out-params omitted.
+        if unsafe {
+            self.symbols
+                .GetLineByOffset(offset, Some(&mut line), Some(&mut buf), None, None)
+        }
+        .is_ok()
+        {
+            let file = cstr_from_buf(&buf);
+            if file.is_empty() {
+                (None, 0)
+            } else {
+                (Some(file), line as i64)
+            }
+        } else {
+            (None, 0)
+        }
     }
 
     // --- lifecycle (task 2.3) ---
@@ -327,6 +973,11 @@ impl Engine {
     /// `RemoveEngineOptions(INITIAL_BREAK)` (mandatory — leaving it set re-breaks every `go`) →
     /// force-load the exe's symbols (`Reload "/f <module>"`). Returns the initial-break stop.
     pub fn launch(&mut self, req: &LaunchReq) -> Result<StopOutcome, EngineError> {
+        // A new session's breakpoint ids start fresh, so any conditions from a prior session
+        // (which `detach` clears, but a target that exited on its own does not) must not linger and
+        // collide with a reused id.
+        self.breakpoint_conditions.clear();
+
         // SAFETY: `self.control` is the live control interface; `AddEngineOptions` takes a u32 flag.
         unsafe { self.control.AddEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK) }
             .map_err(|e| EngineError::op("AddEngineOptions(INITIAL_BREAK)", e))?;
@@ -402,6 +1053,9 @@ impl Engine {
     /// `AttachToProcess`: best-effort `SeDebugPrivilege` → `AddEngineOptions(INITIAL_BREAK)` →
     /// `AttachProcess(DEBUG_ATTACH_DEFAULT)` → wait → `RemoveEngineOptions`.
     pub fn attach_pid(&mut self, pid: u32) -> Result<StopOutcome, EngineError> {
+        // Fresh session — drop any stale breakpoint conditions (see `launch`).
+        self.breakpoint_conditions.clear();
+
         // Needed only to attach to processes owned by another user / elevated; best-effort
         // (attaching to our own child does not require it), so its failure is not fatal.
         let _ = enable_debug_privilege();
@@ -446,6 +1100,7 @@ impl Engine {
         // SAFETY: live client; `flags` is a documented DEBUG_END_* constant.
         unsafe { self.client.EndSession(flags) }.map_err(|e| EngineError::op("EndSession", e))?;
         self.is_dump = false;
+        self.breakpoint_conditions.clear();
         Ok(())
     }
 
@@ -778,24 +1433,6 @@ impl Engine {
         // SAFETY: live symbols interface; `reload` is NUL-terminated and outlives the call.
         let _ = unsafe { self.symbols.Reload(PCSTR(reload.as_ptr().cast())) };
     }
-
-    // --- raw interface accessors for the not-yet-wired surface (task 2.5) ---
-    //
-    // `data_spaces`/`registers` are not yet touched by any method, so they are exposed as `pub`
-    // borrowing accessors purely to keep the fields from tripping `dead_code` under `-D warnings`
-    // (`pub` fns are exempt). Task 2.5 (memory/register reads) consumes the fields directly, at
-    // which point these accessors are removed. The other four interfaces are already used
-    // directly by the methods above, so they need no accessor.
-
-    /// `IDebugDataSpaces4` (memory reads — task 2.5).
-    pub fn data_spaces(&self) -> &IDebugDataSpaces4 {
-        &self.data_spaces
-    }
-
-    /// `IDebugRegisters2` (register reads — task 2.5).
-    pub fn registers(&self) -> &IDebugRegisters2 {
-        &self.registers
-    }
 }
 
 /// Enable `SeDebugPrivilege` on the current process token (best-effort; ports the C++
@@ -830,6 +1467,91 @@ fn enable_debug_privilege() -> bool {
         let ok = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None).is_ok();
         let _ = CloseHandle(token);
         ok
+    }
+}
+
+/// A lifetime guard for an [`IDebugBreakpoint`] obtained from `AddBreakpoint`/`GetBreakpointBy*`.
+///
+/// DbgEng's breakpoint objects are **owned by the engine**: their lifetime runs from
+/// `AddBreakpoint` to `RemoveBreakpoint`, and DbgEng documents that clients must not call their
+/// `IUnknown` methods (`AddRef`/`Release`/`QueryInterface`). The `windows`-crate `IDebugBreakpoint`
+/// smart pointer would, on `Drop`, call `Release` — which on a DbgEng breakpoint is an access
+/// violation (it is not a normally ref-counted object). Wrapping the pointer in `ManuallyDrop`
+/// suppresses that `Drop`, so `Release` is never invoked. The wrapped pointer is only ever used to
+/// call the breakpoint's *own* methods (`SetOffset`/`AddFlags`/`GetId`/`GetOffset`) and as the
+/// argument to `IDebugControl::RemoveBreakpoint`; it never escapes a single engine method.
+struct Bp(ManuallyDrop<IDebugBreakpoint>);
+
+impl Bp {
+    /// Wrap an engine-owned breakpoint so its `Release` never runs.
+    fn new(bp: IDebugBreakpoint) -> Bp {
+        Bp(ManuallyDrop::new(bp))
+    }
+
+    /// Borrow the underlying interface to call the breakpoint's own (non-`IUnknown`) methods.
+    ///
+    /// The returned reference is only valid while the breakpoint is registered: after the borrow
+    /// is passed to `IDebugControl::RemoveBreakpoint` the underlying pointer is dangling, so the
+    /// reference must not be used again (the `remove_breakpoint` call site uses it exactly once and
+    /// drops the `Bp` immediately).
+    fn get(&self) -> &IDebugBreakpoint {
+        &self.0
+    }
+}
+
+/// Decode a NUL-terminated ANSI buffer (as filled by the DbgEng `*String`/`*Text` calls) into an
+/// owned `String`, stopping at the first NUL and lossily decoding any non-UTF-8 bytes. A buffer
+/// with no NUL is decoded in full.
+fn cstr_from_buf(buf: &[u8]) -> String {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Map a `DEBUG_MODULE_PARAMETERS::SymbolType` to the neutral `ModuleInfo::symbol_status` token
+/// (the lowercase set documented on `debugger_core::ModuleInfo`). The full-symbol formats
+/// (PDB/CODEVIEW/COFF/SYM/DIA) all collapse to `pdb` ("real symbols loaded — names resolve"),
+/// EXPORT→`export` (export-table only), DEFERRED→`deferred` (not loaded yet), and `DEBUG_SYMTYPE_NONE`
+/// (or any unknown value)→`none`. Collapsing the loaded formats to `pdb` keeps the token within the
+/// documented vocabulary while still telling the agent "symbols are available".
+fn symbol_status(symbol_type: u32) -> String {
+    let token = if symbol_type == DEBUG_SYMTYPE_PDB
+        || symbol_type == DEBUG_SYMTYPE_CODEVIEW
+        || symbol_type == DEBUG_SYMTYPE_COFF
+        || symbol_type == DEBUG_SYMTYPE_SYM
+        || symbol_type == DEBUG_SYMTYPE_DIA
+    {
+        "pdb"
+    } else if symbol_type == DEBUG_SYMTYPE_EXPORT {
+        "export"
+    } else if symbol_type == DEBUG_SYMTYPE_DEFERRED {
+        "deferred"
+    } else {
+        "none"
+    };
+    token.to_string()
+}
+
+/// Extract the mnemonic+operands from one `IDebugControl::Disassemble` text line. The engine
+/// renders a single line shaped `00007ff6`b1657280 894c2408        mov     dword ptr [rsp+8],ecx`
+/// — a backtick-formatted address, a single space, the raw instruction bytes (one hex run, no
+/// internal spaces), whitespace, then the instruction. The byte run can be long enough that only a
+/// *single* space separates it from the mnemonic (e.g. `c744240400000000 mov …`), so a
+/// double-space split is unreliable; instead we drop the first two whitespace-delimited tokens
+/// (address, bytes) and keep the remainder as the instruction. Falls back to the whole trimmed
+/// line if the expected two leading columns are absent (never returns empty-handed when the line
+/// has content).
+fn parse_disasm_text(line: &str) -> String {
+    let trimmed = line.trim_end_matches(['\r', '\n']).trim();
+    // Tokenize on whitespace: [0] = address, [1] = raw bytes, [2..] = instruction.
+    let mut it = trimmed.split_whitespace();
+    let _addr = it.next();
+    let _bytes = it.next();
+    let rest: Vec<&str> = it.collect();
+    if rest.is_empty() {
+        // Unexpected shape (fewer than three columns): return the whole trimmed line.
+        trimmed.to_string()
+    } else {
+        rest.join(" ")
     }
 }
 

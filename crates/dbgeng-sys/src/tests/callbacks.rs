@@ -12,8 +12,6 @@
 use crate::callbacks::exception_breaks;
 use crate::{Engine, OutputKind};
 
-use windows::core::s;
-
 #[test]
 fn exception_breaks_truth_table() {
     // First-chance access violation passes through (does NOT break).
@@ -72,16 +70,12 @@ fn output_callbacks_capture_command_output() {
 
     // `version` is a no-target DbgEng meta-command that prints the engine version banner — it
     // needs no debuggee, so it exercises the OutputCallbacks wiring without launch (task 2.3).
-    engine
-        .execute_raw(s!("version"))
-        .expect("execute `version`");
-
-    let captured = engine.take_output();
+    let captured = engine.execute("version").expect("execute `version`");
     assert!(
         !captured.is_empty(),
         "the `version` command should have produced captured output via OutputCallbacks"
     );
-    // take_output drains, so a second drain is empty.
+    // execute drains as it returns, so a fresh drain is empty.
     assert!(
         engine.take_output().is_empty(),
         "take_output should drain the buffer"
@@ -101,14 +95,12 @@ fn output_callbacks_capture_command_output() {
     }));
 
     let marker = "dbgeng-sys-probe-22";
-    engine
-        .execute_raw(s!(".echo dbgeng-sys-probe-22"))
+    let echoed = engine
+        .execute(".echo dbgeng-sys-probe-22")
         .expect("execute `.echo`");
-
-    let echoed = engine.take_output();
     assert!(
         echoed.contains(marker),
-        "the captured buffer should contain the echoed marker, got: {echoed:?}"
+        "the captured output should contain the echoed marker, got: {echoed:?}"
     );
     let sink_seen = sink_lines.lock().unwrap_or_else(|p| p.into_inner()).clone();
     assert!(
