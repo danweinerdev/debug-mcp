@@ -13,3 +13,6 @@ rust-version.workspace = true
 debugger-core.workspace = true
 thiserror.workspace = true
 windows.workspace = true
+# Needed only so the `#[windows::core::implement]` macro's `::windows_core::…` expansions
+# resolve (the callback COM objects in `callbacks.rs`). Kept Windows-only with the rest.
+windows-core.workspace = true

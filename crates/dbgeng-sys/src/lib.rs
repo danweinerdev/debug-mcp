@@ -25,11 +25,13 @@
 //! neutral `debugger_core::BackendError` happens upstream in `windbg-backend` (Phase 3).
 #![cfg(windows)]
 
+mod callbacks;
 mod engine;
 mod error;
 
 #[cfg(test)]
 mod tests;
 
+pub use callbacks::{exception_breaks, OutputKind, OutputSink};
 pub use engine::Engine;
 pub use error::EngineError;

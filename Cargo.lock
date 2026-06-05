@@ -138,6 +138,7 @@ dependencies = [
  "debugger-core",
  "thiserror",
  "windows",
+ "windows-core 0.59.0",
 ]
 
 [[package]]

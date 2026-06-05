@@ -29,6 +29,9 @@ windows = { version = "0.59", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_Debug_Extensions",
 ] }
+# The `#[windows::core::implement]` macro expands to `::windows_core::…` paths, so the crate
+# implementing a COM interface must have `windows-core` in scope as a named dependency.
+windows-core = "0.59"
 
 # Internal crates.
 debugger-core = { path = "crates/debugger-core" }

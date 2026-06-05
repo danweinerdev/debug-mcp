@@ -14,13 +14,22 @@
 //! has to `Release()` all six by hand) does not apply here: dropping an `Engine` releases all
 //! six interfaces in field order with no hand-written cleanup.
 
+use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+use windows::core::PCSTR;
 use windows::core::{s, Interface};
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    DebugCreate, IDebugClient5, IDebugControl4, IDebugDataSpaces4, IDebugRegisters2,
-    IDebugSymbols3, IDebugSystemObjects4,
+    DebugCreate, IDebugClient5, IDebugControl4, IDebugDataSpaces4, IDebugEventCallbacks,
+    IDebugOutputCallbacks, IDebugRegisters2, IDebugSymbols3, IDebugSystemObjects4,
+};
+#[cfg(test)]
+use windows::Win32::System::Diagnostics::Debug::Extensions::{
+    DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_THIS_CLIENT,
 };
 use windows::Win32::System::Diagnostics::Debug::SYMOPT_NO_IMAGE_SEARCH;
 
+use crate::callbacks::{self, CallbackState, OutputSink};
 use crate::error::EngineError;
 
 /// An owned DbgEng engine: the six COM interfaces queried off a single `IDebugClient5`.
@@ -41,6 +50,19 @@ pub struct Engine {
     registers: IDebugRegisters2,
     /// Process/thread/system enumeration and context switching.
     system_objects: IDebugSystemObjects4,
+    /// The shared state the registered callbacks (below) write and this `Engine` reads:
+    /// captured output, the output sink, and the last-stop info. `Arc<Mutex<…>>` because DbgEng
+    /// invokes the callbacks from its own internal threads (see `callbacks` module docs).
+    callback_state: Arc<Mutex<CallbackState>>,
+    /// The registered output/event callback interfaces, retained for the engine's lifetime.
+    ///
+    /// `SetOutputCallbacks`/`SetEventCallbacks` `AddRef` these, so DbgEng holds its own reference
+    /// while they are registered; we keep ours too so the objects (and the shared `Arc` they
+    /// carry) cannot be released out from under an in-flight callback, and so a future teardown
+    /// can re-clear them. They are `Drop`-released with the rest of the interfaces in field
+    /// order — no manual `Release` (unlike the C++ destructor's hand-written cleanup).
+    _output_callbacks: IDebugOutputCallbacks,
+    _event_callbacks: IDebugEventCallbacks,
 }
 
 impl Engine {
@@ -103,8 +125,27 @@ impl Engine {
         unsafe { symbols.SetSymbolOptions(opts | SYMOPT_NO_IMAGE_SEARCH) }
             .map_err(|e| EngineError::op("SetSymbolOptions", e))?;
 
-        // task 2.2: register callbacks (SetEventCallbacks/SetOutputCallbacks) — the callback
-        // types do not exist yet.
+        // Build and register the output + event callbacks (port of the C++ constructor's
+        // `SetEventCallbacks`/`SetOutputCallbacks`). `build` creates the shared `CallbackState`
+        // and both COM objects over it; we register the interfaces and retain everything.
+        //
+        // Ownership/refcount: `SetOutputCallbacks`/`SetEventCallbacks` `AddRef` the interface
+        // they receive, so DbgEng holds its own reference for as long as they are registered.
+        // We pass `&output_cb`/`&event_cb` (a borrowing `Param`) and store the owned interfaces
+        // in `Engine` below, so our reference outlives the registration and the shared `Arc`
+        // cannot be released while a callback is in flight. (The C++ had to balance this by hand
+        // in its destructor; here `Drop` releases both interfaces automatically.)
+        let (callback_state, output_cb, event_cb) = callbacks::build();
+        // SAFETY: `client` is the live `IDebugClient5` from `DebugCreate`. The setters take a
+        // borrowed COM interface (`&output_cb`/`&event_cb`) and `AddRef` it; both objects are
+        // moved into the returned `Engine` immediately below, so they outlive the call and the
+        // registration. No raw pointers escape; the registration is on the engine-owning thread.
+        unsafe { client.SetOutputCallbacks(&output_cb) }
+            .map_err(|e| EngineError::op("SetOutputCallbacks", e))?;
+        // SAFETY: same invariants as `SetOutputCallbacks` above; `event_cb` is a live
+        // `IDebugEventCallbacks` retained in `Engine` for the engine's lifetime.
+        unsafe { client.SetEventCallbacks(&event_cb) }
+            .map_err(|e| EngineError::op("SetEventCallbacks", e))?;
 
         Ok(Engine {
             client,
@@ -113,6 +154,9 @@ impl Engine {
             data_spaces,
             registers,
             system_objects,
+            callback_state,
+            _output_callbacks: output_cb,
+            _event_callbacks: event_cb,
         })
     }
 
@@ -126,6 +170,79 @@ impl Engine {
         // reads a `u32` out-param (returned by value); no pointers cross the FFI boundary.
         unsafe { self.control.GetExecutionStatus() }
             .map_err(|e| EngineError::op("GetExecutionStatus", e))
+    }
+
+    /// Helper: lock the shared callback state, recovering from a poisoned mutex (a callback
+    /// panicked while holding it) rather than re-panicking on the engine thread.
+    fn callback_state(&self) -> std::sync::MutexGuard<'_, CallbackState> {
+        self.callback_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Install (or replace) the output sink: a closure invoked for every output line DbgEng
+    /// emits, with the line's `OutputKind` and text, *in addition to* the captured buffer.
+    /// The closure runs on whatever thread DbgEng dispatches output from, so it must be `Send`.
+    /// Phase 3 wires this onto a `BackendEvent` channel; here it backs the live output-capture
+    /// test.
+    pub fn set_output_sink(&mut self, sink: OutputSink) {
+        self.callback_state().set_sink(sink);
+    }
+
+    /// Drain and return the captured output accumulated since the last drain (the `GetAndClear`
+    /// analog). Leaves the buffer empty.
+    pub fn take_output(&mut self) -> String {
+        self.callback_state().take_output()
+    }
+
+    /// The human-readable reason for the most recent stop (empty until the debuggee first
+    /// stops). Mirrors the C++ `GetLastStopReason`.
+    pub fn last_stop_reason(&self) -> String {
+        self.callback_state().last_stop_reason()
+    }
+
+    /// The id of the most recently hit breakpoint, if any (set by the `Breakpoint` event).
+    pub fn last_breakpoint_id(&self) -> Option<u32> {
+        self.callback_state().last_breakpoint_id()
+    }
+
+    /// The offset (address) of the most recently hit breakpoint, if any.
+    pub fn last_breakpoint_offset(&self) -> Option<u64> {
+        self.callback_state().last_breakpoint_offset()
+    }
+
+    /// The code of the most recently recorded exception, if any (set by the `Exception` event).
+    pub fn last_exception_code(&self) -> Option<u32> {
+        self.callback_state().last_exception_code()
+    }
+
+    /// The faulting address of the most recently recorded exception, if any.
+    pub fn last_exception_address(&self) -> Option<u64> {
+        self.callback_state().last_exception_address()
+    }
+
+    /// The debuggee's exit code, once it has exited (set by the `ExitProcess` event).
+    pub fn last_exit_code(&self) -> Option<u32> {
+        self.callback_state().last_exit_code()
+    }
+
+    /// Run a raw DbgEng command line through `IDebugControl::Execute`, routed to *this client*
+    /// so its output flows through our registered [`callbacks::OutputCallbacks`]. This is the
+    /// minimal command path the task-2.2 output-capture test needs (no-target commands such as
+    /// `version`/`.echo`); the full neutral `execute()` surface lands in task 2.5, which will
+    /// supersede this. `#[cfg(test)]` + `pub(crate)`: it exists only to drive the 2.2 test and
+    /// never forms part of the crate's public (or even non-test) surface.
+    #[cfg(test)]
+    pub(crate) fn execute_raw(&mut self, command: PCSTR) -> Result<(), EngineError> {
+        // SAFETY: `self.control` is the live `IDebugControl4` from `create`. `command` is a
+        // NUL-terminated ANSI `PCSTR` owned by the caller for the duration of the call (the
+        // engine copies it). `DEBUG_OUTCTL_THIS_CLIENT` routes output to this client's output
+        // callbacks; no pointers are retained past the call.
+        unsafe {
+            self.control
+                .Execute(DEBUG_OUTCTL_THIS_CLIENT, command, DEBUG_EXECUTE_DEFAULT)
+        }
+        .map_err(|e| EngineError::op("Execute", e))
     }
 
     // The remaining five interfaces back the operations added in tasks 2.2–2.5. They are
@@ -164,5 +281,26 @@ impl Engine {
     /// `IDebugSystemObjects4` (process/thread enumeration — task 2.4).
     pub fn system_objects(&self) -> &IDebugSystemObjects4 {
         &self.system_objects
+    }
+}
+
+impl Drop for Engine {
+    /// Explicitly unregister the event/output callbacks before the interfaces are released, so
+    /// DbgEng stops dispatching into our callback objects the moment the engine is torn down.
+    /// This mirrors the C++ destructor (`engine.cpp`: `SetEventCallbacks(nullptr)` +
+    /// `SetOutputCallbacks(nullptr)` before `Release`). Field drops alone do NOT guarantee this:
+    /// the six interfaces and DbgEng's own AddRef keep the underlying object alive, so without an
+    /// explicit unregister DbgEng could still invoke a released callback — a real race once task
+    /// 2.4 runs a `WaitForEvent` loop and a teardown can overlap an in-flight event.
+    fn drop(&mut self) {
+        // SAFETY: `self.client` is the live `IDebugClient5`. Passing `None` is the documented
+        // way to clear a callback registration (the `nullptr` the C++ passes). Errors are
+        // ignored — there is nothing to do in `drop` if the engine is already tearing down — and
+        // we never panic out of `drop` (no `unwrap`). After this returns, the field drops
+        // `Release` every interface (incl. the callback objects) in declaration order.
+        unsafe {
+            let _ = self.client.SetEventCallbacks(None);
+            let _ = self.client.SetOutputCallbacks(None);
+        }
     }
 }
