@@ -20,12 +20,12 @@ tasks:
     depends_on: ["2.1"]
   - id: "2.3"
     title: "Lifecycle: launch / attach_pid / detach + symbol path + engine-cmd surface completeness"
-    status: in-progress
+    status: complete
     verification: "`launch()` runs INITIAL_BREAK → `CreateProcess2` → `WaitForEvent` → `RemoveEngineOptions` → `Reload(\"/f <module>\")` and returns the initial-break `StopOutcome`; a subsequent `go()` does **not** immediately re-break (proving the option was removed); `attach_pid()` stops a separately-spawned process; `detach()` uses `EndSession(DEBUG_END_ACTIVE_DETACH)` and a rebuild-after-detach test confirms **no module file lock** is left; the symbol path is `srv*` cache-only with `SYMOPT_NO_IMAGE_SEARCH` (R5); **`Engine::open_dump` and `Engine::attach_kernel` are stubbed here** (placeholder error / `todo!`) so the `Engine` surface and the Phase-3 `EngineCmd` enum are a *complete, closed* set before Phase 3 consumes them — Phase 4 fills the bodies without reopening the enum; a dump-session `go`/`step` guard returns the frozen Phase-1 literal `\"cannot continue a crash-dump session\"`."
     depends_on: ["2.2"]
   - id: "2.4"
     title: "Execution: go (poll loop + interrupt flag + reset) / step / InterruptHandle"
-    status: pending
+    status: in-progress
     verification: "`go(&interrupt)` resets the flag at entry, polls `WaitForEvent(0,200ms)`, and returns `Stopped` at a breakpoint or `Exited`/'still running' on the `S_FALSE` deadline (R3: no clean context on timeout, documented); `step()` over/into land on the next line and out uses `gu`; `InterruptHandle::interrupt()` breaks a blocked `go()` within ~200 ms; a second `go()` immediately after does **not** spuriously interrupt (flag-reset test); **R4** is resolved — either the cross-thread `SetInterrupt` guarantee is cited in the `// SAFETY:` block or the flag-only fallback is taken (documented), with the `Send` `InterruptHandle` newtype + `Arc` keep-alive."
     depends_on: ["2.3"]
   - id: "2.5"
@@ -91,12 +91,12 @@ pure function.
 ## 2.3: Lifecycle
 
 ### Subtasks
-- [ ] `launch(&LaunchReq)`: `AddEngineOptions(INITIAL_BREAK)` → `CreateProcess2(DEBUG_ONLY_THIS_PROCESS|CREATE_NO_WINDOW)` → `WaitForEvent` → `RemoveEngineOptions(INITIAL_BREAK)` → `Reload("/f <module>")`.
-- [ ] `attach_pid(pid)`: `EnableDebugPrivilege` (caller) + `AttachProcess(DEBUG_ATTACH_DEFAULT)` + `WaitForEvent` + `RemoveEngineOptions`.
-- [ ] `detach(is_dump)`: `EndSession(DEBUG_END_ACTIVE_DETACH)` (live) / `EndSession(DEBUG_END_PASSIVE)` (dump); reset session state.
-- [ ] Symbol path: `srv*` cache-only + `SYMOPT_NO_IMAGE_SEARCH` (R5).
-- [ ] **Stub** `Engine::open_dump`/`Engine::attach_kernel` (placeholder error) so the `Engine` API + the Phase-3 `EngineCmd` enum are complete now; Phase 4 fills the bodies.
-- [ ] Guard dump-session `go`/`step` with the frozen literal `"cannot continue a crash-dump session"` (Phase-1 contract).
+- [x] `launch(&LaunchReq)`: `AddEngineOptions(INITIAL_BREAK)` → `CreateProcess2(DEBUG_ONLY_THIS_PROCESS|CREATE_NO_WINDOW)` → `wait_for_event` → `RemoveEngineOptions(INITIAL_BREAK)` → `Reload("/f <module>")`. (Program is quoted for space-safe paths; the raw-vtable `wait_for_event` recovers S_OK vs S_FALSE.)
+- [x] `attach_pid(pid)`: best-effort `enable_debug_privilege` + `AttachProcess(DEBUG_ATTACH_DEFAULT)` + `wait_for_event` + `RemoveEngineOptions`.
+- [x] `detach()`: reads the engine's own `is_dump` → `EndSession(DEBUG_END_ACTIVE_DETACH)` (live) / `DEBUG_END_PASSIVE` (dump).
+- [x] Symbol path: `srv*` cache-only + `SYMOPT_NO_IMAGE_SEARCH` (R5) — set in `create()` (2.1).
+- [x] **Stub** `Engine::open_dump`/`Engine::attach_kernel` (Phase-4 error) so the `Engine` API + the Phase-3 `EngineCmd` enum are complete now.
+- [x] `ensure_runnable()` carries the frozen literal `"cannot continue a crash-dump session"` (the go/step guard 2.4 calls; `is_dump` set by `open_dump` in Phase 4).
 
 ### Notes
 The INITIAL_BREAK removal is mandatory — leaving it set makes every `go` re-break. The
