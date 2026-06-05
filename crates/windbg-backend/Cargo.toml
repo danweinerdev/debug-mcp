@@ -1,0 +1,16 @@
+[package]
+name = "windbg-backend"
+description = "WinDbg (DbgEng) backend: WinDbgBackend + WinDbgFactory over a dedicated MTA-COM engine thread. Built on dbgeng-sys."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Windows-only: the engine thread drives DbgEng (via dbgeng-sys), which only exists on Windows.
+# Off Windows the lib is `#![cfg(windows)]` and compiles to nothing, like dbgeng-sys.
+[target.'cfg(windows)'.dependencies]
+debugger-core.workspace = true
+dbgeng-sys.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true

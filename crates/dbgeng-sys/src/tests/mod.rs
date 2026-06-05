@@ -2,5 +2,6 @@
 //! `#[cfg(test)]` next to the code). Live-engine coverage lives in `tests/engine.rs`.
 
 mod callbacks;
+mod com;
 mod engine;
 mod error;

@@ -26,6 +26,7 @@ rmcp = { version = "1.7.0", features = ["server", "transport-io"] }
 # Windows COM/FFI — only `dbgeng-sys` (the lone unsafe crate) may use it, and only on Windows.
 windows = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_System_Com",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_Debug_Extensions",
     "Win32_System_Threading",
@@ -39,5 +40,7 @@ windows-core = "0.59"
 debugger-core = { path = "crates/debugger-core" }
 dap-client = { path = "crates/dap-client" }
 lldb-backend = { path = "crates/lldb-backend" }
+windbg-backend = { path = "crates/windbg-backend" }
+dbgeng-sys = { path = "crates/dbgeng-sys" }
 mcp-session = { path = "crates/mcp-session" }
 mcp-tools = { path = "crates/mcp-tools" }

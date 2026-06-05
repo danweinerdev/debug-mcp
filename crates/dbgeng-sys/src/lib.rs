@@ -26,6 +26,7 @@
 #![cfg(windows)]
 
 mod callbacks;
+mod com;
 mod engine;
 mod error;
 
@@ -33,5 +34,6 @@ mod error;
 mod tests;
 
 pub use callbacks::{exception_breaks, OutputKind, OutputSink};
+pub use com::ComApartment;
 pub use engine::{BpLoc, Engine, InterruptHandle, LaunchReq};
 pub use error::EngineError;

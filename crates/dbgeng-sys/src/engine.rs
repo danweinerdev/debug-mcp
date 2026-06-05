@@ -159,6 +159,17 @@ pub struct InterruptHandle {
 }
 
 impl InterruptHandle {
+    /// Build an [`InterruptHandle`] over a caller-supplied flag, **not** tied to any live engine.
+    ///
+    /// Used by `windbg-backend`'s test `FakeEngine` (which has no real engine to mint a handle
+    /// from) so its `interrupt_handle()` can return a usable, inspectable handle sharing the same
+    /// `Arc<AtomicBool>` the fake holds. In production the flag is always the engine's own
+    /// `interrupt_flag` (see [`Engine::interrupt_handle`]); this constructor just lets a test
+    /// observe an `interrupt()` without standing up DbgEng.
+    pub fn from_flag(flag: Arc<AtomicBool>) -> InterruptHandle {
+        InterruptHandle { flag }
+    }
+
     /// Request that the engine's in-flight `go` break in. Sets the shared flag with `Release`
     /// ordering so the engine thread's `Acquire` load in `go`'s poll loop observes it. Safe to
     /// call from any thread and at any time (a request while nothing is running is simply consumed
