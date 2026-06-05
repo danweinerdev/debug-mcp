@@ -25,12 +25,12 @@ tasks:
     depends_on: ["2.2"]
   - id: "2.4"
     title: "Execution: go (poll loop + interrupt flag + reset) / step / InterruptHandle"
-    status: in-progress
+    status: complete
     verification: "`go(&interrupt)` resets the flag at entry, polls `WaitForEvent(0,200ms)`, and returns `Stopped` at a breakpoint or `Exited`/'still running' on the `S_FALSE` deadline (R3: no clean context on timeout, documented); `step()` over/into land on the next line and out uses `gu`; `InterruptHandle::interrupt()` breaks a blocked `go()` within ~200 ms; a second `go()` immediately after does **not** spuriously interrupt (flag-reset test); **R4** is resolved — either the cross-thread `SetInterrupt` guarantee is cited in the `// SAFETY:` block or the flag-only fallback is taken (documented), with the `Send` `InterruptHandle` newtype + `Arc` keep-alive."
     depends_on: ["2.3"]
   - id: "2.5"
     title: "Breakpoints / inspection / memory / commands"
-    status: pending
+    status: in-progress
     verification: "Against the fixture at a known stop: a breakpoint set by function (with the `module!sym` fallback), by `file:line`, and by `0x<addr>` each resolves and is hit; `remove`/`list` reflect ids/offsets/hit-counts; `threads()`/`stack_trace()`/`locals()` (via `SetScope`+`GetScopeSymbolGroup2`)/`evaluate(\"?? expr\")` return correct values; `read_memory()` (`ReadVirtual`) returns the expected bytes and short-reads truncate cleanly; `disassemble()` returns the requested instruction count; `execute(\"r\")` returns register text via the output sink; `modules()` lists the exe with its PDB status; `current_source_location()` maps the IP to file:line."
     depends_on: ["2.4"]
 ---
@@ -107,15 +107,18 @@ so Phase 4 is purely additive in the method bodies.
 ## 2.4: Execution + InterruptHandle
 
 ### Subtasks
-- [ ] `go(&AtomicBool)`: reset the flag at entry (Relaxed store), `SetExecutionStatus(GO)`, 200 ms `WaitForEvent` poll loop checking the flag (Acquire) + the conditional-BP hook (Phase 5 fills the eval); return `Stopped`/`Exited`/'still running' (S_FALSE).
-- [ ] `step(kind)`: `STEP_OVER`/`STEP_INTO`; `gu` (Execute) for `OUT`; `WaitForEvent`.
-- [ ] `interrupt_handle()` → mint a separately-AddRef'd `IDebugControl4` `InterruptHandle` (`NonNull`, `unsafe impl Send`, `// SAFETY:` with the R4 citation/fallback); `InterruptHandle::interrupt()` issues `SetInterrupt(DEBUG_INTERRUPT_ACTIVE)`.
-- [ ] Port the `Break()` recovery shape (re-`SetInterrupt` + `WaitForEvent`) for the S_FALSE-no-context case (consumed by `pause` in Phase 3/5).
+- [x] `go(timeout_ms)`: resets the engine's shared `Arc<AtomicBool>` flag at entry, `SetExecutionStatus(GO)`, 200 ms `wait_for_event` poll loop checking the flag (Acquire); returns `Ok(Some(StopOutcome))` (stopped/exited) or `Ok(None)` (still-running, R3). (Conditional-BP hook is Phase 5.)
+- [x] `step(kind)`: `STEP_OVER`/`STEP_INTO`; `Execute("gu")` for `Out`; `wait_for_event`.
+- [x] `interrupt_handle()` → `InterruptHandle` holding a clone of the engine's `Arc<AtomicBool>` ONLY (no COM pointer). `interrupt()` sets the flag; the engine's own `go` poll loop turns it into a `SetInterrupt`-driven break on the engine thread.
+- [x] `break_in()` + shared `break_loop()` port the C++ `Break()` recovery (SetInterrupt + ≤50×200 ms re-issue); `go`'s interrupt branch reuses it.
 
 ### Notes
-R4 is load-bearing: confirm the MS-docs cross-thread `SetInterrupt` guarantee; if unconfirmable,
-drop `SetInterrupt` and rely solely on the 200 ms flag poll (≤200 ms pause latency, zero
-cross-thread COM). The flag-reset-at-entry closes the spurious-interrupt race.
+**R4 RESOLVED — flag-only.** `InterruptHandle` holds no COM interface, so no DbgEng pointer ever
+crosses a thread boundary (the confinement invariant holds with zero exceptions); it is trivially
+`Send` with no `unsafe`. Cost: ≤200 ms latency for an off-thread `interrupt()` to be observed by
+`go`'s poll. The real `SetInterrupt` is issued by `go`/`break_loop` on the engine thread. The
+flag-reset-at-entry (sole `false`-writer) closes the spurious-interrupt race. `go`'s timeout is a
+budget (may overshoot ~200 ms); `timeout_ms = 0` ≠ infinite.
 
 ## 2.5: Breakpoints / inspection / memory / commands
 
