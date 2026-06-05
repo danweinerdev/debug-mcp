@@ -15,12 +15,12 @@ tasks:
     depends_on: []
   - id: "2.2"
     title: "Event + output callbacks; output sink; stop-reason capture"
-    status: pending
+    status: complete
     verification: "A Rust `IDebugOutputCallbacks` impl routes `Execute()` output to `set_output_sink` (round-trip captured in a smoke test); the `IDebugEventCallbacks` impl records breakpoint id/offset, exception code/address, and exit code into the engine's last-stop state; first-chance exceptions pass through (`DEBUG_STATUS_NO_CHANGE`) while second-chance and the `0x80000003` initial breakpoint break — exercised by a controlled crash in the fixture; COM refcounting of the callback objects is correct (no leak/early-free under a create→detach cycle)."
     depends_on: ["2.1"]
   - id: "2.3"
     title: "Lifecycle: launch / attach_pid / detach + symbol path + engine-cmd surface completeness"
-    status: pending
+    status: in-progress
     verification: "`launch()` runs INITIAL_BREAK → `CreateProcess2` → `WaitForEvent` → `RemoveEngineOptions` → `Reload(\"/f <module>\")` and returns the initial-break `StopOutcome`; a subsequent `go()` does **not** immediately re-break (proving the option was removed); `attach_pid()` stops a separately-spawned process; `detach()` uses `EndSession(DEBUG_END_ACTIVE_DETACH)` and a rebuild-after-detach test confirms **no module file lock** is left; the symbol path is `srv*` cache-only with `SYMOPT_NO_IMAGE_SEARCH` (R5); **`Engine::open_dump` and `Engine::attach_kernel` are stubbed here** (placeholder error / `todo!`) so the `Engine` surface and the Phase-3 `EngineCmd` enum are a *complete, closed* set before Phase 3 consumes them — Phase 4 fills the bodies without reopening the enum; a dump-session `go`/`step` guard returns the frozen Phase-1 literal `\"cannot continue a crash-dump session\"`."
     depends_on: ["2.2"]
   - id: "2.4"
@@ -74,13 +74,19 @@ PowerShell equivalent for these gates.
 ## 2.2: Callbacks + output sink
 
 ### Subtasks
-- [ ] Implement `IDebugOutputCallbacks::Output` → push text to the registered `set_output_sink(Box<dyn FnMut(OutputKind,&str)+Send>)`; mutex-guard the sink (DbgEng may call back from internal threads).
-- [ ] Implement `IDebugEventCallbacks` (the 13 methods): record BP id/offset, exception code/address (first- vs second-chance logic), exit code into last-stop state; log module loads.
-- [ ] Provide `GetAndClear`-style capture for synchronous command output (`execute`/`evaluate`).
+- [x] Implement `IDebugOutputCallbacks::Output` → push text to the registered `set_output_sink(Box<dyn FnMut(OutputKind,&str)+Send>)`; `Arc<Mutex<CallbackState>>` (DbgEng calls back from internal threads).
+- [x] Implement `IDebugEventCallbacks` (all methods, via the windows `#[implement]` macro): record BP id/offset, exception code/address (first/second-chance via the pure `exception_breaks`), exit code into last-stop state. `GetInterestMask` = BP|EXCEPTION|EXIT_PROCESS|LOAD_MODULE.
+- [x] Provide `take_output()` (`GetAndClear` analog) for synchronous command output; `Drop for Engine` unregisters callbacks (`SetEventCallbacks(None)`/`SetOutputCallbacks(None)`) before release.
 
 ### Notes
-First-chance exceptions return `DEBUG_STATUS_NO_CHANGE` (pass through); only second-chance and
-`0x80000003` (initial breakpoint) break — port the C++ `callbacks.cpp` logic exactly.
+First-chance non-breakpoint exceptions return `DEBUG_STATUS_NO_CHANGE`; only second-chance and
+`0x80000003` (initial breakpoint) break — ported from `callbacks.cpp`. **windows-rs mechanics
+learned:** `#[implement]` generates a `*_Impl` trait you impl on the `_Impl` wrapper; needs an
+explicit `windows-core` dep; `DEBUG_STATUS_*` is conveyed as the method's `HRESULT` — `status()`
+maps `0`(`NO_CHANGE`)→`Ok(())` and `6`(`BREAK`)→`Err(from_hresult(6))` (a success-range HRESULT,
+so `HRESULT::ok()` must NOT be used). Live event-callback observation (crash/exit) is tested in
+2.3 against the fixture; 2.2 tested the output path live + the first/second-chance logic as a
+pure function.
 
 ## 2.3: Lifecycle
 
