@@ -7,6 +7,8 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use std::sync::atomic::Ordering;
+
 use dbgeng_sys::{BpLoc, InterruptHandle, LaunchReq, OutputKind, OutputSink};
 use debugger_core::{
     BreakpointResult, DumpOutcome, EvalResult, Frame, Instruction, MemoryRead, ModuleInfo,
@@ -49,6 +51,23 @@ pub struct Recorder {
     /// The `terminate` flag of each `detach(terminate)` call, in order — proves disconnect's
     /// kill-vs-detach choice round-trips.
     pub detaches: Vec<bool>,
+    /// The `timeout_ms` of each `go(timeout_ms)` call, in order — proves `cont` marshals the
+    /// effectively-infinite budget.
+    pub gos: Vec<u32>,
+    /// Set `true` the instant `go` is *entered* on the engine thread, before it produces its reply.
+    /// The cancellation test uses this to confirm the `Go` command actually reached the engine
+    /// (the future was polled past its `cmd_tx.send`) BEFORE the abort — so the test exercises a
+    /// cont cancelled mid-await, not a never-started future.
+    pub go_entered: bool,
+    /// The kind of each `step(kind)` call, in order — proves `step` marshals each `StepKind`.
+    pub steps: Vec<StepKind>,
+    /// The number of `break_in()` calls — proves `cont`'s `None`→break_in fallback ran.
+    pub break_ins: u32,
+    /// The value of the interrupt flag observed AT THE MOMENT each `detach(terminate)` ran, in
+    /// order. `disconnect` trips the interrupt flag *before* marshaling the detach, so a `true`
+    /// here proves the ordering (flag-then-detach) directly, not merely the post-condition — a
+    /// detach that raced ahead of the flag would record `false`.
+    pub interrupt_flag_at_detach: Vec<bool>,
 }
 
 /// A scripted engine. Each field is the canned reply for the matching [`EngineOps`] method; the
@@ -59,9 +78,12 @@ pub struct FakeEngine {
     pub threads: Vec<ThreadInfo>,
     pub modules: Vec<ModuleInfo>,
     pub stop_outcome: StopOutcome,
+    /// When true, `go` returns `Ok(None)` (the still-running / unreachable-deadline case) so a test
+    /// can drive `cont`'s `None`→`break_in` fallback. When false, `go` returns `Some(stop_outcome)`.
+    pub go_returns_none: bool,
     /// The interrupt flag the minted [`InterruptHandle`] shares.
     pub interrupt_flag: Arc<AtomicBool>,
-    /// The shared call recorder (breakpoint flush, detach terminate flag).
+    /// The shared call recorder (breakpoint flush, detach terminate flag, go/step/break_in calls).
     pub recorder: Arc<Mutex<Recorder>>,
 }
 
@@ -76,6 +98,7 @@ impl Default for FakeEngine {
                 description: String::new(),
                 hit_breakpoint_ids: Vec::new(),
             }),
+            go_returns_none: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             recorder: Arc::new(Mutex::new(Recorder::default())),
         }
@@ -118,19 +141,39 @@ impl EngineOps for FakeEngine {
     }
 
     fn detach(&mut self, terminate: bool) -> Result<(), EngineError> {
-        self.recorder().detaches.push(terminate);
+        // Snapshot the interrupt flag AT detach time before recording the detach, so the ordering
+        // test can prove `disconnect` set the flag BEFORE marshaling the detach (a detach that
+        // raced ahead of the flag would record `false`).
+        let flag_now = self.interrupt_flag.load(Ordering::Acquire);
+        let mut rec = self.recorder();
+        rec.interrupt_flag_at_detach.push(flag_now);
+        rec.detaches.push(terminate);
         Ok(())
     }
 
-    fn go(&mut self, _timeout_ms: u32) -> Result<Option<StopOutcome>, EngineError> {
-        Ok(Some(self.stop_outcome.clone()))
+    fn go(&mut self, timeout_ms: u32) -> Result<Option<StopOutcome>, EngineError> {
+        // Reset the interrupt flag at entry, exactly as the real `go` does — so a `cont` whose
+        // future was dropped (cancelled) does not leave a stale `true` that would break the next op.
+        self.interrupt_flag.store(false, Ordering::SeqCst);
+        {
+            let mut rec = self.recorder();
+            rec.go_entered = true;
+            rec.gos.push(timeout_ms);
+        }
+        if self.go_returns_none {
+            Ok(None)
+        } else {
+            Ok(Some(self.stop_outcome.clone()))
+        }
     }
 
-    fn step(&mut self, _kind: StepKind) -> Result<StopOutcome, EngineError> {
+    fn step(&mut self, kind: StepKind) -> Result<StopOutcome, EngineError> {
+        self.recorder().steps.push(kind);
         Ok(self.stop_outcome.clone())
     }
 
     fn break_in(&mut self) -> Result<StopOutcome, EngineError> {
+        self.recorder().break_ins += 1;
         Ok(self.stop_outcome.clone())
     }
 

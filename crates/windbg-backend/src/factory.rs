@@ -99,6 +99,15 @@ impl BackendFactory for WinDbgFactory {
         // Wire the output sink: a closure that ONLY sends (OutputKind, text) to the output mpsc —
         // no await, no direct buffer write (Decision 6). It runs on the engine thread; the
         // unbounded send is non-blocking. Installed fire-and-forget via SetOutputSink (no reply).
+        //
+        // LIMITATION (debuggee stdout): this sink carries only DbgEng's `IDebugOutputCallbacks` —
+        // *engine* output (ModLoad, break notices, symbol diagnostics) — NOT the debuggee's own
+        // stdout/stderr. `dbgeng-sys::Engine::launch` uses `CREATE_NO_WINDOW`, so the child's
+        // `printf` console writes go nowhere observable and never reach this channel. So the
+        // `read_output` MCP tool returns engine output, not program output, under WinDbg — a known
+        // difference from the lldb/DAP backend, which pipes the launched process's stdout through
+        // the event stream. Surfacing real debuggee stdout needs a `dbgeng-sys` launch-path change
+        // (stdout pipe redirection / console handling), tracked for a later phase.
         let sink_tx = out_tx.clone();
         let sink = Box::new(move |kind: OutputKind, text: &str| {
             // The receiver may already be gone (the event stream was dropped); ignore that.

@@ -275,6 +275,17 @@ impl DebuggerBackend for WinDbgBackend {
     }
 
     async fn disconnect(&self, terminate: bool) {
+        // Set the interrupt flag FIRST, then marshal the detach. This matters because handlers are
+        // concurrent: a `disconnect` can land while a free-running `cont`'s `go` is still blocking
+        // the engine thread. `go` only checks the cooperative interrupt flag (not the command
+        // channel), so a `Detach` queued behind it would never run until `go` returned on its own.
+        // Tripping the flag here makes the in-flight `go` break on its next ~200 ms poll slice and
+        // return, so the engine thread loops back to `blocking_recv` and processes the queued
+        // `Detach`. With nothing running, the flag is harmlessly consumed (the next `go` resets it
+        // at entry). This makes the common free-running-cont disconnect clean; it does NOT solve
+        // the uncancellable kernel-wait orphan case (R2 / Phase 5).
+        self.interrupt.interrupt();
+
         // Best-effort detach (never errors, Spec FR-6): marshal Detach carrying `terminate` (kill
         // vs. plain detach, honored by the engine), and discard any error. Dropping the backend
         // afterwards closes the channel and ends the thread (whose own teardown never kills).
@@ -310,23 +321,65 @@ impl DebuggerBackend for WinDbgBackend {
     // --- execution ---
 
     async fn cont(&self, _thread_id: i64) -> Result<StopOutcome, BackendError> {
-        // TODO(3.3): marshal EngineCmd::Go with the continue timeout budget and map the
-        // still-running (Ok(None)) case onto the neutral continue-timed-out path.
-        Err(BackendError::Send(
-            "cont: not yet implemented (phase 3.3)".into(),
-        ))
+        // LIMITATION (debuggee stdout): running the target here does NOT surface the debuggee's own
+        // stdout/stderr (`printf`) through `BackendEvent::Output`. The only output the sink sees is
+        // DbgEng's `IDebugOutputCallbacks` — *engine* output (ModLoad, break notices, symbol
+        // diagnostics), not the child's console writes. `dbgeng-sys` launches the child
+        // `CREATE_NO_WINDOW`, so its console writes go nowhere observable. Consequently the
+        // `read_output` MCP tool returns engine output, not program output, under WinDbg — a known
+        // difference from the lldb/DAP backend, where the launched process's stdout is piped through
+        // the event stream. Surfacing real debuggee stdout needs a `dbgeng-sys` launch-path change
+        // (stdout pipe redirection / console handling), tracked for a later phase.
+        //
+        // WinDbg/lldb `continue` semantics: block until the next stop. We marshal a `Go` with an
+        // effectively-infinite budget (`u32::MAX` ms): the engine's `go` polls (~200 ms) until the
+        // target stops/exits OR the cooperative interrupt flag fires (`pause`/`disconnect` trip it),
+        // so an unbounded budget is the correct "block until stop" — the tool layer owns user
+        // cancellation (its request token), and `pause` is what actually breaks a running target.
+        //
+        // `_thread_id` is intentionally ignored: WinDbg `g` resumes the WHOLE target, not a single
+        // thread (DbgEng has no per-thread continue — unlike DAP's per-thread `continue`). This
+        // matches the C++ windbg plugin, which likewise has no per-thread continue.
+        let outcome = self
+            .call(|reply| EngineCmd::Go {
+                timeout_ms: u32::MAX,
+                reply,
+            })
+            .await?;
+        match outcome {
+            // The normal case: the target hit a stop / exited within the budget.
+            Some(stop) => Ok(stop),
+            // Safety net for the (practically unreachable) ~u32::MAX-ms deadline: `pause` trips the
+            // interrupt flag long before this budget could ever elapse, so the only way to land here
+            // is the deadline expiring with the target still running and no interrupt — essentially
+            // impossible in practice. If it ever does, fall back to `break_in()` to regain a real
+            // stop-with-context (a still-running `go` returns no context) and return that.
+            //
+            // If `break_in` itself times out here (it carries its own ~10 s polling bound), treat
+            // it like `Ok(None)`: the target is still running and needs an external `pause`/restart
+            // to regain control — same recovery guidance as a cancelled cont. (No logic change; this
+            // whole arm is practically unreachable.)
+            None => self.call(|reply| EngineCmd::BreakIn { reply }).await,
+        }
     }
 
     async fn step(
         &self,
-        _kind: StepKind,
+        kind: StepKind,
         _thread_id: i64,
         _gran: Option<Granularity>,
     ) -> Result<StopOutcome, BackendError> {
-        // TODO(3.3): map neutral StepKind → dbgeng_sys::StepKind and marshal EngineCmd::Step.
-        Err(BackendError::Send(
-            "step: not yet implemented (phase 3.3)".into(),
-        ))
+        // Map the neutral StepKind onto the engine step and marshal it. `dbgeng_sys`'s step takes
+        // the same `debugger_core::StepKind` (Over/Into/Out), so this is a direct pass-through — no
+        // separate dbgeng_sys::StepKind to translate.
+        //
+        // `_thread_id` and `_gran` are intentionally ignored, both deliberate WinDbg behavior notes:
+        // - DbgEng steps the CURRENT thread (no per-thread step target; the C++ plugin stepped the
+        //   current thread too), so `_thread_id` does not apply.
+        // - DbgEng step is source/line-oriented (`p`/`t`/`gu`) with no separate
+        //   instruction-granularity knob, so `_gran` (the DAP statement-vs-instruction hint) has no
+        //   WinDbg analog and is dropped.
+        self.call(|reply| EngineCmd::Step { kind, reply }).await
     }
 
     async fn pause(&self) -> Result<(), BackendError> {

@@ -143,18 +143,19 @@ async fn pause_sets_the_interrupt_flag() {
 }
 
 /// A placeholder op (owned by a later task) surfaces the documented not-yet-implemented error,
-/// so the trait compiles all-or-nothing and the seam is honored.
+/// so the trait compiles all-or-nothing and the seam is honored. `cont`/`step` are implemented in
+/// 3.3, so this now targets a phase-3.4 placeholder (`stack_trace`).
 #[tokio::test]
 async fn placeholder_op_reports_not_yet_implemented() {
     let (backend, _term) = backend_over_fake(ok_constructor)
         .await
         .expect("fake backend ready");
     let err = backend
-        .cont(1)
+        .stack_trace(1, 0, 20)
         .await
-        .expect_err("cont is a 3.3 placeholder");
+        .expect_err("stack_trace is a 3.4 placeholder");
     match err {
-        BackendError::Send(msg) => assert!(msg.contains("phase 3.3"), "{msg}"),
+        BackendError::Send(msg) => assert!(msg.contains("phase 3.4"), "{msg}"),
         other => panic!("expected a Send placeholder error, got {other:?}"),
     }
 }
