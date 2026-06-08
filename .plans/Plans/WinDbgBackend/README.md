@@ -18,7 +18,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "windbg-backend Core — engine thread + DebuggerBackend (21 ops)"
-    status: pending
+    status: in-progress
     doc: "03-WinDbg-Backend-Core.md"
     depends_on: [2]
   - id: 4

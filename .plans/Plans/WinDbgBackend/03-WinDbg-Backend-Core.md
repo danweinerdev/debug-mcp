@@ -3,19 +3,19 @@ title: "windbg-backend Core — engine thread + DebuggerBackend (21 ops)"
 type: phase
 plan: WinDbgBackend
 phase: 3
-status: pending
+status: in-progress
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-06-05
 deliverable: "A Windows-only `windbg-backend` crate (#![forbid(unsafe_code)]) that owns a dedicated MTA-COM engine thread, marshals async DebuggerBackend calls to the dbgeng-sys Engine, translates results to neutral types, and registers WinDbgFactory — so the existing 21 neutral tools drive WinDbg end-to-end, with the Normal/Attach/Pause integration groups green."
 tasks:
   - id: "3.1"
     title: "Crate scaffold + EngineOps trait + FakeEngine + dedicated engine thread + EngineCmd marshaling"
-    status: pending
+    status: complete
     verification: "`windbg-backend` is a `cfg(windows)` member with `#![forbid(unsafe_code)]`; test files live in dedicated `tests/`/`src/tests/` folders (not inline `#[cfg(test)]`); the `dbgeng-sys` `Engine` surface is abstracted behind an `EngineOps` trait (object-safe) so a scripted **`FakeEngine`** can stand in for a live engine in unit tests (the `lldb-backend` `tokio::io::duplex` analog); `WinDbgFactory::connect()` spawns one `std::thread` whose **first** action is `CoInitializeEx(MTA)` + `Engine::create()`, signaling readiness via a `oneshot` (init failure → `BackendError::Detect`/`Spawn`); an `EngineCmd` round-trips through the channel and returns its `oneshot` reply (proven against `FakeEngine`); dropping the backend closes the command channel and ends the thread in the normal (non-kernel) path; the no-COM-on-calling-thread invariant is enforced by a `connect()` doc-comment and a unit test that calls `connect()` from a thread that was **not** `CoInitialize`d and asserts it does not fault and returns a ready backend. (Phase-entry task; README phase-level `depends_on: [2]` gates the start.)"
     depends_on: []
   - id: "3.2"
     title: "DebuggerBackend lifecycle: launch / attach / disconnect"
-    status: pending
+    status: in-progress
     verification: "Unit tests against `FakeEngine` cover the `launch` breakpoint-flush ordering, the `wait_for`→`findProcessByName`→pid mapping, and the connect-error wording (no live target); live integration then confirms: `launch(spec)` returns `LaunchOutcome::Stopped` at the initial break with the spec's pending breakpoints flushed and set (verified by an immediate `list`); `attach(pid)` stops a spawned process and `wait_for` resolves a named process; `debugger_pid()` reports the target/engine pid as the handlers expect; `disconnect(terminate)` detaches and ends the event-pump; a connect-failure resets the session to idle."
     depends_on: ["3.1"]
   - id: "3.3"
