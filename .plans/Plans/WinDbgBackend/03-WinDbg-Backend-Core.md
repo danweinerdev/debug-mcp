@@ -15,12 +15,12 @@ tasks:
     depends_on: []
   - id: "3.2"
     title: "DebuggerBackend lifecycle: launch / attach / disconnect"
-    status: in-progress
+    status: complete
     verification: "Unit tests against `FakeEngine` cover the `launch` breakpoint-flush ordering, the `wait_for`→`findProcessByName`→pid mapping, and the connect-error wording (no live target); live integration then confirms: `launch(spec)` returns `LaunchOutcome::Stopped` at the initial break with the spec's pending breakpoints flushed and set (verified by an immediate `list`); `attach(pid)` stops a spawned process and `wait_for` resolves a named process; `debugger_pid()` reports the target/engine pid as the handlers expect; `disconnect(terminate)` detaches and ends the event-pump; a connect-failure resets the session to idle."
     depends_on: ["3.1"]
   - id: "3.3"
     title: "Execution + pause/interrupt + BackendEvent stream"
-    status: pending
+    status: in-progress
     verification: "`cont`/`step` block and return the next `StopOutcome`; `pause` (and a cancelled `cont` via the request token) breaks the target so it does not run forever (agent recovers with `pause`, mirroring lldb) — **and this holds under both R4 resolutions:** if 2.4 took `SetInterrupt`, `pause` sets the flag + calls `InterruptHandle::interrupt()`; if 2.4 took the flag-only fallback, `pause` sets the flag only and `InterruptHandle::interrupt()` is absent/no-op — the ≤200 ms break requirement is met either way (the handler reads the R4 decision recorded by task 2.4); the output-sink closure runs on the engine thread and contains only a `tokio::mpsc` `send()` (no await, no direct `OutputBuffer` write — Decision 6), with the `BackendEvent::Output` stream built from the receiver on the async side; process exit/EOF emits `BackendEvent::Terminated{code}` and the existing (already-tested) event-pump flips state to `terminated`."
     depends_on: ["3.2"]
   - id: "3.4"
