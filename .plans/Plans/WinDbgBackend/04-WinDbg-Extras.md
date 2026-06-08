@@ -3,14 +3,14 @@ title: "WinDbg Extras — dump / kernel / analyze / modules (25 tools)"
 type: phase
 plan: WinDbgBackend
 phase: 4
-status: pending
+status: in-progress
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-06-08
 deliverable: "The four WinDbg-only capabilities wired end-to-end: open_crash_dump, attach_kernel, analyze_crash, get_modules — backed by dbgeng-sys dump/kernel/analyze/modules and the windbg-backend trait methods — with the Crash and Dump integration groups green and 25 tools live on Windows."
 tasks:
   - id: "4.1"
     title: "dbgeng-sys: open_dump / attach_kernel / analyze / modules"
-    status: pending
+    status: done
     verification: "`open_dump(path)` runs `OpenDumpFile` → `WaitForEvent(30s)` and returns a `DumpOutcome` whose `crash_location` comes from `current_source_location()`; `attach_kernel(conn)` validates KDNET and either polls with cancellation (R2 option a) or uses `INFINITE` with the orphan caveat (R2 option b) — the chosen behavior is documented and the bad/unreachable-connection path is covered; `analyze()` runs `!analyze -v` (extensions discovered at runtime per R8) and returns its text; `modules()` lists modules and a unit test asserts the `ModuleInfo` **format contract** (base = `\"0x{:016X}\"`, size = decimal string, symbol_status ∈ {pdb,export,deferred,none}) against a fixed value; dump sessions reject `go`/`step` with the frozen `\"cannot continue a crash-dump session\"` literal. (Phase-entry task; README phase-level `depends_on: [3]` gates the start.)"
     depends_on: []
   - id: "4.2"

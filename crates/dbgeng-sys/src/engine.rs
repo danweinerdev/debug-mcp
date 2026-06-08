@@ -34,10 +34,11 @@ use windows::Win32::Security::{
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DebugCreate, IDebugBreakpoint, IDebugClient5, IDebugControl, IDebugControl4, IDebugDataSpaces4,
     IDebugEventCallbacks, IDebugOutputCallbacks, IDebugRegisters2, IDebugSymbols3,
-    IDebugSystemObjects4, DEBUG_ANY_ID, DEBUG_ATTACH_DEFAULT, DEBUG_BREAKPOINT_CODE,
-    DEBUG_BREAKPOINT_ENABLED, DEBUG_CREATE_PROCESS_OPTIONS, DEBUG_END_ACTIVE_DETACH,
-    DEBUG_END_ACTIVE_TERMINATE, DEBUG_END_PASSIVE, DEBUG_ENGOPT_INITIAL_BREAK,
-    DEBUG_EXECUTE_DEFAULT, DEBUG_INTERRUPT_ACTIVE, DEBUG_MODNAME_MODULE, DEBUG_MODULE_PARAMETERS,
+    IDebugSystemObjects4, DEBUG_ANY_ID, DEBUG_ATTACH_DEFAULT, DEBUG_ATTACH_KERNEL_CONNECTION,
+    DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED, DEBUG_CREATE_PROCESS_OPTIONS,
+    DEBUG_END_ACTIVE_DETACH, DEBUG_END_ACTIVE_TERMINATE, DEBUG_END_PASSIVE,
+    DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT, DEBUG_EXECUTE_NOT_LOGGED,
+    DEBUG_INTERRUPT_ACTIVE, DEBUG_MODNAME_MODULE, DEBUG_MODULE_PARAMETERS, DEBUG_OUTCTL_IGNORE,
     DEBUG_OUTCTL_THIS_CLIENT, DEBUG_SCOPE_GROUP_LOCALS, DEBUG_STACK_FRAME, DEBUG_STATUS_BREAK,
     DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED,
     DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO,
@@ -46,7 +47,7 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
 };
 use windows::Win32::System::Diagnostics::Debug::SYMOPT_NO_IMAGE_SEARCH;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW, DEBUG_ONLY_THIS_PROCESS,
+    GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW, DEBUG_ONLY_THIS_PROCESS, INFINITE,
 };
 
 use crate::callbacks::{self, CallbackState, OutputSink};
@@ -134,6 +135,12 @@ pub struct Engine {
     /// stored here and the conditional-break re-loop is deferred to Phase 5 (the `wait_for_event`
     /// hook). `set_breakpoint` inserts, `remove_breakpoint` drops, and `detach` clears the map.
     breakpoint_conditions: HashMap<u32, String>,
+    /// Whether the per-session debugger-extension load (`.extpath` + `.load ext.dll`) has run.
+    /// Ports the C++ `extensionsLoaded_` guard: `ensure_extensions_loaded` performs the load once
+    /// and sets this; `detach` resets it to `false` so a fresh session reloads (mirrors the C++
+    /// `Detach` clearing `extensionsLoaded_`). `execute`/`analyze` call `ensure_extensions_loaded`
+    /// first so `!`-extension commands resolve (`!analyze`, `!heap`, …).
+    extensions_loaded: bool,
 }
 
 /// A `Send` interrupt token for one [`Engine`], the *only* part of this crate that crosses a
@@ -274,6 +281,7 @@ impl Engine {
             is_dump: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             breakpoint_conditions: HashMap::new(),
+            extensions_loaded: false,
         })
     }
 
@@ -350,8 +358,11 @@ impl Engine {
     /// command emitted.
     ///
     /// `!analyze`/extension commands need the runtime extension-path discovery (R8) the C++
-    /// `EnsureExtensionsLoaded` performs first; that is Phase 4, so a plain `execute` here does
-    /// *not* load extensions — ordinary commands (`r`, `dd`, `version`, `.echo`, …) work unchanged.
+    /// `EnsureExtensionsLoaded` performs first; like the C++ `ExecuteCommand`, `execute` calls
+    /// [`Engine::ensure_extensions_loaded`] before running the command (once per session), so the
+    /// `run_command` escape hatch can use `!`-extensions (`!heap`, `!analyze`, …) too. The load is
+    /// best-effort (a missing `ext.dll` does not fail the command); ordinary commands (`r`, `dd`,
+    /// `version`, `.echo`, …) work whether or not the extension load succeeded.
     ///
     /// Mirrors the C++ tolerance for a command that fails but still produced output: a failing
     /// `HRESULT` is only surfaced as an error when nothing was captured; otherwise the captured
@@ -359,6 +370,9 @@ impl Engine {
     pub fn execute(&mut self, command: &str) -> Result<String, EngineError> {
         let cmd = CString::new(command)
             .map_err(|_| EngineError::engine("execute: command contains an interior NUL byte"))?;
+        // Load debugger extensions once per session (C++ `ExecuteCommand` calls this first), so an
+        // `!`-extension command run through the raw escape hatch resolves. Best-effort.
+        self.ensure_extensions_loaded();
         // Drop any output buffered before this command so the returned text is just this command's.
         let _ = self.take_output();
         // SAFETY: `self.control` is the live `IDebugControl4` from `create`. `cmd` is a
@@ -1117,6 +1131,7 @@ impl Engine {
         // SAFETY: live client; `flags` is a documented DEBUG_END_* constant.
         unsafe { self.client.EndSession(flags) }.map_err(|e| EngineError::op("EndSession", e))?;
         self.is_dump = false;
+        self.extensions_loaded = false;
         self.breakpoint_conditions.clear();
         Ok(())
     }
@@ -1295,26 +1310,242 @@ impl Engine {
         Err(EngineError::engine("break: timed out"))
     }
 
-    /// Open a crash/minidump. STUB until Phase 4 — present now so the `Engine` surface (and the
-    /// Phase-3 `EngineCmd` enum built over it) is a complete, closed set.
-    pub fn open_dump(&mut self, _path: &str) -> Result<DumpOutcome, EngineError> {
-        Err(EngineError::engine(
-            "open_dump is not implemented until Phase 4",
-        ))
+    /// Open a crash/minidump and load it into a (stopped) dump session. Ports the C++
+    /// `OpenDumpFile`: guard `state == NoTarget`, `OpenDumpFile(path)`, mark the session a dump,
+    /// then `WaitForEvent(30000)` to load the dump's stored state.
+    ///
+    /// The returned [`DumpOutcome`] carries the dump's stop snapshot (`stop`) when `WaitForEvent`
+    /// surfaces one, and the crash source location (`crash_location` = `"<file>:<line>"`) from
+    /// [`Engine::current_source_location`]. The session is left `is_dump = true`, so a later
+    /// `go`/`step`/`break_in` is refused by [`Engine::ensure_runnable`] with the frozen
+    /// `"cannot continue a crash-dump session"` literal.
+    pub fn open_dump(&mut self, path: &str) -> Result<DumpOutcome, EngineError> {
+        // C++ `OpenDumpFile` guards `state != NoTarget → E_UNEXPECTED`, which rejects opening a
+        // dump while ANY session is already active — a live process attach/launch as well as
+        // another dump. The Rust engine has no `State` enum, so we mirror the C++ guard exactly by
+        // reading DbgEng's execution status: anything other than `DEBUG_STATUS_NO_DEBUGGEE` means a
+        // debuggee (live or dump) is bound to this engine, and reusing it for a dump is a
+        // programming error. The Phase-3 model creates a fresh `Engine` per session at the connect
+        // point, so a just-created engine is `NoTarget` and this guard is rarely hit; mirroring it
+        // defensively prevents silently reusing/clobbering an existing session.
+        //
+        // SAFETY: `self.control` is the live `IDebugControl4` from `create`; `GetExecutionStatus`
+        // only reads a `u32` out-param (returned by value) — no pointers cross the FFI boundary.
+        let status = unsafe { self.control.GetExecutionStatus() }
+            .map_err(|e| EngineError::op("GetExecutionStatus", e))?;
+        if status != DEBUG_STATUS_NO_DEBUGGEE {
+            return Err(EngineError::engine(
+                "open_dump: a session is already active",
+            ));
+        }
+
+        let path_c = CString::new(path).map_err(|_| {
+            EngineError::engine("open_dump: dump path contains an interior NUL byte")
+        })?;
+        // SAFETY: `self.client` is the live `IDebugClient5` from `create`. `OpenDumpFile` takes a
+        // `PCSTR` (ANSI — matching the C++ `OpenDumpFile(path.c_str())`); `path_c` is a
+        // NUL-terminated buffer owned here that outlives the call (the engine copies the path). No
+        // pointers are retained past the call.
+        unsafe { self.client.OpenDumpFile(PCSTR(path_c.as_ptr().cast())) }
+            .map_err(|e| EngineError::op("OpenDumpFile", e))?;
+
+        // Mark the session a dump *before* the wait, exactly as the C++ sets `isDumpSession_` right
+        // after a successful `OpenDumpFile` — so even an erroring wait leaves the dump flag correct
+        // for `detach` (which must end a dump session with `DEBUG_END_PASSIVE`).
+        self.is_dump = true;
+
+        // `WaitForEvent` loads the dump's stored state (C++ uses a 30 s budget).
+        let stop = match self.wait_for_event(30_000)? {
+            WaitResult::Event(StopOutcome::Stopped(info)) => Some(info),
+            // The dump loaded but did not surface a `Stopped` snapshot (e.g. an `Exited`-shaped
+            // event); the session is still a valid stopped dump — leave `stop` unset.
+            WaitResult::Event(_) => None,
+            WaitResult::TimedOut => {
+                return Err(EngineError::engine("open_dump: timed out loading dump"))
+            }
+        };
+
+        // `crash_location` is `"<file>:<line>"` when the dump's instruction maps to source; `None`
+        // otherwise (no symbols / no line). Best-effort: a failure to read the location is not a
+        // dump-open failure (the dump still loaded).
+        let crash_location = self
+            .current_source_location()
+            .ok()
+            .flatten()
+            .map(|(file, line)| format!("{file}:{line}"));
+
+        Ok(DumpOutcome {
+            stop,
+            crash_location,
+        })
     }
 
-    /// Attach to a kernel target (KDNET). STUB until Phase 4 — see `open_dump`.
-    pub fn attach_kernel(&mut self, _connection: &str) -> Result<StopOutcome, EngineError> {
-        Err(EngineError::engine(
-            "attach_kernel is not implemented until Phase 4",
-        ))
+    /// Attach to a kernel target over KDNET. Ports the C++ `AttachKernel`: guard `NoTarget`,
+    /// `AddEngineOptions(INITIAL_BREAK)` (without it `WaitForEvent` blocks forever on a running
+    /// kernel target), `AttachKernel(DEBUG_ATTACH_KERNEL_CONNECTION, connection)`, then wait for
+    /// the initial break and `RemoveEngineOptions(INITIAL_BREAK)`.
+    ///
+    /// `connection` is passed through verbatim (the only supported form is KDNET
+    /// `"net:port=<p>,key=<k>"`, validated by DbgEng itself — an unparseable string surfaces as an
+    /// `AttachKernel` error).
+    ///
+    /// ## R2 decision — the wait is `INFINITE` (and uncancellable)
+    ///
+    /// We mirror the C++ exactly and wait `INFINITE`: KDNET is the only supported transport and
+    /// DbgEng's KDNET wait does not honor a finite timeout there ("INFINITE is sadly the only
+    /// supported wait"). The consequence is a **hard caveat**: if the KDNET target is unreachable
+    /// (the guest VM is not listening on the port), `WaitForEvent(INFINITE)` blocks the
+    /// engine-owning thread *forever* with no cancellation point — DbgEng's KDNET transport retries
+    /// indefinitely. There is no way to interrupt it from here. The user-facing recovery is "`/mcp`
+    /// disconnect" (tear down the whole server), as documented in the plugin's kernel workflow.
+    ///
+    /// The proper fix — running the attach on an orphan-able engine thread so an unreachable target
+    /// can be abandoned without hanging the server — is **deferred to Phase 5** (the
+    /// uncancellable-wait orphan-thread teardown). This method must therefore never be driven with
+    /// an unreachable target from a context that cannot itself be torn down (the dbgeng-sys live
+    /// test for this path is `#[ignore]`d for exactly this reason; see `tests/lifecycle.rs`).
+    pub fn attach_kernel(&mut self, connection: &str) -> Result<StopOutcome, EngineError> {
+        // Fresh session — drop any stale breakpoint conditions (see `launch`/`attach_pid`).
+        self.breakpoint_conditions.clear();
+
+        let connection_c = CString::new(connection).map_err(|_| {
+            EngineError::engine("attach_kernel: connection string contains an interior NUL byte")
+        })?;
+
+        // Without INITIAL_BREAK, `WaitForEvent` blocks forever on a running kernel target (C++).
+        // SAFETY: live control interface; `DEBUG_ENGOPT_INITIAL_BREAK` is a documented u32 flag.
+        unsafe { self.control.AddEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK) }
+            .map_err(|e| EngineError::op("AddEngineOptions(INITIAL_BREAK)", e))?;
+
+        // SAFETY: live client; `DEBUG_ATTACH_KERNEL_CONNECTION` selects the connection-string
+        // (KDNET) transport. `connection_c` is NUL-terminated and outlives the call (the engine
+        // copies it); the `PCSTR` borrows it for the duration of the call only.
+        if let Err(e) = unsafe {
+            self.client.AttachKernel(
+                DEBUG_ATTACH_KERNEL_CONNECTION,
+                PCSTR(connection_c.as_ptr().cast()),
+            )
+        } {
+            // AttachKernel itself failed (e.g. malformed connection string) before any wait: undo
+            // the INITIAL_BREAK option (so it does not leak into a later session on a reused engine)
+            // and surface the mapped error. SAFETY: live control interface; documented u32 flag.
+            let _ = unsafe { self.control.RemoveEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK) };
+            return Err(EngineError::op("AttachKernel", e));
+        }
+
+        // A live kernel session is never a dump (C++ sets `isDumpSession_ = false` here).
+        self.is_dump = false;
+
+        // R2: INFINITE is the only supported KDNET wait — this can block forever on an unreachable
+        // target (see the method doc). The Phase-5 orphan-thread teardown is the cancellation fix.
+        let wait = self.wait_for_event(INFINITE);
+
+        // Clear INITIAL_BREAK regardless of the wait result so later `go`/`step` don't re-break.
+        // SAFETY: live control interface; documented u32 flag.
+        let removed = unsafe { self.control.RemoveEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK) };
+
+        // Surface a wait failure first, then a RemoveEngineOptions failure, before the timeout
+        // branch — the launch/attach error-ordering. On a wait FAILURE, also `EndSession` so the
+        // KDNET port is not leaked (C++ `EndSession(DEBUG_END_ACTIVE_DETACH)` on the failure path).
+        let outcome = match wait {
+            Ok(o) => o,
+            Err(e) => {
+                // SAFETY: live client; `DEBUG_END_ACTIVE_DETACH` is a documented u32 flag. Do not
+                // leak the KDNET port — end the half-open session before returning the wait error.
+                let _ = unsafe { self.client.EndSession(DEBUG_END_ACTIVE_DETACH) };
+                self.is_dump = false;
+                return Err(e);
+            }
+        };
+        // DELIBERATE, DOCUMENTED deviation from the C++: the C++ `AttachKernel` drops the
+        // `RemoveEngineOptions(INITIAL_BREAK)` HRESULT on the success path; we surface it. A
+        // lingering INITIAL_BREAK would re-break every subsequent `go`/`step` (corrupting all later
+        // execution on this session), so a failure to clear it is a real fault worth raising — and
+        // surfacing it here is consistent with `launch`/`attach_pid`, which already propagate this
+        // HRESULT in the same ordering (wait error first, then RemoveEngineOptions).
+        removed.map_err(|e| EngineError::op("RemoveEngineOptions(INITIAL_BREAK)", e))?;
+        match outcome {
+            WaitResult::Event(o) => Ok(o),
+            // `wait_for_event(INFINITE)` only returns `TimedOut` on an S_FALSE, which an INFINITE
+            // wait does not produce in practice; treat it as a clear error rather than a stop.
+            WaitResult::TimedOut => Err(EngineError::engine(
+                "attach_kernel: kernel wait returned without an event",
+            )),
+        }
     }
 
-    /// Guard the execution path: a crash-dump session cannot be resumed. Called by go/step
-    /// (task 2.4). The message is the frozen contract literal (the same string the tool layer
-    /// surfaces). Today `is_dump` is always false (open_dump is a Phase-4 stub), so this is a
-    /// belt-and-suspenders engine-level guard behind the mcp-tools `resume()` guard.
-    /// `pub` (not `pub(crate)`) so it is exempt from `dead_code` until task 2.4's go/step call it.
+    /// Run `!analyze -v` and return the (truncated) automated crash-analysis report. Ports the C++
+    /// `analyze_crash` tool: `ExecuteCommand("!analyze -v")` (which loads extensions first), then
+    /// the tool-layer `truncateOutput` cap. The 32 KiB cap + the exact truncation suffix mirror the
+    /// C++ `truncateOutput` (`advanced_tools.cpp`); applying it here keeps the neutral `analyze`
+    /// return self-contained.
+    ///
+    /// ## State contract — this method does NOT guard state
+    ///
+    /// Mirroring the C++ (which guards at the tool layer, not in the engine), `analyze` performs no
+    /// state check. Run against a `NoTarget` engine it simply asks DbgEng to `!analyze -v` with no
+    /// debuggee, which yields empty/error DbgEng output rather than a meaningful report — it does
+    /// not fault, but it is not useful. The **tool layer is responsible for the state guard**: the
+    /// `analyze_crash` handler (task 4.3, `crates/mcp-tools/src/handlers/windbg.rs`) calls
+    /// `session.check_state(&[State::Stopped])` before dispatching here, which is the contract this
+    /// method relies on. (Verified in place as of task 4.1.)
+    pub fn analyze(&mut self) -> Result<String, EngineError> {
+        // `execute` already calls `ensure_extensions_loaded` (so `!analyze` resolves); call it here
+        // too for clarity/parity with the C++ `ExecuteCommand` ordering — the guard makes the
+        // second call a no-op.
+        self.ensure_extensions_loaded();
+        let output = self.execute("!analyze -v")?;
+        Ok(truncate_output(output))
+    }
+
+    /// Load the WinDbg debugger extensions once per session: `.extpath <WinKits x64 paths>` then
+    /// `.load ext.dll`. Ports the C++ `EnsureExtensionsLoaded` (the R8 ext-path discovery), guarded
+    /// by [`Engine::extensions_loaded`] so it runs at most once per session (reset by `detach`).
+    ///
+    /// ## R8 — hardcoded WinKits paths (parity with the C++)
+    ///
+    /// The C++ hardcodes the x64 Windows Kits 10 debugger extension directories; we replicate that
+    /// hardcoded `.extpath` verbatim. Runtime discovery (the registry `KitsRoot10` value or the
+    /// `WindowsSdkDir` env var) is a possible refinement, but the hardcoded path is the documented
+    /// C++ behavior and is correct for a standard SDK install; we deliberately match it for strict
+    /// parity rather than diverge here. Both commands run with `DEBUG_OUTCTL_IGNORE` (no output
+    /// routed to our callbacks) and `DEBUG_EXECUTE_NOT_LOGGED`, and any failure is swallowed —
+    /// extension load is best-effort, exactly as the C++ ignores both `Execute` HRESULTs.
+    fn ensure_extensions_loaded(&mut self) {
+        if self.extensions_loaded {
+            return;
+        }
+        // Set the guard before issuing the commands (matching the C++, which sets
+        // `extensionsLoaded_ = true` up front) so a re-entrant call cannot double-load.
+        self.extensions_loaded = true;
+
+        // Hardcoded WinKits x64 extension search path (R8 — mirrors the C++ verbatim).
+        // SAFETY: live control interface; `s!(...)` is a 'static NUL-terminated ANSI string valid
+        // for the call (the engine copies it). `DEBUG_OUTCTL_IGNORE`/`DEBUG_EXECUTE_NOT_LOGGED` are
+        // documented u32 flags. Best-effort: the HRESULT is intentionally ignored (C++ parity).
+        let _ = unsafe {
+            self.control.Execute(
+                DEBUG_OUTCTL_IGNORE,
+                s!(".extpath C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\winext;C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\WINXP;C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64"),
+                DEBUG_EXECUTE_NOT_LOGGED,
+            )
+        };
+        // SAFETY: same invariants as the `.extpath` call above; `s!(".load ext.dll")` is a 'static
+        // NUL-terminated ANSI string. Best-effort: the HRESULT is intentionally ignored.
+        let _ = unsafe {
+            self.control.Execute(
+                DEBUG_OUTCTL_IGNORE,
+                s!(".load ext.dll"),
+                DEBUG_EXECUTE_NOT_LOGGED,
+            )
+        };
+    }
+
+    /// Guard the execution path: a crash-dump session cannot be resumed. Called by
+    /// `go`/`step`/`break_in` (task 2.4). The message is the frozen contract literal (the same
+    /// string the tool layer surfaces). `open_dump` (Phase 4) sets `is_dump`, so a real dump
+    /// session now reaches this guard; for a live session this is a belt-and-suspenders
+    /// engine-level guard behind the mcp-tools `resume()` guard.
     pub fn ensure_runnable(&self) -> Result<(), EngineError> {
         if self.is_dump {
             Err(EngineError::engine("cannot continue a crash-dump session"))
@@ -1524,13 +1755,35 @@ fn cstr_from_buf(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
+/// Cap a long command report at 32 KiB, appending the C++ truncation marker. Ports the C++
+/// `truncateOutput` (`advanced_tools.cpp`): `MAX_OUTPUT_SIZE = 32768`; output larger than the cap
+/// is cut to exactly the cap and the fixed `"\n\n... (output truncated at 32KB)"` suffix appended.
+/// Used by [`Engine::analyze`] so `!analyze -v`'s (often huge) report is bounded.
+///
+/// The cap is applied on a UTF-8 char boundary at or below 32768 bytes (the C++ `resize` cuts at a
+/// raw byte index; we round down to the nearest char boundary so the returned `String` stays valid
+/// UTF-8 — the captured text is already lossily decoded ANSI, so this only matters for multi-byte
+/// replacement chars and never lengthens the output beyond the cap).
+pub(crate) fn truncate_output(mut output: String) -> String {
+    const MAX_OUTPUT_SIZE: usize = 32768; // 32 KiB, matching the C++ `MAX_OUTPUT_SIZE`.
+    if output.len() > MAX_OUTPUT_SIZE {
+        let mut cut = MAX_OUTPUT_SIZE;
+        while cut > 0 && !output.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        output.truncate(cut);
+        output.push_str("\n\n... (output truncated at 32KB)");
+    }
+    output
+}
+
 /// Map a `DEBUG_MODULE_PARAMETERS::SymbolType` to the neutral `ModuleInfo::symbol_status` token
 /// (the lowercase set documented on `debugger_core::ModuleInfo`). The full-symbol formats
 /// (PDB/CODEVIEW/COFF/SYM/DIA) all collapse to `pdb` ("real symbols loaded — names resolve"),
 /// EXPORT→`export` (export-table only), DEFERRED→`deferred` (not loaded yet), and `DEBUG_SYMTYPE_NONE`
 /// (or any unknown value)→`none`. Collapsing the loaded formats to `pdb` keeps the token within the
 /// documented vocabulary while still telling the agent "symbols are available".
-fn symbol_status(symbol_type: u32) -> String {
+pub(crate) fn symbol_status(symbol_type: u32) -> String {
     let token = if symbol_type == DEBUG_SYMTYPE_PDB
         || symbol_type == DEBUG_SYMTYPE_CODEVIEW
         || symbol_type == DEBUG_SYMTYPE_COFF

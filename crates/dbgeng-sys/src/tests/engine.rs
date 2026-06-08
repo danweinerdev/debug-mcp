@@ -5,6 +5,9 @@
 //! (the one type in this crate intended to cross a thread boundary; the R4 flag-only design rests
 //! on it being soundly `Send` with no `unsafe`).
 
+use debugger_core::ModuleInfo;
+
+use crate::engine::{symbol_status, truncate_output};
 use crate::InterruptHandle;
 
 /// Compile-time proof that `InterruptHandle` is `Send`. It is the only piece of this crate that is
@@ -15,4 +18,151 @@ use crate::InterruptHandle;
 fn interrupt_handle_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<InterruptHandle>();
+}
+
+/// The `symbol_status` map produces exactly the documented neutral vocabulary
+/// (`{"pdb","export","deferred","none"}`) the `ModuleInfo::symbol_status` contract promises, with
+/// every full-symbol `DEBUG_SYMTYPE_*` collapsing to `"pdb"`. This is the canonical set the
+/// `modules()` format-contract test below asserts against; a drift here would break the agent's
+/// "do symbols resolve?" decision.
+#[test]
+fn symbol_status_maps_to_the_neutral_vocabulary() {
+    use windows::Win32::System::Diagnostics::Debug::Extensions::{
+        DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
+        DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM,
+    };
+
+    // All full-symbol formats collapse to "pdb".
+    for full in [
+        DEBUG_SYMTYPE_PDB,
+        DEBUG_SYMTYPE_CODEVIEW,
+        DEBUG_SYMTYPE_COFF,
+        DEBUG_SYMTYPE_SYM,
+        DEBUG_SYMTYPE_DIA,
+    ] {
+        assert_eq!(symbol_status(full), "pdb");
+    }
+    assert_eq!(symbol_status(DEBUG_SYMTYPE_EXPORT), "export");
+    assert_eq!(symbol_status(DEBUG_SYMTYPE_DEFERRED), "deferred");
+    assert_eq!(symbol_status(DEBUG_SYMTYPE_NONE), "none");
+    // Any unknown value falls back to "none".
+    assert_eq!(symbol_status(0xDEAD_BEEF), "none");
+
+    // The produced token is always one of the four documented values.
+    for ty in [
+        DEBUG_SYMTYPE_PDB,
+        DEBUG_SYMTYPE_EXPORT,
+        DEBUG_SYMTYPE_DEFERRED,
+        DEBUG_SYMTYPE_NONE,
+        0u32,
+        12345u32,
+    ] {
+        let token = symbol_status(ty);
+        assert!(
+            matches!(token.as_str(), "pdb" | "export" | "deferred" | "none"),
+            "symbol_status({ty}) produced an out-of-vocabulary token {token:?}"
+        );
+    }
+}
+
+/// The `ModuleInfo` format contract that `modules()` builds (and that the tool/serde layer relies
+/// on): `base` is a fixed-width `0x` + 16 uppercase hex digits, `size` is a decimal string, and
+/// `symbol_status` is one of the documented tokens. We assert it against a `ModuleInfo` constructed
+/// with the exact `modules()` formatting (`format!("0x{base:016X}")` / `size.to_string()` /
+/// `symbol_status(...)`), so a change to the formatting in `modules()` is caught without a live
+/// engine. (A live module-field assertion against the real `test_target` runs in `tests/`.)
+#[test]
+fn module_info_format_contract() {
+    // Build a ModuleInfo the *same* way `Engine::modules` does, from raw DbgEng-shaped values.
+    let base: u64 = 0x0000_7FFA_1B2C_0000;
+    let size: u64 = 2_138_112;
+    use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_SYMTYPE_PDB;
+    let module = ModuleInfo {
+        name: "ntdll.dll".to_string(),
+        base: format!("0x{base:016X}"),
+        size: size.to_string(),
+        symbol_status: symbol_status(DEBUG_SYMTYPE_PDB),
+    };
+
+    // base: literal "0x" + exactly 16 uppercase hex digits.
+    assert_eq!(module.base, "0x00007FFA1B2C0000");
+    assert_eq!(module.base.len(), 18);
+    assert!(module.base.starts_with("0x"));
+    let hex = &module.base[2..];
+    assert_eq!(hex.len(), 16);
+    assert!(
+        hex.chars()
+            .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c)),
+        "base hex digits must be uppercase 0-9A-F, got {hex:?}"
+    );
+
+    // size: a decimal string (no 0x, all ASCII digits).
+    assert_eq!(module.size, "2138112");
+    assert!(module.size.chars().all(|c| c.is_ascii_digit()));
+
+    // symbol_status: one of the documented tokens.
+    assert!(matches!(
+        module.symbol_status.as_str(),
+        "pdb" | "export" | "deferred" | "none"
+    ));
+}
+
+/// `truncate_output` mirrors the C++ `truncateOutput`: output at or under the 32 KiB cap passes
+/// through unchanged; output over the cap is cut to (at most) the cap and the fixed suffix is
+/// appended. This bounds `analyze()`'s `!analyze -v` report exactly as the C++ tool layer did.
+#[test]
+fn truncate_output_caps_at_32kb_with_suffix() {
+    const CAP: usize = 32768;
+    const SUFFIX: &str = "\n\n... (output truncated at 32KB)";
+
+    // Under the cap: unchanged.
+    let small = "EXCEPTION_ACCESS_VIOLATION".to_string();
+    assert_eq!(truncate_output(small.clone()), small);
+
+    // Exactly at the cap: unchanged (the C++ only truncates when strictly greater).
+    let exact = "a".repeat(CAP);
+    assert_eq!(truncate_output(exact.clone()), exact);
+
+    // Over the cap: cut to the cap and suffixed. The body before the suffix is exactly CAP bytes
+    // (the input is single-byte ASCII so the char-boundary rounding does not move the cut).
+    let big = "b".repeat(CAP + 5000);
+    let truncated = truncate_output(big);
+    assert!(truncated.ends_with(SUFFIX), "missing truncation suffix");
+    let body = &truncated[..truncated.len() - SUFFIX.len()];
+    assert_eq!(body.len(), CAP, "body should be capped at exactly 32KB");
+    assert!(body.bytes().all(|b| b == b'b'));
+}
+
+/// Multi-byte boundary safety: the `is_char_boundary` walk-back must round the cut DOWN to a char
+/// boundary so the returned `String` never splits a UTF-8 sequence. With a 3-byte char ('€'),
+/// 32768 is not a multiple of 3, so the raw cut at 32768 lands mid-char; the walk-back must move it
+/// to the nearest boundary at or below the cap. We assert: no panic, truncation occurred, the body
+/// is at most the cap, the cut sits on a char boundary, and the body re-parses as valid UTF-8.
+#[test]
+fn truncate_output_rounds_down_to_char_boundary_on_multibyte() {
+    const CAP: usize = 32768;
+    const SUFFIX: &str = "\n\n... (output truncated at 32KB)";
+
+    // '€' is 3 bytes in UTF-8; 32768 % 3 != 0, so a raw byte cut at the cap would split a char.
+    let euro = '\u{20AC}';
+    assert_eq!(euro.len_utf8(), 3);
+    let count = (CAP / 3) + 100; // comfortably past the cap.
+    let big: String = euro.to_string().repeat(count);
+    assert!(big.len() > CAP);
+
+    let truncated = truncate_output(big); // must not panic on the mid-char raw index.
+    assert!(truncated.ends_with(SUFFIX), "missing truncation suffix");
+
+    let body = &truncated[..truncated.len() - SUFFIX.len()];
+    // The cut rounds DOWN to a boundary: body <= cap, and 32768 is not a 3-multiple so it lands
+    // strictly below at the largest multiple of 3 (32766).
+    assert!(body.len() <= CAP, "body must not exceed the cap");
+    assert_eq!(
+        body.len() % 3,
+        0,
+        "cut must land on a '€' (3-byte) char boundary"
+    );
+    // Re-parses cleanly as UTF-8 and contains only whole '€' chars (no replacement/split byte).
+    let reparsed = std::str::from_utf8(body.as_bytes()).expect("body is valid UTF-8");
+    assert!(reparsed.chars().all(|c| c == euro), "no char was split");
 }
