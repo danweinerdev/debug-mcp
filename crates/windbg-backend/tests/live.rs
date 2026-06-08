@@ -404,6 +404,84 @@ fn inspection_at_compute_breakpoint() {
     });
 }
 
+/// The RUNTIME breakpoint-setter path post-launch (distinct from the launch-flush path that
+/// `cont_hits_breakpoint_then_runs_to_exit` exercises): launch `normal` with NO pending bp, then
+/// `set_function_breakpoints(&[compute])` at the loader break returns a VERIFIED bp, `cont` runs to
+/// it (Stopped at the breakpoint), and finally `set_function_breakpoints(&[nonexistent_xyz_func])`
+/// returns an UNVERIFIED result (verified:false) — NOT a panic, NOT a `Closed` error (lldb/DAP
+/// parity: an unresolvable function is a per-bp `verified:false`, never a request-level error).
+#[test]
+fn runtime_set_function_breakpoint_resolves_then_unresolvable_is_unverified() {
+    if should_skip() {
+        return;
+    }
+    let _guard = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+
+    runtime().block_on(async {
+        let conn = WinDbgFactory::new()
+            .connect()
+            .await
+            .expect("connect a live WinDbg backend");
+        let backend = conn.backend;
+
+        // Launch with NO pending breakpoint, so the only bp set is via the RUNTIME setter below.
+        match backend.launch(launch_spec("normal")).await.expect("launch") {
+            LaunchOutcome::Stopped(_) => {}
+            other => panic!("launch must stop at the loader break, got {other:?}"),
+        }
+
+        // Runtime setter: set a function breakpoint on `compute` at the loader break. The real exe
+        // symbols are loaded, so `compute` resolves → a verified breakpoint.
+        let results = backend
+            .set_function_breakpoints(&[FunctionBp {
+                name: "compute".to_string(),
+                condition: String::new(),
+            }])
+            .await
+            .expect("set_function_breakpoints(compute) at the loader break");
+        assert_eq!(results.len(), 1, "one result for the one function bp");
+        assert!(
+            results[0].verified,
+            "the runtime `compute` breakpoint must resolve to a verified bp, got {:?}",
+            results[0]
+        );
+
+        // cont runs the target to the runtime-set `compute` breakpoint (Stopped).
+        match backend
+            .cont(0)
+            .await
+            .expect("cont to the runtime breakpoint")
+        {
+            StopOutcome::Stopped(info) => {
+                let reason = info.reason.to_ascii_lowercase();
+                assert!(
+                    reason.contains("breakpoint") || !info.hit_breakpoint_ids.is_empty(),
+                    "cont should stop at the runtime-set compute breakpoint, got {info:?}"
+                );
+            }
+            other => panic!("cont should hit the runtime breakpoint (Stopped), got {other:?}"),
+        }
+
+        // A NONEXISTENT function (the `err_bad_bp` scenario): the runtime setter must return an
+        // UNVERIFIED result, NOT panic and NOT a Closed/transport error.
+        let bad = backend
+            .set_function_breakpoints(&[FunctionBp {
+                name: "nonexistent_xyz_func".to_string(),
+                condition: String::new(),
+            }])
+            .await
+            .expect("an unresolvable function must NOT fail the call (lldb parity)");
+        assert_eq!(bad.len(), 1, "one result for the one (bad) function bp");
+        assert!(
+            !bad[0].verified,
+            "a nonexistent function must yield an unverified result, got {:?}",
+            bad[0]
+        );
+
+        backend.disconnect(true).await;
+    });
+}
+
 /// `step` Over and `step` Into from the loader break each land `Stopped` (a single source step
 /// stays inside the loader/CRT). thread_id and gran are ignored (WinDbg steps the current thread,
 /// source/line-oriented — no instruction-granularity knob).

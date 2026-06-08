@@ -1,11 +1,18 @@
 //! Marshaling / thread-lifecycle tests over a [`FakeEngine`] (no live engine, no COM on the
 //! calling thread). Covers the task-3.1 round-trip, readiness success/failure, the no-COM
-//! invariant, and teardown.
+//! invariant, teardown, and `pause`.
+//!
+//! There is no longer a "not-yet-implemented placeholder" test here: every `DebuggerBackend`
+//! trait method is implemented in `windbg-backend` (the runtime breakpoint setters were the last
+//! `BackendError::Send("…phase 3.3")` placeholders and now resolve real bps — see
+//! `tests/breakpoints.rs`). The capability-gated `open_dump`/`attach_kernel`/`analyze` inherit the
+//! trait's DEFAULT `Unsupported` bodies (Phase-4 capability work, not crate placeholders), so they
+//! are not the same kind of placeholder and are covered by the tool-layer capability gating.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use debugger_core::{BackendError, DebuggerBackend, ThreadInfo};
+use debugger_core::{DebuggerBackend, ThreadInfo};
 
 use crate::engine_ops::EngineOps;
 use crate::error::EngineError;
@@ -140,32 +147,4 @@ async fn pause_sets_the_interrupt_flag() {
         flag.load(Ordering::Acquire),
         "pause must set the shared interrupt flag"
     );
-}
-
-/// A placeholder op (owned by a later task) surfaces the documented not-yet-implemented error,
-/// so the trait compiles all-or-nothing and the seam is honored. The inspection ops are
-/// implemented in 3.4, so this now targets a phase-3.3 placeholder still pending
-/// (`set_source_breakpoints` — the standalone set-breakpoints handler, distinct from the launch
-/// flush 3.3 already wired).
-#[tokio::test]
-async fn placeholder_op_reports_not_yet_implemented() {
-    use debugger_core::SourceBp;
-
-    let (backend, _term) = backend_over_fake(ok_constructor)
-        .await
-        .expect("fake backend ready");
-    let err = backend
-        .set_source_breakpoints(
-            "test.c",
-            &[SourceBp {
-                line: 10,
-                condition: String::new(),
-            }],
-        )
-        .await
-        .expect_err("set_source_breakpoints is a 3.3 placeholder");
-    match err {
-        BackendError::Send(msg) => assert!(msg.contains("phase 3.3"), "{msg}"),
-        other => panic!("expected a Send placeholder error, got {other:?}"),
-    }
 }

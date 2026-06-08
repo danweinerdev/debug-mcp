@@ -2,6 +2,7 @@
 //! `#[cfg(test)]` next to the code). These use [`FakeEngine`](fake::FakeEngine) and need **no
 //! live engine** (and no COM on the calling thread), so they run on any Windows host.
 
+mod breakpoints;
 mod execution;
 mod fake;
 mod inspection;

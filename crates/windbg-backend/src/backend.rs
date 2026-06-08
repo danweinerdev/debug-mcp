@@ -10,6 +10,7 @@
 //! No `unsafe`: the backend only ever holds channel endpoints and a `Send`
 //! [`InterruptHandle`](dbgeng_sys::InterruptHandle); all DbgEng/COM work is on the engine thread.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,19 @@ pub struct WinDbgBackend {
     /// attach-by-pid already reports the supplied pid at the tool layer). The `Mutex` is only ever
     /// locked for a synchronous read/write that drops the guard before any `.await`.
     target_pid: Mutex<Option<i64>>,
+    /// Per-category breakpoint tracking for the **replace-all** reconciliation the runtime setters
+    /// implement (see [`set_source_breakpoints`](DebuggerBackend::set_source_breakpoints)).
+    ///
+    /// The tool layer drives breakpoints declaratively, exactly like lldb's DAP: each
+    /// `setBreakpoints(file, …)` call carries the FULL desired list for that file, and
+    /// `setFunctionBreakpoints(…)` the FULL desired function list — the backend must make the
+    /// engine match, preserving the engine id of an already-set location (so a stop reports the same
+    /// id the `set_breakpoint` tool returned) and removing ones no longer requested. DbgEng has a
+    /// single flat breakpoint pool with no file/category tag, so the backend tracks the mapping
+    /// itself: `location key → cached BreakpointResult` per category. The `Mutex` is only ever
+    /// locked for a synchronous snapshot/commit that drops the guard before any `.await` (the engine
+    /// round-trips happen between, lock-free).
+    breakpoints: Mutex<BreakpointTable>,
     /// The engine thread's join handle, owned here so the thread is not silently detached: this
     /// makes the thread's lifetime observable and gives Phase 5 a hook for the R2 orphan-thread
     /// teardown. We deliberately do NOT join it on `Drop` — a thread blocked in a long `go`
@@ -62,6 +76,24 @@ pub struct WinDbgBackend {
     /// closing the command channel (dropping `cmd_tx`), which ends the loop in the normal path; a
     /// genuinely-stuck thread is left to exit at process end (R2, Phase 5).
     _engine_thread: std::thread::JoinHandle<()>,
+}
+
+/// The backend's per-category breakpoint tracking, keyed by source location so the runtime setters
+/// can do replace-all reconciliation while preserving engine ids (see [`WinDbgBackend::breakpoints`]).
+///
+/// `source` maps a file path → (line → the engine's [`BreakpointResult`] for that file:line);
+/// `function` maps a function name → its [`BreakpointResult`]. The cached result carries the engine
+/// id minted by `set_breakpoint`, so a re-send of an unchanged location reuses the same id rather
+/// than creating a duplicate (DbgEng `AddBreakpoint` would otherwise leak a second breakpoint at the
+/// same address each call). Source and function breakpoints are tracked separately because the tool
+/// layer reconciles them through separate DAP-style requests.
+#[derive(Default)]
+struct BreakpointTable {
+    /// file path → (line → cached result). One inner map per source file (DAP `setBreakpoints` is
+    /// per-file, so a reconcile only touches the addressed file's lines).
+    source: HashMap<String, HashMap<u32, BreakpointResult>>,
+    /// function name → cached result. A single category (DAP `setFunctionBreakpoints` is global).
+    function: HashMap<String, BreakpointResult>,
 }
 
 impl WinDbgBackend {
@@ -77,6 +109,33 @@ impl WinDbgBackend {
             cmd_tx,
             interrupt,
             target_pid: Mutex::new(debugger_pid),
+            breakpoints: Mutex::new(BreakpointTable::default()),
+            _engine_thread: engine_thread,
+        }
+    }
+
+    /// Test-only: build a backend whose command channel is ALREADY closed (its receiver is
+    /// dropped) over a benign, already-finished engine thread. Any marshaled op's `cmd_tx.send`
+    /// fails immediately → [`call`](WinDbgBackend::call) maps it to [`BackendError::Closed`] — the
+    /// deterministic "dead engine thread" path. Used by the breakpoint Closed-propagation test
+    /// without racing a real teardown.
+    #[cfg(test)]
+    pub(crate) fn with_closed_channel_for_test() -> WinDbgBackend {
+        // A channel whose receiver is dropped: every send returns `Err` (the engine thread gone).
+        let (cmd_tx, rx) = mpsc::channel::<EngineCmd>(1);
+        // Close the channel immediately, before constructing the backend, so every `cmd_tx.send`
+        // fails from the outset.
+        drop(rx);
+        let interrupt = InterruptHandle::from_flag(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        // A trivially-finished thread so the JoinHandle field is populated without a live engine.
+        let engine_thread = std::thread::spawn(|| {});
+        WinDbgBackend {
+            cmd_tx,
+            interrupt,
+            target_pid: Mutex::new(None),
+            breakpoints: Mutex::new(BreakpointTable::default()),
             _engine_thread: engine_thread,
         }
     }
@@ -86,6 +145,26 @@ impl WinDbgBackend {
     fn set_target_pid(&self, pid: Option<i64>) {
         let mut guard = self.target_pid.lock().unwrap_or_else(|p| p.into_inner());
         *guard = pid;
+    }
+
+    /// Remove one engine breakpoint by id during a reconcile, best-effort. A non-transport failure
+    /// (e.g. the id was already gone) is swallowed — the worst case is a leftover engine breakpoint,
+    /// never a wrong result — but a transport `Closed` (the engine thread died) is propagated so the
+    /// caller aborts the whole reconcile (nothing further can succeed). An id `<= 0` is an unverified
+    /// sentinel (never a real engine breakpoint) and is skipped without a round-trip.
+    async fn remove_engine_breakpoint(&self, id: i64) -> Result<(), BackendError> {
+        if id <= 0 {
+            return Ok(());
+        }
+        match self
+            .call(|reply| EngineCmd::RemoveBreakpoint { id, reply })
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(BackendError::Closed) => Err(BackendError::Closed),
+            // A non-transport remove failure (stale id, already removed) is best-effort: swallow it.
+            Err(_) => Ok(()),
+        }
     }
 
     /// Resolve `attach`'s `wait_for` mode: poll the process list for a process named `name` to
@@ -187,6 +266,45 @@ pub(crate) fn map_engine_err(err: EngineError) -> BackendError {
     }
 }
 
+/// Resolve one breakpoint's [`SetBreakpoint`](EngineCmd::SetBreakpoint) call into a per-bp result,
+/// applying the lldb-parity per-bp-failure rule used by both runtime breakpoint setters.
+///
+/// `Engine::set_breakpoint` (dbgeng-sys) returns `Err(EngineError)` for an UNRESOLVABLE location
+/// (no symbols / unknown line / unknown function — `GetOffsetByLine`/`GetOffsetByName` fails),
+/// which [`WinDbgBackend::call`] maps through [`map_engine_err`] to [`BackendError::Dap`]. lldb's
+/// DAP `setBreakpoints`/`setFunctionBreakpoints`, by contrast, returns a *per-bp* `verified:false`
+/// entry for an unresolvable bp and NEVER a request-level error. To match that parity we convert an
+/// unresolvable-bp `Err` into a `verified:false` `BreakpointResult` (id 0 — the lldb "unverified"
+/// sentinel from `DapBreakpoint`'s `#[serde(default)]`, carrying the engine's message) and let the
+/// batch continue — so one bad line/function does not fail the others.
+///
+/// The lone exception is [`BackendError::Closed`]: that is a TRANSPORT failure (the engine thread
+/// died), so nothing further can succeed — it is propagated (`Err`) and aborts the batch. Any other
+/// backend error (the engine's "could not resolve", surfaced via `map_engine_err` as
+/// [`BackendError::Dap`]) is treated as a per-bp failure, not a transport failure.
+///
+/// `unverified_line` is the `line` to record on the unverified-error fallback: a source bp echoes
+/// its requested line (so the handler's line-match finds the entry); a function bp passes 0 (the
+/// "no line" sentinel).
+fn bp_result_or_continue(
+    outcome: Result<BreakpointResult, BackendError>,
+    unverified_line: i64,
+) -> Result<BreakpointResult, BackendError> {
+    match outcome {
+        Ok(result) => Ok(result),
+        // Transport failure: the engine thread is gone — propagate and abort the batch.
+        Err(BackendError::Closed) => Err(BackendError::Closed),
+        // An unresolvable bp (or any non-transport engine error): mirror lldb's per-bp
+        // `verified:false` result and continue the batch rather than failing the whole call.
+        Err(other) => Ok(BreakpointResult {
+            id: 0,
+            verified: false,
+            line: unverified_line,
+            message: other.to_string(),
+        }),
+    }
+}
+
 #[async_trait]
 impl DebuggerBackend for WinDbgBackend {
     // --- lifecycle ---
@@ -210,8 +328,12 @@ impl DebuggerBackend for WinDbgBackend {
 
         // On a stop (the normal launch result), flush the pending breakpoints the session tracked
         // when the tool set them: launch flushes, attach does not. Each set is best-effort — a
-        // breakpoint that fails to resolve (e.g. no symbols yet) must NOT abort the launch; the
-        // per-bp result is discarded here and the session's own tracking carries verification.
+        // breakpoint that fails to resolve (e.g. no symbols yet) must NOT abort the launch.
+        //
+        // A successful (verified) flush is RECORDED in `self.breakpoints` so that a later runtime
+        // `set_source_breakpoints`/`set_function_breakpoints` re-send of the same location reuses the
+        // flushed engine breakpoint (preserving its id) instead of adding a duplicate — keeping the
+        // flush path and the runtime reconcile path consistent.
         if matches!(outcome, StopOutcome::Stopped(_)) {
             for (file, bps) in &spec.source_breakpoints {
                 for bp in bps {
@@ -225,25 +347,42 @@ impl DebuggerBackend for WinDbgBackend {
                         line,
                     };
                     let condition = bp.condition.clone();
-                    let _ = self
+                    let result = self
                         .call(|reply| EngineCmd::SetBreakpoint {
                             loc,
                             condition,
                             reply,
                         })
                         .await;
+                    if let Ok(result) = result {
+                        if result.verified {
+                            let mut table =
+                                self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
+                            table
+                                .source
+                                .entry(file.clone())
+                                .or_default()
+                                .insert(line, result);
+                        }
+                    }
                 }
             }
             for bp in &spec.function_breakpoints {
                 let loc = BpLoc::Function(bp.name.clone());
                 let condition = bp.condition.clone();
-                let _ = self
+                let result = self
                     .call(|reply| EngineCmd::SetBreakpoint {
                         loc,
                         condition,
                         reply,
                     })
                     .await;
+                if let Ok(result) = result {
+                    if result.verified {
+                        let mut table = self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
+                        table.function.insert(bp.name.clone(), result);
+                    }
+                }
             }
         }
 
@@ -318,24 +457,192 @@ impl DebuggerBackend for WinDbgBackend {
 
     async fn set_source_breakpoints(
         &self,
-        _file: &str,
-        _bps: &[SourceBp],
+        file: &str,
+        bps: &[SourceBp],
     ) -> Result<Vec<BreakpointResult>, BackendError> {
-        // TODO(3.3): parse each SourceBp into a BpLoc::FileLine and marshal EngineCmd::SetBreakpoint
-        // per line (DbgEng has no batch set-for-file; the per-file list is reconciled here).
-        Err(BackendError::Send(
-            "set_source_breakpoints: not yet implemented (phase 3.3)".into(),
-        ))
+        // REPLACE-ALL reconciliation (lldb/DAP parity): the tool layer passes the FULL desired list
+        // for this file each call. The engine must end up with exactly these file:line breakpoints —
+        // preserving the engine id of a line already set (so a stop reports the same id the
+        // `set_breakpoint` tool returned), removing lines no longer requested, and adding new ones.
+        // DbgEng `AddBreakpoint` always creates a NEW breakpoint, so without this reconcile a re-send
+        // (e.g. after a sibling `remove_breakpoint` re-sends the file's remaining list) would leak a
+        // duplicate at the same address and the stop id would drift. We track the per-file mapping in
+        // `self.breakpoints.source[file]`.
+        //
+        // Snapshot the file's prior tracked lines under the lock, drop the lock, do the engine
+        // round-trips lock-free, then commit the new map under the lock — never holding the lock
+        // across an `.await`.
+        let prior: HashMap<u32, BreakpointResult> = {
+            let table = self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
+            table.source.get(file).cloned().unwrap_or_default()
+        };
+
+        // The set of valid (u32) lines requested this call — what should remain after reconcile.
+        let mut desired_lines: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+        // Per-bp failure semantics (lldb/DAP parity): an unresolvable line yields a `verified:false`
+        // per-bp result and the batch continues; only a transport failure (`Closed`) is fatal (see
+        // `bp_result_or_continue`). The result vector is positional with `bps` (the handler matches
+        // by line or takes the last).
+        let mut results = Vec::with_capacity(bps.len());
+        let mut new_map: HashMap<u32, BreakpointResult> = HashMap::new();
+        for bp in bps {
+            // A line outside u32 range is malformed and cannot be a real source line. Like lldb's
+            // per-bp unresolvable handling, do NOT abort the batch — push an unverified result
+            // echoing the requested line and DO NOT ask the engine to set it (skip the marshal).
+            let line = match u32::try_from(bp.line) {
+                Ok(line) => line,
+                Err(_) => {
+                    results.push(BreakpointResult {
+                        id: 0,
+                        verified: false,
+                        line: bp.line,
+                        message: format!("{file}:{}: line out of range", bp.line),
+                    });
+                    continue;
+                }
+            };
+            desired_lines.insert(line);
+
+            // Already set at this file:line — reuse the cached result (and its engine id) rather than
+            // adding a duplicate. INTENTIONAL/DEFERRED: a re-sent location keeps its ORIGINAL
+            // condition — a changed `condition` on a re-send is NOT re-applied to the engine. The
+            // condition is stored engine-side at first-set time, and conditional breakpoint
+            // evaluation is a deferred Phase-5 feature, so a bare re-send of the same line is
+            // (deliberately) idempotent here. If conditional-eval lands, this reuse branch must
+            // diff the condition and re-set the engine breakpoint when it changed.
+            if let Some(existing) = prior.get(&line) {
+                results.push(existing.clone());
+                new_map.insert(line, existing.clone());
+                continue;
+            }
+
+            // A new line: ask the engine to set it.
+            let loc = BpLoc::FileLine {
+                file: file.to_string(),
+                line,
+            };
+            let condition = bp.condition.clone();
+            let outcome = self
+                .call(|reply| EngineCmd::SetBreakpoint {
+                    loc,
+                    condition,
+                    reply,
+                })
+                .await;
+            // A source bp's unverified-error fallback echoes the requested line; a transport failure
+            // propagates (aborting before any commit, so the tracked map is unchanged).
+            let result = bp_result_or_continue(outcome, bp.line)?;
+            // Only a verified (real engine id) result is tracked for reuse; an unverified one carries
+            // no engine breakpoint, so it must not be cached as one.
+            if result.verified {
+                new_map.insert(line, result.clone());
+            }
+            results.push(result);
+        }
+
+        // Remove the engine breakpoints for lines that were tracked before but are no longer
+        // requested (the lines dropped by this declarative re-send). Best-effort per id — a remove
+        // failure for one stale line must not fail the whole reconcile (the worst case is a leftover
+        // breakpoint, not a wrong result); a transport `Closed` aborts.
+        //
+        // We capture (rather than `?`-propagate) a `Closed` from the remove pass so the commit below
+        // still runs: `new_map` reflects what was actually ADDED this call, and committing it keeps
+        // the tracked table consistent with the engine's real state (the just-added entries are kept,
+        // and the stale entries — which we were trying to remove — are dropped) before we surface the
+        // transport error. `Closed` means the engine thread is permanently dead, so this is largely
+        // theoretical, but it leaves no silently-wrong table.
+        let remove_result: Result<(), BackendError> = async {
+            for (line, old) in &prior {
+                if !desired_lines.contains(line) {
+                    self.remove_engine_breakpoint(old.id).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        // Commit the new per-file map under the lock (even on a `Closed` remove failure — see above).
+        {
+            let mut table = self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
+            if new_map.is_empty() {
+                table.source.remove(file);
+            } else {
+                table.source.insert(file.to_string(), new_map);
+            }
+        }
+        remove_result?;
+        Ok(results)
     }
 
     async fn set_function_breakpoints(
         &self,
-        _bps: &[FunctionBp],
+        bps: &[FunctionBp],
     ) -> Result<Vec<BreakpointResult>, BackendError> {
-        // TODO(3.3): parse each FunctionBp into a BpLoc::Function and marshal EngineCmd::SetBreakpoint.
-        Err(BackendError::Send(
-            "set_function_breakpoints: not yet implemented (phase 3.3)".into(),
-        ))
+        // REPLACE-ALL reconciliation, same as `set_source_breakpoints` but for the single global
+        // function category (DAP `setFunctionBreakpoints` is not per-file). The tool layer passes the
+        // FULL desired function list; we preserve the engine id of a name already set, remove names
+        // no longer requested, and add new ones. The result vector is positional with `bps` (the
+        // handler takes the last). Per-bp-error-vs-`Closed` handling matches `bp_result_or_continue`:
+        // an unresolvable function (the `err_bad_bp` scenario — e.g. `nonexistent_xyz`) is a
+        // `verified:false` result, NOT a request error; only a dead engine thread (`Closed`) is fatal.
+        let prior: HashMap<String, BreakpointResult> = {
+            let table = self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
+            table.function.clone()
+        };
+
+        let mut desired_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut results = Vec::with_capacity(bps.len());
+        let mut new_map: HashMap<String, BreakpointResult> = HashMap::new();
+        for bp in bps {
+            desired_names.insert(bp.name.clone());
+
+            // Already set for this function name — reuse the cached result (preserving the engine id).
+            if let Some(existing) = prior.get(&bp.name) {
+                results.push(existing.clone());
+                new_map.insert(bp.name.clone(), existing.clone());
+                continue;
+            }
+
+            let loc = BpLoc::Function(bp.name.clone());
+            let condition = bp.condition.clone();
+            let outcome = self
+                .call(|reply| EngineCmd::SetBreakpoint {
+                    loc,
+                    condition,
+                    reply,
+                })
+                .await;
+            // A function bp has no input line; the unverified-error fallback uses line 0 (the
+            // "no line" sentinel — matches lldb's function-bp default and `list_breakpoints`'
+            // `line == 0` suppression).
+            let result = bp_result_or_continue(outcome, 0)?;
+            if result.verified {
+                new_map.insert(bp.name.clone(), result.clone());
+            }
+            results.push(result);
+        }
+
+        // Remove the engine breakpoints for functions tracked before but no longer requested.
+        // As in `set_source_breakpoints`, capture (rather than `?`-propagate) a `Closed` from the
+        // remove pass so the commit below still runs — keeping the tracked table consistent with what
+        // was actually added before surfacing the transport error (`Closed` = engine thread dead).
+        let remove_result: Result<(), BackendError> = async {
+            for (name, old) in &prior {
+                if !desired_names.contains(name) {
+                    self.remove_engine_breakpoint(old.id).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        {
+            let mut table = self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
+            table.function = new_map;
+        }
+        remove_result?;
+        Ok(results)
     }
 
     // --- execution ---

@@ -48,6 +48,9 @@ impl RecordedBp {
 pub struct Recorder {
     /// Each `set_breakpoint(loc, condition)` call, in order — proves the launch breakpoint flush.
     pub breakpoints: Vec<(RecordedBp, String)>,
+    /// Each `remove_breakpoint(id)` call, in order — proves the replace-all reconcile actually asks
+    /// the engine to drop a stale breakpoint's id (the only unit-level proof the removal path runs).
+    pub removes: Vec<i64>,
     /// The `terminate` flag of each `detach(terminate)` call, in order — proves disconnect's
     /// kill-vs-detach choice round-trips.
     pub detaches: Vec<bool>,
@@ -88,6 +91,18 @@ pub struct Recorder {
     pub disassembles: Vec<(u64, i64)>,
 }
 
+/// One scripted `set_breakpoint` reply, popped in order by [`FakeEngine::set_breakpoint`]. Lets a
+/// breakpoint test drive both the resolve-OK and the unresolvable-`Err` paths per call without a
+/// live engine. When the queue is empty the fake falls back to its default `Ok` (a verified bp),
+/// so a test only scripts the calls it cares about.
+pub enum ScriptedBp {
+    /// Resolve to this verified/unverified result.
+    Ok(BreakpointResult),
+    /// Fail to resolve — the engine returns this error (mapped by the backend to a per-bp
+    /// unverified result; this is the `nonexistent_xyz` / unknown-line path).
+    Err(EngineError),
+}
+
 /// A scripted engine. Each field is the canned reply for the matching [`EngineOps`] method; the
 /// defaults are benign so a test only sets the fields it asserts on. `interrupt_flag` is shared
 /// with the [`InterruptHandle`] `interrupt_handle()` mints, so a test can observe a `pause()`;
@@ -115,6 +130,10 @@ pub struct FakeEngine {
     pub memory: Vec<u8>,
     /// Canned instructions `disassemble` returns.
     pub instructions: Vec<Instruction>,
+    /// Scripted `set_breakpoint` replies, consumed front-to-back (one per call). Empty → the
+    /// default verified bp. Shared behind a `Mutex` because `set_breakpoint` takes `&mut self` but
+    /// the queue is mutated per call; a `VecDeque` pops from the front in call order.
+    pub scripted_bps: Mutex<std::collections::VecDeque<ScriptedBp>>,
 }
 
 impl Default for FakeEngine {
@@ -137,6 +156,7 @@ impl Default for FakeEngine {
             execute_result: String::new(),
             memory: Vec::new(),
             instructions: Vec::new(),
+            scripted_bps: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 }
@@ -156,6 +176,20 @@ impl FakeEngine {
         FakeEngine {
             stop_outcome: outcome,
             recorder,
+            ..FakeEngine::default()
+        }
+    }
+
+    /// A fake whose `set_breakpoint` returns the scripted replies in order (then the default
+    /// verified bp once the queue drains), sharing `recorder` so a test can read back the marshaled
+    /// `(BpLoc, condition)` of each call. Used by the breakpoint-setter tests.
+    pub fn with_scripted_bps(
+        scripted: Vec<ScriptedBp>,
+        recorder: Arc<Mutex<Recorder>>,
+    ) -> FakeEngine {
+        FakeEngine {
+            recorder,
+            scripted_bps: Mutex::new(scripted.into_iter().collect()),
             ..FakeEngine::default()
         }
     }
@@ -218,18 +252,34 @@ impl EngineOps for FakeEngine {
         loc: &BpLoc,
         condition: &str,
     ) -> Result<BreakpointResult, EngineError> {
+        // Record the marshaled location + condition FIRST (proves which bps the backend asked the
+        // engine to set; a malformed line the backend skips never reaches here, so its absence is
+        // itself the assertion).
         self.recorder()
             .breakpoints
             .push((RecordedBp::from_loc(loc), condition.to_string()));
-        Ok(BreakpointResult {
-            id: 1,
-            verified: true,
-            line: 0,
-            message: String::new(),
-        })
+        // Pop the next scripted reply (per call, in order); fall back to the default verified bp.
+        let next = self
+            .scripted_bps
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop_front();
+        match next {
+            Some(ScriptedBp::Ok(result)) => Ok(result),
+            Some(ScriptedBp::Err(err)) => Err(err),
+            None => Ok(BreakpointResult {
+                id: 1,
+                verified: true,
+                line: 0,
+                message: String::new(),
+            }),
+        }
     }
 
-    fn remove_breakpoint(&mut self, _id: i64) -> Result<(), EngineError> {
+    fn remove_breakpoint(&mut self, id: i64) -> Result<(), EngineError> {
+        // Record the removed id so a reconcile test can prove the stale-removal path actually ran
+        // (the backend asked the engine to drop exactly this breakpoint).
+        self.recorder().removes.push(id);
         Ok(())
     }
 

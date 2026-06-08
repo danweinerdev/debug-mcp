@@ -117,11 +117,9 @@ async fn protocol_windbg_advertises_25_tools_and_debug_identity() {
 /// error/panic).
 ///
 /// The breakpoint-driven slice of the C++ scenario (set/list/remove breakpoints, then
-/// continue INTO `compute` to inspect `sum`/`i`/`n`) is split out into the `#[ignore]`d
-/// [`normal_session_breakpoints_blocked_on_task_3_3`] below — `windbg-backend`'s
-/// `set_source_breakpoints`/`set_function_breakpoints` are still Phase-3.3 placeholders
-/// (`"not yet implemented (phase 3.3)"`). Without breakpoints the target cannot be stopped
-/// inside `compute`, so the locals/continue-to-breakpoint assertions await Task 3.3.
+/// continue INTO `compute` to inspect `sum`/`i`/`n`) is split out into
+/// [`normal_session_breakpoint_workflow`] below, which exercises `windbg-backend`'s runtime
+/// `set_source_breakpoints`/`set_function_breakpoints` (now implemented).
 #[tokio::test]
 async fn normal_session_workflow() {
     if should_skip_windbg("normal_session_workflow") {
@@ -281,17 +279,15 @@ async fn normal_session_workflow() {
     assert_eq!(h.state(), State::Idle);
 }
 
-/// The breakpoint-driven slice of the Normal scenario, BLOCKED on Task 3.3: set a function
-/// breakpoint on `compute` and `main`, list them, remove one, then `continue` into `compute`
-/// and inspect its locals (`sum`/`i`/`n`). `windbg-backend`'s `set_function_breakpoints` is
-/// still a Phase-3.3 placeholder (returns `"set_function_breakpoints: not yet implemented
-/// (phase 3.3)"`), so this is `#[ignore]`d until that lands — running it documents the gap
-/// (the very first breakpoint call fails). Remove the `#[ignore]` once Task 3.3 wires the
-/// DbgEng `SetBreakpoint` marshaling.
+/// The breakpoint-driven slice of the Normal scenario (now that `windbg-backend`'s runtime
+/// `set_function_breakpoints` is implemented): set a function breakpoint on `compute` and
+/// `main`, list them, remove one, then `continue` into `compute` and inspect its locals
+/// (`sum`/`i`/`n`). Goes through the real `set_function_breakpoint`/`list_breakpoints`/
+/// `remove_breakpoint`/`continue` tool handlers end-to-end. Skips cleanly if the fixture is
+/// absent; must pass when it is present.
 #[tokio::test]
-#[ignore = "blocked on Task 3.3: windbg-backend set_function_breakpoints is a placeholder"]
-async fn normal_session_breakpoints_blocked_on_task_3_3() {
-    if should_skip_windbg("normal_session_breakpoints_blocked_on_task_3_3") {
+async fn normal_session_breakpoint_workflow() {
+    if should_skip_windbg("normal_session_breakpoint_workflow") {
         return;
     }
     let _guard = live_guard().await;
