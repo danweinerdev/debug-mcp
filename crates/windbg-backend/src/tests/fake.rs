@@ -68,6 +68,24 @@ pub struct Recorder {
     /// here proves the ordering (flag-then-detach) directly, not merely the post-condition — a
     /// detach that raced ahead of the flag would record `false`.
     pub interrupt_flag_at_detach: Vec<bool>,
+    /// The `(thread_id, max)` of each `stack_trace` call, in order — proves the backend's
+    /// fetch-bound (`start + levels`) and thread selection.
+    pub stack_traces: Vec<(i64, i64)>,
+    /// The `frame_index` of each `locals` call, in order — proves `variables` decoded the frame
+    /// index from the scope's `variables_reference` (`reference - 1`).
+    pub locals_frames: Vec<i64>,
+    /// The `expr` of each `evaluate` call, in order — proves `evaluate(Expression)` forms the
+    /// `?? expr` (here the fake's `evaluate` mirrors the real engine, prefixing `?? `).
+    pub evaluates: Vec<String>,
+    /// The raw `command` of each `execute` call, in order — proves `evaluate(Repl)` marshals the
+    /// command VERBATIM (no backtick prefix) through `Execute`.
+    pub executes: Vec<String>,
+    /// The `(address, size)` of each `read_memory` call, in order — proves the address parse and
+    /// the count → size mapping.
+    pub read_memories: Vec<(u64, usize)>,
+    /// The `(address, count)` of each `disassemble` call, in order — proves the address parse and
+    /// that the requested count is honored verbatim.
+    pub disassembles: Vec<(u64, i64)>,
 }
 
 /// A scripted engine. Each field is the canned reply for the matching [`EngineOps`] method; the
@@ -85,6 +103,18 @@ pub struct FakeEngine {
     pub interrupt_flag: Arc<AtomicBool>,
     /// The shared call recorder (breakpoint flush, detach terminate flag, go/step/break_in calls).
     pub recorder: Arc<Mutex<Recorder>>,
+    /// Canned frames `stack_trace` returns (before the backend's `start`/`levels` window).
+    pub frames: Vec<Frame>,
+    /// Canned locals `locals` returns (the inspection translation table).
+    pub locals: Vec<Variable>,
+    /// Canned `evaluate` output text (the real engine prefixes `?? `; the fake mirrors that).
+    pub evaluate_result: String,
+    /// Canned `execute` output text (the raw-command result for `evaluate(Repl)`).
+    pub execute_result: String,
+    /// Canned bytes `read_memory` returns (truncated to the requested `size`).
+    pub memory: Vec<u8>,
+    /// Canned instructions `disassemble` returns.
+    pub instructions: Vec<Instruction>,
 }
 
 impl Default for FakeEngine {
@@ -101,6 +131,12 @@ impl Default for FakeEngine {
             go_returns_none: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             recorder: Arc::new(Mutex::new(Recorder::default())),
+            frames: Vec::new(),
+            locals: Vec::new(),
+            evaluate_result: String::new(),
+            execute_result: String::new(),
+            memory: Vec::new(),
+            instructions: Vec::new(),
         }
     }
 }
@@ -205,35 +241,50 @@ impl EngineOps for FakeEngine {
         Ok(self.threads.clone())
     }
 
-    fn stack_trace(&mut self, _thread_id: i64, _max: i64) -> Result<Vec<Frame>, EngineError> {
-        Ok(Vec::new())
+    fn stack_trace(&mut self, thread_id: i64, max: i64) -> Result<Vec<Frame>, EngineError> {
+        self.recorder().stack_traces.push((thread_id, max));
+        Ok(self.frames.clone())
     }
 
-    fn locals(&mut self, _frame_index: i64) -> Result<Vec<Variable>, EngineError> {
-        Ok(Vec::new())
+    fn locals(&mut self, frame_index: i64) -> Result<Vec<Variable>, EngineError> {
+        self.recorder().locals_frames.push(frame_index);
+        Ok(self.locals.clone())
     }
 
-    fn evaluate(&mut self, _expr: &str) -> Result<EvalResult, EngineError> {
+    fn evaluate(&mut self, expr: &str) -> Result<EvalResult, EngineError> {
+        // Mirror the real `Engine::evaluate`: it runs `?? <expr>` through Execute. The fake records
+        // the FORMED command so a test can assert `evaluate(Expression)` reached the engine as
+        // `?? expr` (the C++ plugin's expression-eval form).
+        let command = format!("?? {expr}");
+        self.recorder().evaluates.push(command);
         Ok(EvalResult {
-            result: String::new(),
+            result: self.evaluate_result.clone(),
             ty: String::new(),
             variables_reference: 0,
         })
     }
 
-    fn read_memory(&mut self, address: u64, _size: usize) -> Result<MemoryRead, EngineError> {
+    fn read_memory(&mut self, address: u64, size: usize) -> Result<MemoryRead, EngineError> {
+        self.recorder().read_memories.push((address, size));
+        // Truncate the canned bytes to the requested size (the engine returns at most `size` bytes).
+        let mut data = self.memory.clone();
+        data.truncate(size);
         Ok(MemoryRead {
             address: format!("0x{address:016X}"),
-            data: Vec::new(),
+            data,
         })
     }
 
-    fn disassemble(&mut self, _address: u64, _count: i64) -> Result<Vec<Instruction>, EngineError> {
-        Ok(Vec::new())
+    fn disassemble(&mut self, address: u64, count: i64) -> Result<Vec<Instruction>, EngineError> {
+        self.recorder().disassembles.push((address, count));
+        Ok(self.instructions.clone())
     }
 
-    fn execute(&mut self, _command: &str) -> Result<String, EngineError> {
-        Ok(String::new())
+    fn execute(&mut self, command: &str) -> Result<String, EngineError> {
+        // Record the RAW command verbatim so a test can prove `evaluate(Repl)` marshaled it with no
+        // backtick prefix (the `??`-wrapping is only the Expression path, handled in `evaluate`).
+        self.recorder().executes.push(command.to_string());
+        Ok(self.execute_result.clone())
     }
 
     fn modules(&mut self) -> Result<Vec<ModuleInfo>, EngineError> {

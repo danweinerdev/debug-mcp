@@ -156,6 +156,26 @@ pub(crate) async fn poll_for_process(
     }
 }
 
+/// Parse a neutral address string (`read_memory`/`disassemble`'s `address` arg) into a `u64`.
+/// Accepts a `0x`/`0X`-prefixed hex address or a plain decimal address (the two forms the tool
+/// layer can carry — an IP reference like `Frame::instruction_pointer` is `0x{:016X}`). A
+/// malformed address is a user-facing failure carried in [`BackendError::Dap`] (the neutral
+/// "the debugger reported an error" channel), not a transport error.
+pub(crate) fn parse_address(address: &str) -> Result<u64, BackendError> {
+    let trimmed = address.trim();
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)
+    } else {
+        trimmed.parse::<u64>()
+    };
+    parsed.map_err(|_| BackendError::Dap {
+        message: format!("invalid address: '{address}'"),
+    })
+}
+
 /// Map a `dbgeng-sys` [`EngineError`] onto the neutral [`BackendError`]. The full per-op Go-string
 /// wording is owned by the tool layer / later tasks; here we carry the engine's verbatim message
 /// in the closest neutral variant so nothing is lost: a COM/engine failure becomes
@@ -402,60 +422,234 @@ impl DebuggerBackend for WinDbgBackend {
 
     async fn stack_trace(
         &self,
-        _thread_id: i64,
-        _start: i64,
-        _levels: i64,
+        thread_id: i64,
+        start: i64,
+        levels: i64,
     ) -> Result<(Vec<Frame>, i64), BackendError> {
-        // TODO(3.4): marshal EngineCmd::StackTrace (thread_id, max=levels) and compute total_frames.
-        Err(BackendError::Send(
-            "stack_trace: not yet implemented (phase 3.4)".into(),
-        ))
+        // Marshal the call-stack walk to the engine, which produces neutral `Frame`s already
+        // (index/id = frame index, symbolicated `name`, `source_path`/`line` via GetLineByOffset,
+        // and the IP as the `0x{:016X}` `instruction_pointer`) — the same shape lldb's DAP mapping
+        // emits, so the `backtrace` handler formats them byte-identically.
+        //
+        // Frame request semantics: the engine has no separate "start frame" parameter (DbgEng's
+        // GetStackTrace always walks from the top), so we ask it for the frames we need —
+        // `start + levels` from the top — and apply the `start`/`levels` window here, mirroring the
+        // DAP `startFrame`/`levels` slicing the handler expects. `levels <= 0` means "all frames"
+        // in the neutral contract (the handler only passes a positive `levels` or its 20 default,
+        // but `resolve_frame_id` always passes 20); we then clamp the engine `max` to a sane bound.
+        let start = start.max(0);
+        // How many frames to fetch from the top: `start + levels` when a positive window is asked
+        // for, else a generous cap (the engine clamps to [1, 1024]).
+        let fetch_max = if levels > 0 {
+            start.saturating_add(levels)
+        } else {
+            1024
+        };
+
+        let frames = self
+            .call(|reply| EngineCmd::StackTrace {
+                thread_id,
+                max: fetch_max,
+                reply,
+            })
+            .await?;
+
+        // `total_frames` is the count of frames FETCHED in THIS request (the DAP `totalFrames`
+        // analog the handler echoes), computed BEFORE the `start` slice. It is NOT the true stack
+        // depth: the engine returns at most `fetch_max` (= `start + levels`) frames, so this count
+        // is bounded by the fetch window, not the whole stack. Getting the true depth would cost an
+        // extra unconditional walk to the engine frame cap (a separate `GetStackTrace` round-trip)
+        // on every request — `Engine::stack_trace` exposes no cheaper depth — so we deliberately do
+        // not pay it.
+        //
+        // Why this is correct for every CURRENT caller: each tool-layer caller passes `start = 0`
+        // (`handle_backtrace`, `resolve_frame_id`, and the `read_memory` IP lookup all pass 0), so
+        // `fetch_max == levels` and the fetched window IS the full stack (up to `levels`/the engine
+        // cap) — `total_frames` equals the true depth for them.
+        //
+        // CAVEAT for a future `start > 0` paginating caller: with `start > 0` the engine still walks
+        // from the top and caps at `start + levels`, so `total_frames` reflects only that fetched
+        // prefix, NOT the full stack depth. Such a caller must not treat `total_frames` as the total
+        // stack size for pagination; closing that gap needs a true-depth walk here (or an engine
+        // depth query) before the `start` slice.
+        let total_frames = frames.len() as i64;
+
+        // Apply the `start` window. The engine already capped the count at `fetch_max`, so a
+        // positive `levels` is honored by the fetch bound; here we only drop the leading `start`
+        // frames. The engine numbers frames by their absolute index (0 = innermost), which we keep
+        // as `Frame::index`/`Frame::id` so the frame-map the handler builds (index → id) stays
+        // consistent across a windowed request.
+        let windowed: Vec<Frame> = frames.into_iter().skip(start as usize).collect();
+        Ok((windowed, total_frames))
     }
 
-    async fn scopes(&self, _frame_id: i64) -> Result<Vec<Scope>, BackendError> {
-        // TODO(3.4): DbgEng has no DAP scopes; synthesize a Locals scope whose variables_reference
-        // encodes the frame so `variables` can fetch locals via EngineCmd::Locals.
-        Err(BackendError::Send(
-            "scopes: not yet implemented (phase 3.4)".into(),
-        ))
+    async fn scopes(&self, frame_id: i64) -> Result<Vec<Scope>, BackendError> {
+        // DbgEng has no DAP `scopes` request: locals are read per frame via the symbol-group API
+        // (`Engine::locals(frame_index)`). We synthesize the single scope the inspection handler
+        // needs — a "Locals" group (the case-insensitive `local` scope match in
+        // `inspection.rs::scope_matches`) — whose `variables_reference` ENCODES the frame so a
+        // later `variables(reference)` can recover the frame index and fetch its locals.
+        //
+        // Encoding: `variables_reference = frame_id + 1`. The `+1` offset is load-bearing — the
+        // flatten algorithm (`flatten_variables`) only treats a reference as expandable when it is
+        // `> 0`, so frame 0 must not map to reference 0. `variables()` decodes it back with `- 1`.
+        // `frame_id` is the engine frame index (`Frame::id == Frame::index` from `stack_trace`).
+        //
+        // Saturation note: `frame_id` is always a value that came from `stack_trace` via the tool
+        // layer's `resolve_frame_id` (the only path that supplies a `frame_id`), so it is bounded by
+        // the stack depth (≤ the engine's 1024-frame cap — `Engine::stack_trace` clamps `max` to
+        // `[1, 1024]` and numbers frames `0..filled`). The `saturating_add(1)` therefore never
+        // saturates in practice (frame_id ≪ i64::MAX); the saturating form is just a belt-and-braces
+        // guard against an arithmetic overflow rather than a reachable path. `variables` also rejects
+        // an implausibly large reference (see there), so a saturated reference would round-trip to a
+        // rejected, non-expandable value rather than silently breaking the `+1`/`-1` round-trip.
+        //
+        // This mirrors lldb's structure: lldb returns a `Locals` `Scope` with a DAP
+        // variablesReference; we return a `Locals` `Scope` with our frame-encoded reference. The
+        // handler's scope match and flatten are identical for both. (lldb also surfaces Globals /
+        // Registers scopes; WinDbg's locals path covers only Locals — the C++ windbg-mcp plugin
+        // likewise exposed only `get_locals`, so a Globals/Registers scope has no WinDbg analog and
+        // is intentionally absent.)
+        let reference = frame_id.saturating_add(1);
+        Ok(vec![Scope {
+            name: "Locals".to_string(),
+            variables_reference: reference,
+        }])
     }
 
-    async fn variables(&self, _variables_reference: i64) -> Result<Vec<Variable>, BackendError> {
-        // TODO(3.4): decode the frame from variables_reference and marshal EngineCmd::Locals.
-        Err(BackendError::Send(
-            "variables: not yet implemented (phase 3.4)".into(),
-        ))
+    async fn variables(&self, variables_reference: i64) -> Result<Vec<Variable>, BackendError> {
+        // Decode the frame index from the reference produced by `scopes` (`frame_id + 1`). A
+        // reference `<= 0` is not one we minted (the handler only ever passes a reference it got
+        // from our `scopes`, but guard anyway) — there are no nested child references under WinDbg
+        // (see the LIMITATION below), so anything we did not mint has no locals to fetch.
+        //
+        // We also reject an implausibly large reference. A reference we mint is `frame_id + 1`, and
+        // `frame_id` is bounded by the engine's frame cap (≤ 1024 — see `scopes`), so a legitimate
+        // reference is ≤ 1025. `MAX_FRAME_REFERENCE` is a generous bound well above that; a reference
+        // beyond it cannot be one we minted (it would imply a frame index past the cap, or a
+        // saturated `frame_id + 1`), so we treat it as "no locals to fetch" rather than passing a
+        // bogus frame index to the engine. This makes the `+1`/`-1` round-trip self-documenting and
+        // robust even at the `i64::MAX` corner without over-engineering.
+        const MAX_FRAME_REFERENCE: i64 = 1 << 20;
+        if variables_reference <= 0 || variables_reference > MAX_FRAME_REFERENCE {
+            return Ok(Vec::new());
+        }
+        let frame_index = variables_reference - 1;
+
+        // Marshal the per-frame locals read. The engine returns neutral `Variable`s already
+        // (name/value/type from the DEBUG_SCOPE_GROUP_LOCALS symbol group), with
+        // `variables_reference`/`named`/`indexed` all 0.
+        //
+        // LIMITATION (nested expansion): WinDbg locals come back as a FLAT, top-level-only list.
+        // The `dbgeng-sys` symbol-group surface (`read_scope_locals`) does not expand child members
+        // (struct fields / array elements / pointee), so every `Variable` carries
+        // `variables_reference = 0` and `named = indexed = 0`. This is a deliberate, design-deferred
+        // gap (Plan 03 §3.4 — deep nested expansion is not in scope): the `flatten_variables`
+        // algorithm sees a leaf for each local (reference 0 → no recursion, `has_children` stays
+        // false), so the top level formats correctly and nothing is silently dropped — a struct
+        // local simply renders with its summary `value` text and no expandable children. lldb, by
+        // contrast, returns a positive `variables_reference` + a `named`/`indexed` child count for a
+        // container, which the flatten then expands. Closing this gap needs a `dbgeng-sys`
+        // child-symbol-expansion path (ExpandSymbol / GetSymbolEntryInformation), tracked for a
+        // later phase; until then WinDbg `variables` is intentionally one level deep.
+        self.call(|reply| EngineCmd::Locals { frame_index, reply })
+            .await
     }
 
     async fn evaluate(
         &self,
-        _expr: &str,
+        expr: &str,
         _frame_id: Option<i64>,
-        _mode: EvalMode,
+        mode: EvalMode,
     ) -> Result<EvalResult, BackendError> {
-        // TODO(3.4): Expression → EngineCmd::Evaluate; Repl → EngineCmd::Execute (raw command,
-        // no backtick — supports_command_repl_mode() is true).
-        Err(BackendError::Send(
-            "evaluate: not yet implemented (phase 3.4)".into(),
-        ))
+        // `_frame_id` is intentionally ignored: the engine evaluates in the CURRENT scope (the C++
+        // windbg-mcp plugin evaluated in the current frame too — there is no per-call frame-scoped
+        // evaluate on this surface; the active frame is set by the last stop/stack walk).
+        //
+        // OBSERVABLE PARITY DIFFERENCE (deliberate): the lldb/DAP backend HONORS `frameId` —
+        // `evaluate` there runs in the requested frame's scope, so the same expression can yield a
+        // different value per frame. WinDbg here always evaluates in the innermost (current) stopped
+        // frame regardless of `_frame_id`, so a non-current `frame_id` is silently evaluated in the
+        // current scope, not the requested one. This is a real behavior difference a future reader
+        // must know is intentional, not an oversight. Closing it needs DbgEng frame-scope switching
+        // around the evaluate (`IDebugSymbols::SetScope` / `SetScopeFrameByIndex` to the requested
+        // frame, evaluate, then `ResetScope` — the same scope dance `Engine::locals` already does
+        // for per-frame locals), tracked for a later phase.
+        match mode {
+            // Expression evaluation: the C++ plugin runs `?? <expr>` (the readable C++-expression
+            // evaluator) through Execute. `Engine::evaluate` already wraps `expr` as `?? expr` and
+            // returns the trimmed output as the `result` (type/var_reference left empty/0 — the
+            // `??` text carries the type inline, and there is no structured child reference). The
+            // `evaluate` handler renders `result`/`type` and only adds children when
+            // `variables_reference > 0`, so a 0 reference formats identically to an lldb scalar.
+            EvalMode::Expression => {
+                self.call(|reply| EngineCmd::Evaluate {
+                    expr: expr.to_string(),
+                    reply,
+                })
+                .await
+            }
+            // Repl / raw-command mode (the `run_command` tool's escape hatch): run the command
+            // verbatim through `Engine::execute`. `supports_command_repl_mode()` is `true`, so the
+            // handler passes the RAW command with NO backtick prefix (the backtick is only for
+            // legacy lldb-vscode). We map the captured command output into the `result` field and
+            // leave type/var_reference empty/0 (a raw command has no typed value or children).
+            EvalMode::Repl => {
+                let output = self
+                    .call(|reply| EngineCmd::Execute {
+                        command: expr.to_string(),
+                        reply,
+                    })
+                    .await?;
+                Ok(EvalResult {
+                    result: output,
+                    ty: String::new(),
+                    variables_reference: 0,
+                })
+            }
+        }
     }
 
-    async fn read_memory(&self, _address: &str, _count: i64) -> Result<MemoryRead, BackendError> {
-        // TODO(3.4): parse the address string → u64 and marshal EngineCmd::ReadMemory.
-        Err(BackendError::Send(
-            "read_memory: not yet implemented (phase 3.4)".into(),
-        ))
+    async fn read_memory(&self, address: &str, count: i64) -> Result<MemoryRead, BackendError> {
+        // Parse the neutral address string → u64. The tool layer passes a hex (`0x…`) or decimal
+        // address; accept both. A malformed address is a user-facing error (carried in the closest
+        // neutral variant), not a transport failure.
+        let parsed = parse_address(address)?;
+
+        // A non-positive count reads nothing (the tool layer clamps to a positive size; guard the
+        // i64→usize conversion so a negative value cannot wrap to a huge allocation).
+        let size = usize::try_from(count.max(0)).unwrap_or(0);
+
+        // The engine reads up to `size` bytes (truncating to the bytes actually read at a page
+        // boundary) and echoes the address as `0x{:016X}`, exactly the `MemoryRead` shape the
+        // `read_memory` handler formats (it base64-encodes `data` and reports `bytes_read`).
+        self.call(|reply| EngineCmd::ReadMemory {
+            address: parsed,
+            size,
+            reply,
+        })
+        .await
     }
 
     async fn disassemble(
         &self,
-        _address: &str,
-        _count: i64,
+        address: &str,
+        count: i64,
     ) -> Result<Vec<Instruction>, BackendError> {
-        // TODO(3.4): parse the address string → u64 and marshal EngineCmd::Disassemble.
-        Err(BackendError::Send(
-            "disassemble: not yet implemented (phase 3.4)".into(),
-        ))
+        // Parse the neutral address string → u64 (hex or decimal), same as `read_memory`.
+        let parsed = parse_address(address)?;
+
+        // Honor the `count` passed by the tool layer verbatim (the project-wide
+        // `instruction_count = 20` default is a tool-layer concern; the backend disassembles
+        // exactly what it is asked for). The engine renders each instruction's address
+        // (`0x{:016X}`) and mnemonic text into neutral `Instruction`s (bytes/symbol left empty —
+        // the text line carries the mnemonic), the shape the `disassemble` handler formats.
+        self.call(|reply| EngineCmd::Disassemble {
+            address: parsed,
+            count,
+            reply,
+        })
+        .await
     }
 
     // --- capability ---

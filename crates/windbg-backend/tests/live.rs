@@ -12,8 +12,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use debugger_core::{
-    AttachOutcome, AttachSpec, BackendEvent, BackendFactory, FunctionBp, LaunchOutcome, LaunchSpec,
-    StepKind, StopOutcome,
+    AttachOutcome, AttachSpec, BackendEvent, BackendFactory, EvalMode, FunctionBp, LaunchOutcome,
+    LaunchSpec, StepKind, StopOutcome,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -231,6 +231,176 @@ fn cont_hits_breakpoint_then_runs_to_exit() {
         }
 
         backend.disconnect(false).await;
+    });
+}
+
+/// Full inspection path (3.4): launch with a `compute` function breakpoint → `cont` to it →
+/// `stack_trace` finds `compute` and `main` (names + a source line) → `scopes(frame0)` returns a
+/// Locals scope → `variables(localsRef)` includes `compute`'s locals → `evaluate(Repl, "k")` and
+/// `evaluate(Expression, "10 + 10")` both return output → `read_memory`/`disassemble` at the
+/// current IP return data. Drives the real engine through the marshaling layer end-to-end.
+#[test]
+fn inspection_at_compute_breakpoint() {
+    if should_skip() {
+        return;
+    }
+    let _guard = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+
+    runtime().block_on(async {
+        let conn = WinDbgFactory::new()
+            .connect()
+            .await
+            .expect("connect a live WinDbg backend");
+        let backend = conn.backend;
+
+        // Launch stops at the loader break and flushes the pending `compute` breakpoint.
+        match backend
+            .launch(launch_spec_with_compute_bp())
+            .await
+            .expect("launch")
+        {
+            LaunchOutcome::Stopped(_) => {}
+            other => panic!("launch must stop at the loader break, got {other:?}"),
+        }
+
+        // Run to the `compute` breakpoint.
+        let thread_id = match backend.cont(0).await.expect("cont to the breakpoint") {
+            StopOutcome::Stopped(info) => {
+                let reason = info.reason.to_ascii_lowercase();
+                assert!(
+                    reason.contains("breakpoint") || !info.hit_breakpoint_ids.is_empty(),
+                    "the cont should stop at the compute breakpoint, got {info:?}"
+                );
+                info.thread_id
+            }
+            other => panic!("cont should hit the breakpoint (Stopped), got {other:?}"),
+        };
+
+        // stack_trace finds `compute` (innermost) and `main` among the frames, with source lines.
+        let (frames, total) = backend
+            .stack_trace(thread_id, 0, 20)
+            .await
+            .expect("stack_trace at the breakpoint");
+        assert!(total > 0, "the walked stack must be non-empty");
+        assert!(
+            frames.iter().any(|f| f.name.contains("compute")),
+            "stack_trace should find `compute` in the frames, got {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f.name.contains("main")),
+            "stack_trace should find `main` in the frames, got {frames:?}"
+        );
+        // At least one frame maps to a source line (compute's source line is known).
+        assert!(
+            frames.iter().any(|f| f.source_path.is_some() && f.line > 0),
+            "at least one frame should carry a source path + line, got {frames:?}"
+        );
+
+        // Identify the `compute` frame; scope/variables are read against its id.
+        let compute_frame = frames
+            .iter()
+            .find(|f| f.name.contains("compute"))
+            .expect("a compute frame");
+
+        // scopes(frame) returns a Locals scope.
+        let scopes = backend
+            .scopes(compute_frame.id)
+            .await
+            .expect("scopes at the compute frame");
+        let locals_scope = scopes
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case("locals"))
+            .expect("a Locals scope");
+        assert!(
+            locals_scope.variables_reference > 0,
+            "the Locals scope reference must be positive (frame-encoded)"
+        );
+
+        // variables(localsRef) includes compute's locals (`sum` / `i`) with sane type+value.
+        let vars = backend
+            .variables(locals_scope.variables_reference)
+            .await
+            .expect("variables in the compute frame");
+        assert!(
+            vars.iter()
+                .any(|v| v.name == "sum" || v.name == "i" || v.name == "n"),
+            "compute's locals (sum/i/n) should appear, got {vars:?}"
+        );
+        assert!(
+            vars.iter().all(|v| v.variables_reference == 0),
+            "WinDbg top-level locals are flat (no nested child reference), got {vars:?}"
+        );
+
+        // evaluate(Repl, "k") returns the stack as raw command output (non-empty).
+        let repl = backend
+            .evaluate("k", None, EvalMode::Repl)
+            .await
+            .expect("evaluate repl `k`");
+        assert!(
+            !repl.result.trim().is_empty(),
+            "evaluate(Repl, `k`) should return non-empty command output, got {repl:?}"
+        );
+
+        // evaluate(Expression, "10 + 10") returns a value.
+        let expr = backend
+            .evaluate("10 + 10", Some(compute_frame.id), EvalMode::Expression)
+            .await
+            .expect("evaluate expression");
+        assert!(
+            !expr.result.trim().is_empty(),
+            "evaluate(Expression, `10 + 10`) should return a value, got {expr:?}"
+        );
+
+        // evaluate with a NON-current frame_id documents the WinDbg parity limitation: the backend
+        // IGNORES `frame_id` and always evaluates in the innermost (current) stopped frame — unlike
+        // the lldb/DAP backend, which evaluates in the requested frame (see `backend.rs::evaluate`).
+        // We pass `main`'s frame id (an outer frame, NOT `compute`'s innermost) and assert evaluate
+        // still SUCCEEDS with a value. We deliberately do NOT assert a frame-specific value, because
+        // the value comes from the current scope, not the requested frame — asserting otherwise would
+        // contradict the documented limitation. This pins that a non-current `frame_id` does not
+        // error and is silently evaluated in the current scope.
+        let main_frame = frames
+            .iter()
+            .find(|f| f.name.contains("main"))
+            .expect("a main frame");
+        assert_ne!(
+            main_frame.id, compute_frame.id,
+            "main must be a different (non-current) frame than compute for this to be meaningful"
+        );
+        let expr_outer = backend
+            .evaluate("10 + 10", Some(main_frame.id), EvalMode::Expression)
+            .await
+            .expect(
+                "evaluate with a non-current frame_id must still succeed (frame_id is ignored)",
+            );
+        assert!(
+            !expr_outer.result.trim().is_empty(),
+            "evaluate with a non-current frame_id should still return a value (evaluated in the \
+             current scope, since WinDbg ignores frame_id), got {expr_outer:?}"
+        );
+
+        // read_memory at the frame's IP returns the requested byte count; disassemble returns > 0.
+        let ip = compute_frame
+            .instruction_pointer
+            .as_deref()
+            .expect("the compute frame has an instruction pointer");
+        let mem = backend
+            .read_memory(ip, 16)
+            .await
+            .expect("read_memory at IP");
+        assert_eq!(
+            mem.data.len(),
+            16,
+            "read_memory should return the requested 16 bytes at a valid IP, got {} bytes",
+            mem.data.len()
+        );
+        let insns = backend.disassemble(ip, 4).await.expect("disassemble at IP");
+        assert!(
+            !insns.is_empty(),
+            "disassemble at the IP should return at least one instruction"
+        );
+
+        backend.disconnect(true).await;
     });
 }
 

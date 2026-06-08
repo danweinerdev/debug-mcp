@@ -4,6 +4,7 @@
 
 mod execution;
 mod fake;
+mod inspection;
 mod lifecycle;
 mod marshal;
 
