@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use dbgeng_sys::{find_process_by_name, BpLoc, InterruptHandle, LaunchReq};
 use debugger_core::{
-    AttachOutcome, AttachSpec, BackendError, BreakpointResult, DebuggerBackend, EvalMode,
-    EvalResult, Frame, FunctionBp, Granularity, Instruction, LaunchOutcome, LaunchSpec, MemoryRead,
-    ModuleInfo, Scope, SourceBp, StepKind, StopOutcome, ThreadInfo, Variable,
+    AttachOutcome, AttachSpec, BackendError, BreakpointResult, DebuggerBackend, DumpOutcome,
+    EvalMode, EvalResult, Frame, FunctionBp, Granularity, Instruction, LaunchOutcome, LaunchSpec,
+    MemoryRead, ModuleInfo, Scope, SourceBp, StepKind, StopOutcome, ThreadInfo, Variable,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -255,6 +255,21 @@ pub(crate) fn parse_address(address: &str) -> Result<u64, BackendError> {
     })
 }
 
+/// Map an engine [`StopOutcome`] onto the neutral [`AttachOutcome`] both `attach` and
+/// `attach_kernel` return. The two outcome enums are structurally parallel (Stopped/Exited/
+/// Terminated), so this is a 1:1 translation: `Stopped`→`Stopped`, `Exited{code}`→`Exited{code}`,
+/// `Terminated`→`Terminated`. Factored out so `attach` (attach-by-pid / `wait_for`) and
+/// `attach_kernel` (KDNET kernel attach) share one mapping rather than each inlining it — they
+/// differ only in WHICH engine command produces the `StopOutcome`, not in how it maps to the
+/// neutral attach result.
+fn stop_to_attach(outcome: StopOutcome) -> AttachOutcome {
+    match outcome {
+        StopOutcome::Stopped(info) => AttachOutcome::Stopped(info),
+        StopOutcome::Exited { code } => AttachOutcome::Exited { code },
+        StopOutcome::Terminated => AttachOutcome::Terminated,
+    }
+}
+
 /// Map a `dbgeng-sys` [`EngineError`] onto the neutral [`BackendError`]. The full per-op Go-string
 /// wording is owned by the tool layer / later tasks; here we carry the engine's verbatim message
 /// in the closest neutral variant so nothing is lost: a COM/engine failure becomes
@@ -426,11 +441,7 @@ impl DebuggerBackend for WinDbgBackend {
         let outcome = self
             .call(|reply| EngineCmd::AttachPid { pid, reply })
             .await?;
-        Ok(match outcome {
-            StopOutcome::Stopped(info) => AttachOutcome::Stopped(info),
-            StopOutcome::Exited { code } => AttachOutcome::Exited { code },
-            StopOutcome::Terminated => AttachOutcome::Terminated,
-        })
+        Ok(stop_to_attach(outcome))
     }
 
     async fn disconnect(&self, terminate: bool) {
@@ -978,7 +989,50 @@ impl DebuggerBackend for WinDbgBackend {
         self.call(|reply| EngineCmd::Modules { reply }).await
     }
 
-    // open_dump / attach_kernel are Phase-4 engine stubs; analyze is 3.x. They inherit the trait's
-    // default `Unsupported` bodies for now and are overridden in their respective tasks.
-    // TODO(3.x/Phase 4): override open_dump, attach_kernel, analyze.
+    async fn open_dump(&self, path: &str) -> Result<DumpOutcome, BackendError> {
+        // Direct marshal: the engine opens the dump and returns the neutral `DumpOutcome` already
+        // (its `stop`/`crash_location` come back unchanged); `call` maps an `EngineError` →
+        // `BackendError`.
+        //
+        // The connect-point flow is the TOOL layer's job, NOT this method's: the `open_crash_dump`
+        // handler (task 4.3) `connect()`s a FRESH WinDbg engine thread for the dump session and
+        // then calls `open_dump` on that backend — exactly like `launch` runs on an
+        // already-connected backend's engine thread. This method only marshals the `OpenDump` op
+        // onto the (already-connected) engine thread; it neither spawns nor selects a backend.
+        self.call(|reply| EngineCmd::OpenDump {
+            path: path.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    async fn attach_kernel(&self, connection: &str) -> Result<AttachOutcome, BackendError> {
+        // Marshal the kernel attach (the engine returns a `StopOutcome`) and map it onto the
+        // neutral `AttachOutcome` via the same `stop_to_attach` helper `attach` uses — kernel
+        // attach is just another path that produces a first-stop outcome.
+        //
+        // The INFINITE-wait caveat lives in the ENGINE (task 4.1): `Engine::attach_kernel` blocks
+        // (uncancellably) until the kernel connection produces its first break, since DbgEng's
+        // kernel-attach has no bounded wait. This method only marshals + maps; it adds no timeout
+        // of its own (the engine thread is occupied for the duration, and teardown for a stuck
+        // kernel wait is the R2 orphan-thread case, Phase 5).
+        let outcome = self
+            .call(|reply| EngineCmd::AttachKernel {
+                connection: connection.to_string(),
+                reply,
+            })
+            .await?;
+        Ok(stop_to_attach(outcome))
+    }
+
+    async fn analyze(&self) -> Result<String, BackendError> {
+        // Direct marshal: the engine runs `!analyze -v` and returns its raw text; `call` maps an
+        // `EngineError` → `BackendError`.
+        //
+        // State guarding is the TOOL layer's job, NOT this method's: the `analyze_crash` handler
+        // (`mcp-tools::handlers::windbg::handle_analyze_crash`) owns the
+        // `check_state(&[State::Stopped])` guard (confirmed present in task 4.1's review), so
+        // `analyze` itself does not re-check state — it only marshals the `Analyze` op.
+        self.call(|reply| EngineCmd::Analyze { reply }).await
+    }
 }

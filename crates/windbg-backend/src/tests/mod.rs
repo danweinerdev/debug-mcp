@@ -4,6 +4,7 @@
 
 mod breakpoints;
 mod execution;
+mod extras;
 mod fake;
 mod inspection;
 mod lifecycle;

@@ -53,6 +53,7 @@ pub trait EngineOps {
     fn current_source_location(&mut self) -> Result<Option<(String, i64)>, EngineError>;
     fn open_dump(&mut self, path: &str) -> Result<DumpOutcome, EngineError>;
     fn attach_kernel(&mut self, connection: &str) -> Result<StopOutcome, EngineError>;
+    fn analyze(&mut self) -> Result<String, EngineError>;
     fn set_output_sink(&mut self, sink: OutputSink);
     /// Mint a `Send` interrupt handle. `&self` — it only clones an `Arc<AtomicBool>` and mutates
     /// nothing (matches `Engine::interrupt_handle`).
@@ -142,6 +143,10 @@ impl EngineOps for Engine {
 
     fn attach_kernel(&mut self, connection: &str) -> Result<StopOutcome, EngineError> {
         Engine::attach_kernel(self, connection)
+    }
+
+    fn analyze(&mut self) -> Result<String, EngineError> {
+        Engine::analyze(self)
     }
 
     fn set_output_sink(&mut self, sink: OutputSink) {

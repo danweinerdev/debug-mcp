@@ -123,6 +123,9 @@ pub enum EngineCmd {
         connection: String,
         reply: Reply<StopOutcome>,
     },
+    Analyze {
+        reply: Reply<String>,
+    },
     /// Install the output sink on the engine (fire-and-forget — no reply). The closure runs on
     /// the engine thread for every output line; per Decision 6 it must be non-blocking.
     SetOutputSink {
@@ -320,6 +323,9 @@ fn dispatch(engine: &mut dyn EngineOps, cmd: EngineCmd) {
         }
         EngineCmd::AttachKernel { connection, reply } => {
             let _ = reply.send(engine.attach_kernel(&connection));
+        }
+        EngineCmd::Analyze { reply } => {
+            let _ = reply.send(engine.analyze());
         }
         EngineCmd::SetOutputSink { sink } => {
             // Fire-and-forget: install the sink, no reply.

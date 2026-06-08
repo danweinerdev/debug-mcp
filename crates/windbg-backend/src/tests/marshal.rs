@@ -5,9 +5,9 @@
 //! There is no longer a "not-yet-implemented placeholder" test here: every `DebuggerBackend`
 //! trait method is implemented in `windbg-backend` (the runtime breakpoint setters were the last
 //! `BackendError::Send("…phase 3.3")` placeholders and now resolve real bps — see
-//! `tests/breakpoints.rs`). The capability-gated `open_dump`/`attach_kernel`/`analyze` inherit the
-//! trait's DEFAULT `Unsupported` bodies (Phase-4 capability work, not crate placeholders), so they
-//! are not the same kind of placeholder and are covered by the tool-layer capability gating.
+//! `tests/breakpoints.rs`). The capability-gated `modules`/`open_dump`/`attach_kernel`/`analyze`
+//! verbs are now all overridden to marshal onto the engine thread (see `tests/extras.rs` for their
+//! marshal/mapping coverage); none inherits the trait's default `Unsupported` body any longer.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

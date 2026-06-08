@@ -89,6 +89,14 @@ pub struct Recorder {
     /// The `(address, count)` of each `disassemble` call, in order — proves the address parse and
     /// that the requested count is honored verbatim.
     pub disassembles: Vec<(u64, i64)>,
+    /// The `path` of each `open_dump` call, in order — proves `open_dump` marshals the dump path
+    /// VERBATIM to the engine.
+    pub open_dumps: Vec<String>,
+    /// The `connection` of each `attach_kernel` call, in order — proves `attach_kernel` marshals
+    /// the KDNET connection string VERBATIM to the engine.
+    pub attach_kernels: Vec<String>,
+    /// The number of `analyze()` calls — proves `analyze` marshals the `Analyze` op to the engine.
+    pub analyzes: u32,
 }
 
 /// One scripted `set_breakpoint` reply, popped in order by [`FakeEngine::set_breakpoint`]. Lets a
@@ -130,6 +138,13 @@ pub struct FakeEngine {
     pub memory: Vec<u8>,
     /// Canned instructions `disassemble` returns.
     pub instructions: Vec<Instruction>,
+    /// Scripted `open_dump` reply: `Ok(DumpOutcome)` (the dump's first-stop info + crash location)
+    /// maps straight through, while `Err(EngineError)` drives the engine-error path (the backend's
+    /// `call` runs it through `map_engine_err` → `BackendError::Dap`).
+    pub dump_outcome: Result<DumpOutcome, EngineError>,
+    /// Scripted `analyze` reply: `Ok(text)` is the `!analyze -v` result, `Err(EngineError)` drives
+    /// the engine-error path (`map_engine_err` → `BackendError::Dap`).
+    pub analyze_result: Result<String, EngineError>,
     /// Scripted `set_breakpoint` replies, consumed front-to-back (one per call). Empty → the
     /// default verified bp. Shared behind a `Mutex` because `set_breakpoint` takes `&mut self` but
     /// the queue is mutated per call; a `VecDeque` pops from the front in call order.
@@ -156,6 +171,11 @@ impl Default for FakeEngine {
             execute_result: String::new(),
             memory: Vec::new(),
             instructions: Vec::new(),
+            dump_outcome: Ok(DumpOutcome {
+                stop: None,
+                crash_location: None,
+            }),
+            analyze_result: Ok("!analyze -v output".to_string()),
             scripted_bps: Mutex::new(std::collections::VecDeque::new()),
         }
     }
@@ -345,15 +365,36 @@ impl EngineOps for FakeEngine {
         Ok(None)
     }
 
-    fn open_dump(&mut self, _path: &str) -> Result<DumpOutcome, EngineError> {
-        Ok(DumpOutcome {
-            stop: None,
-            crash_location: None,
-        })
+    fn open_dump(&mut self, path: &str) -> Result<DumpOutcome, EngineError> {
+        // Record the dump path so a test can prove `open_dump` marshaled it verbatim, then return
+        // the scripted reply: `Ok(DumpOutcome)` maps straight back through the backend, while a
+        // scripted `Err(EngineError)` drives the engine-error path (`map_engine_err`). `EngineError`
+        // is not `Clone`, so take the scripted value out (one call per fake; a benign `Ok` default
+        // is left behind).
+        self.recorder().open_dumps.push(path.to_string());
+        std::mem::replace(
+            &mut self.dump_outcome,
+            Ok(DumpOutcome {
+                stop: None,
+                crash_location: None,
+            }),
+        )
     }
 
-    fn attach_kernel(&mut self, _connection: &str) -> Result<StopOutcome, EngineError> {
+    fn attach_kernel(&mut self, connection: &str) -> Result<StopOutcome, EngineError> {
+        // Record the connection string so a test can prove `attach_kernel` marshaled it verbatim,
+        // then return the canned stop outcome (the backend maps it → AttachOutcome).
+        self.recorder().attach_kernels.push(connection.to_string());
         Ok(self.stop_outcome.clone())
+    }
+
+    fn analyze(&mut self) -> Result<String, EngineError> {
+        // Count the call (proves `analyze` reached the engine) and return the scripted reply:
+        // `Ok(text)` is the `!analyze -v` result, a scripted `Err(EngineError)` drives the
+        // engine-error path. `EngineError` is not `Clone`, so take the scripted value out (one call
+        // per fake; a benign `Ok` default is left behind).
+        self.recorder().analyzes += 1;
+        std::mem::replace(&mut self.analyze_result, Ok(String::new()))
     }
 
     fn set_output_sink(&mut self, mut sink: OutputSink) {
