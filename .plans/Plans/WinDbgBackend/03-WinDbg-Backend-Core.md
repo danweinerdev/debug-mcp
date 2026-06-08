@@ -5,7 +5,7 @@ plan: WinDbgBackend
 phase: 3
 status: in-progress
 created: 2026-06-03
-updated: 2026-06-05
+updated: 2026-06-08
 deliverable: "A Windows-only `windbg-backend` crate (#![forbid(unsafe_code)]) that owns a dedicated MTA-COM engine thread, marshals async DebuggerBackend calls to the dbgeng-sys Engine, translates results to neutral types, and registers WinDbgFactory — so the existing 21 neutral tools drive WinDbg end-to-end, with the Normal/Attach/Pause integration groups green."
 tasks:
   - id: "3.1"
@@ -20,12 +20,12 @@ tasks:
     depends_on: ["3.1"]
   - id: "3.3"
     title: "Execution + pause/interrupt + BackendEvent stream"
-    status: in-progress
+    status: complete
     verification: "`cont`/`step` block and return the next `StopOutcome`; `pause` (and a cancelled `cont` via the request token) breaks the target so it does not run forever (agent recovers with `pause`, mirroring lldb) — **and this holds under both R4 resolutions:** if 2.4 took `SetInterrupt`, `pause` sets the flag + calls `InterruptHandle::interrupt()`; if 2.4 took the flag-only fallback, `pause` sets the flag only and `InterruptHandle::interrupt()` is absent/no-op — the ≤200 ms break requirement is met either way (the handler reads the R4 decision recorded by task 2.4); the output-sink closure runs on the engine thread and contains only a `tokio::mpsc` `send()` (no await, no direct `OutputBuffer` write — Decision 6), with the `BackendEvent::Output` stream built from the receiver on the async side; process exit/EOF emits `BackendEvent::Terminated{code}` and the existing (already-tested) event-pump flips state to `terminated`."
     depends_on: ["3.2"]
   - id: "3.4"
     title: "Inspection / memory translation to neutral types"
-    status: pending
+    status: in-progress
     verification: "Unit tests against `FakeEngine` pin the DbgEng→neutral translation tables (frame/thread/variable/instruction field mapping, scopes→Locals group, `Variable.named`/`indexed`) without a live target; live integration then confirms at a known fixture stop that `threads`/`stack_trace`/`scopes`/`variables`/`evaluate`/`read_memory`/`disassemble` produce neutral structs the **existing** mcp-tools handlers format without modification; a full launch→breakpoint→backtrace(finds `main`)→variables(include locals)→step-over→evaluate flow succeeds through the real tool dispatch path; `run_command` routes a raw WinDbg command through `evaluate(EvalMode::Repl)` → `Engine::execute`."
     depends_on: ["3.3"]
   - id: "3.5"
