@@ -10,12 +10,12 @@ deliverable: "The four WinDbg-only capabilities wired end-to-end: open_crash_dum
 tasks:
   - id: "4.1"
     title: "dbgeng-sys: open_dump / attach_kernel / analyze / modules"
-    status: done
+    status: complete
     verification: "`open_dump(path)` runs `OpenDumpFile` → `WaitForEvent(30s)` and returns a `DumpOutcome` whose `crash_location` comes from `current_source_location()`; `attach_kernel(conn)` validates KDNET and either polls with cancellation (R2 option a) or uses `INFINITE` with the orphan caveat (R2 option b) — the chosen behavior is documented and the bad/unreachable-connection path is covered; `analyze()` runs `!analyze -v` (extensions discovered at runtime per R8) and returns its text; `modules()` lists modules and a unit test asserts the `ModuleInfo` **format contract** (base = `\"0x{:016X}\"`, size = decimal string, symbol_status ∈ {pdb,export,deferred,none}) against a fixed value; dump sessions reject `go`/`step` with the frozen `\"cannot continue a crash-dump session\"` literal. (Phase-entry task; README phase-level `depends_on: [3]` gates the start.)"
     depends_on: []
   - id: "4.2"
     title: "windbg-backend: the four trait methods → engine"
-    status: pending
+    status: in-progress
     verification: "`open_dump`/`attach_kernel`/`analyze`/`modules` trait impls marshal to the engine thread and return the neutral types; `WinDbgFactory::capabilities()` reflects all four as supported; `open_dump`/`attach_kernel` follow the connect-point pattern (a fresh engine thread per session); a dump session correctly maps the `cannot continue a crash-dump session` error from the engine."
     depends_on: ["4.1"]
   - id: "4.3"
