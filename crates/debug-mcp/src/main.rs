@@ -3,7 +3,7 @@
 //! Constructs the neutral [`SessionManager`] and a [`BackendRegistry`], wires them into the
 //! [`ToolServer`], and serves the MCP tools over stdio via rmcp. **Backend registration is
 //! platform-exclusive:** the lldb backend (lldb-dap) is registered on macOS/Linux only; the
-//! WinDbg backend is registered on Windows only (Phase 3). The runtime `backend`-arg switcher
+//! WinDbg backend (DbgEng) is registered on Windows only. The runtime `backend`-arg switcher
 //! is retained so lldb-on-Windows can be added later (it would register `LldbFactory` under
 //! `cfg(windows)` too). No factory is invoked at startup — the backend is spawned lazily on
 //! the first connect (Spec FR-1.6). On a fatal server error the process prints
@@ -21,6 +21,8 @@ use mcp_session::SessionManager;
 use mcp_tools::{default_backend_for_os, BackendRegistry, ToolServer};
 use rmcp::transport::stdio;
 use rmcp::ServiceExt;
+#[cfg(windows)]
+use windbg_backend::WinDbgFactory;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -37,11 +39,9 @@ async fn main() -> ExitCode {
     };
     #[cfg(windows)]
     let registry = {
-        // Phase 3 registers `WinDbgFactory` here:
-        //   let mut registry = BackendRegistry::new(default_backend_for_os());
-        //   registry.register(Arc::new(WinDbgFactory::new()));
-        // Until then the Windows registry is empty (no backend yet).
-        BackendRegistry::new(default_backend_for_os())
+        let mut registry = BackendRegistry::new(default_backend_for_os());
+        registry.register(Arc::new(WinDbgFactory::new()));
+        registry
     };
 
     let server = ToolServer::new(session, registry);

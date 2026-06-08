@@ -23,6 +23,6 @@ tokio = { workspace = true }
 lldb-backend.workspace = true
 dap-client.workspace = true
 
-# The WinDbg backend (Phase 3) is Windows-only:
-# [target.'cfg(windows)'.dependencies]
-# windbg-backend.workspace = true
+# The WinDbg backend is Windows-only (registered by the binary under cfg(windows)).
+[target.'cfg(windows)'.dependencies]
+windbg-backend.workspace = true

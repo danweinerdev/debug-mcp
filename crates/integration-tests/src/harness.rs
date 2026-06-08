@@ -25,11 +25,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(windows))]
 use lldb_backend::LldbFactory;
 use mcp_session::{SessionManager, State};
 use mcp_tools::{BackendRegistry, ToolOutcome, ToolServer};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use windbg_backend::WinDbgFactory;
 
 /// A generous default per-call bound. Individual calls override it (launch/continue use
 /// 30 s like Go; the e2e workflow uses 60 s overall). A call exceeding its bound is a
@@ -45,11 +48,31 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// Build a server over a fresh session + the **real** lldb factory.
+    /// Build a server over a fresh session + the **real** lldb factory (macOS/Linux).
+    #[cfg(not(windows))]
     pub fn new() -> Harness {
         let session = Arc::new(SessionManager::new());
         let mut registry = BackendRegistry::new("lldb");
         registry.register(Arc::new(LldbFactory::new()));
+        let server = ToolServer::new(Arc::clone(&session), registry);
+        Harness {
+            server,
+            session,
+            ct: CancellationToken::new(),
+        }
+    }
+
+    /// Build a server over a fresh session + the **real** WinDbg factory (Windows). Each
+    /// call yields an independent session whose backend spawns its own engine thread on the
+    /// first connect, so two harnesses do not share DbgEng state until a target is loaded
+    /// (the live tests still serialize behind a mutex — DbgEng keeps process-global state).
+    /// The registry's default + capability union mirror the production Windows binary
+    /// (`default = "windbg"`, all-true caps ⇒ 25 advertised tools).
+    #[cfg(windows)]
+    pub fn new_windbg() -> Harness {
+        let session = Arc::new(SessionManager::new());
+        let mut registry = BackendRegistry::new("windbg");
+        registry.register(Arc::new(WinDbgFactory::new()));
         let server = ToolServer::new(Arc::clone(&session), registry);
         Harness {
             server,
@@ -88,11 +111,29 @@ impl Harness {
     }
 
     /// Launch a fixture with `stop_on_entry=true`, asserting success, and return the parsed
-    /// JSON object (Go `launchFixture`).
+    /// JSON object (Go `launchFixture`). lldb fixtures take no mode argument.
+    #[cfg(not(windows))]
     pub async fn launch_fixture(&self, fixture: &Path) -> Map<String, Value> {
         let args = obj(&[
             ("program", Value::String(fixture.display().to_string())),
             ("stop_on_entry", Value::Bool(true)),
+        ]);
+        let out = self.call("launch", args, Duration::from_secs(30)).await;
+        expect_json_obj("launch", &out)
+    }
+
+    /// Launch the Windows fixture in `mode` (`normal`/`null`/`av`/`wait`), asserting success,
+    /// and return the parsed JSON object. WinDbg always stops at the loader break regardless
+    /// of `stop_on_entry`; the mode is passed through the `launch` tool's `args` field as a
+    /// JSON array (the same shape the production handler parses).
+    #[cfg(windows)]
+    pub async fn launch_windbg(&self, fixture: &Path, mode: &str) -> Map<String, Value> {
+        // The `args` field is a JSON-array **string** (the production handler parses it via
+        // `serde_json::from_str::<Vec<String>>`), so serialize the single-element array here.
+        let args_json = serde_json::to_string(&vec![mode]).expect("serialize args array");
+        let args = obj(&[
+            ("program", Value::String(fixture.display().to_string())),
+            ("args", Value::String(args_json)),
         ]);
         let out = self.call("launch", args, Duration::from_secs(30)).await;
         expect_json_obj("launch", &out)
@@ -113,6 +154,7 @@ impl Harness {
     }
 }
 
+#[cfg(not(windows))]
 impl Default for Harness {
     fn default() -> Self {
         Harness::new()
@@ -168,13 +210,45 @@ pub fn fixture_path(name: &str) -> PathBuf {
 
 /// Whether lldb-dap can be detected (so the live suite can run) — uses the same detection
 /// the production backend uses (`LLDB_DAP_PATH` / PATH / versioned / `xcrun`).
+#[cfg(not(windows))]
 pub fn lldb_dap_available() -> bool {
     lldb_backend::find_lldb_dap().is_ok()
+}
+
+/// The absolute path to the Windows debugging fixture `testdata/win/test_target.exe`
+/// (built by `testdata/win/build.bat`). Does **not** assert existence — callers gate on
+/// [`should_skip_windbg`] first.
+#[cfg(windows)]
+pub fn windbg_fixture_path() -> PathBuf {
+    workspace_root()
+        .join("testdata")
+        .join("win")
+        .join("test_target.exe")
+}
+
+/// The skip-or-run check for a Windows live test: returns `true` (and logs a clear skip
+/// message) when `test_target.exe` has not been built, so the test can
+/// `if should_skip_windbg(...) { return; }`. DbgEng itself is part of the OS, so the only
+/// prerequisite is the compiled fixture.
+#[cfg(windows)]
+pub fn should_skip_windbg(test_name: &str) -> bool {
+    let p = windbg_fixture_path();
+    if p.exists() {
+        false
+    } else {
+        eprintln!(
+            "SKIP {test_name}: fixture {} not built (run testdata/win/build.bat from a VS x64 \
+             Native Tools prompt)",
+            p.display()
+        );
+        true
+    }
 }
 
 /// The live-suite prerequisites: lldb-dap detectable **and** the named fixtures all built.
 /// Returns `Ok(())` to run or `Err(reason)` to skip cleanly. Tests log the reason and
 /// return (a skip), never fail, when this is `Err` (plan 6.1/6.2).
+#[cfg(not(windows))]
 pub fn live_prereqs(fixtures: &[&str]) -> Result<(), String> {
     if !lldb_dap_available() {
         return Err("lldb-dap not found (set LLDB_DAP_PATH or install lldb-dap)".to_string());
@@ -193,6 +267,7 @@ pub fn live_prereqs(fixtures: &[&str]) -> Result<(), String> {
 /// The skip-or-run check for a live test: returns `true` (and logs a clear skip message)
 /// when the prerequisites are not met, so the test can `if should_skip(...) { return; }`.
 /// `test_name` is the calling test's name, for a readable skip log.
+#[cfg(not(windows))]
 pub fn should_skip(test_name: &str, fixtures: &[&str]) -> bool {
     match live_prereqs(fixtures) {
         Ok(()) => false,

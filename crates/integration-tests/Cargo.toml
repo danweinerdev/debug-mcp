@@ -15,7 +15,19 @@ path = "src/lib.rs"
 [dependencies]
 mcp-session.workspace = true
 mcp-tools.workspace = true
-lldb-backend.workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }
+
+# lldb is the macOS/Linux backend — the in-process harness links/registers it only off
+# Windows (its cfg(unix) `Harness::new` template). This keeps lldb-backend (and its DAP
+# transport) out of the Windows build entirely.
+[target.'cfg(not(windows))'.dependencies]
+lldb-backend.workspace = true
+
+# windbg is the Windows backend — the harness' cfg(windows) `Harness::new_windbg`
+# constructor builds a server over it. Because `integration-tests` is only a DEV-dependency
+# of `mcp-tools`, `windbg-backend` (and `dbgeng-sys`) never reach mcp-tools' normal
+# dependency edge — the seam stays intact.
+[target.'cfg(windows)'.dependencies]
+windbg-backend.workspace = true

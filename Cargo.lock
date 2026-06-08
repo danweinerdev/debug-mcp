@@ -152,6 +152,7 @@ dependencies = [
  "mcp-tools",
  "rmcp",
  "tokio",
+ "windbg-backend",
 ]
 
 [[package]]
@@ -315,6 +316,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "windbg-backend",
 ]
 
 [[package]]

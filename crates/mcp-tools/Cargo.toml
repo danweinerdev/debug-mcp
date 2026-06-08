@@ -37,3 +37,9 @@ serde_json = { workspace = true }
 # shells, so `cargo test --workspace` never tries to spawn lldb-dap. The suite requires a
 # real lldb-dap and the compiled C fixtures, and skips cleanly when they are absent.
 integration = []
+# Gates the Windows live WinDbg suite (the analog of `integration` for the DbgEng backend).
+# Without it `tests/integration_windbg.rs` compiles to an empty shell, so the default
+# `cargo test --workspace` run never touches WinDbg. The suite drives the REAL handlers
+# in-process over a `WinDbgFactory` (via the integration-tests harness' cfg(windows)
+# constructor) and skips cleanly when `testdata/win/test_target.exe` is absent.
+integration-windbg = []
