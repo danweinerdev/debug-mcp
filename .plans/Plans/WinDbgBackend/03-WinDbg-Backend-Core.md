@@ -3,7 +3,7 @@ title: "windbg-backend Core — engine thread + DebuggerBackend (21 ops)"
 type: phase
 plan: WinDbgBackend
 phase: 3
-status: in-progress
+status: complete
 created: 2026-06-03
 updated: 2026-06-08
 deliverable: "A Windows-only `windbg-backend` crate (#![forbid(unsafe_code)]) that owns a dedicated MTA-COM engine thread, marshals async DebuggerBackend calls to the dbgeng-sys Engine, translates results to neutral types, and registers WinDbgFactory — so the existing 21 neutral tools drive WinDbg end-to-end, with the Normal/Attach/Pause integration groups green."
@@ -30,7 +30,7 @@ tasks:
     depends_on: ["3.3"]
   - id: "3.5"
     title: "Register WinDbgFactory + per-OS default + Normal/Attach/Pause integration"
-    status: in-progress
+    status: complete
     verification: "`WinDbgFactory` is registered in `main.rs` under `cfg(windows)` with `capabilities()` all-true; the per-OS default resolves to `windbg` on Windows (overridable via the `backend` arg / `DEBUG_BACKEND`); `list_tools` shows 25 on Windows; the `integration-windbg` Normal/Attach/Pause groups (port of the C++ `test_suite.py`) pass against the ported `testdata/win/test_target` fixture; the existing lldb suite stays green; ThreadSanitizer is clean over the engine-thread/`InterruptHandle` interaction."
     depends_on: ["3.4"]
 ---

@@ -3,7 +3,7 @@ title: "WinDbg Backend — debug-mcp"
 type: plan
 status: active
 created: 2026-06-03
-updated: 2026-06-05
+updated: 2026-06-08
 tags: [rust, windbg, dbgeng, com, backend, debugging, kernel, crash-dump, ffi, port, tokio]
 related: [Designs/WinDbgBackend, Designs/RustPort, Specs/RustPort]
 phases:
@@ -18,7 +18,7 @@ phases:
     depends_on: [1]
   - id: 3
     title: "windbg-backend Core — engine thread + DebuggerBackend (21 ops)"
-    status: in-progress
+    status: complete
     doc: "03-WinDbg-Backend-Core.md"
     depends_on: [2]
   - id: 4
