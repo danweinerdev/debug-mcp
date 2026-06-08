@@ -36,13 +36,13 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     IDebugEventCallbacks, IDebugOutputCallbacks, IDebugRegisters2, IDebugSymbols3,
     IDebugSystemObjects4, DEBUG_ANY_ID, DEBUG_ATTACH_DEFAULT, DEBUG_BREAKPOINT_CODE,
     DEBUG_BREAKPOINT_ENABLED, DEBUG_CREATE_PROCESS_OPTIONS, DEBUG_END_ACTIVE_DETACH,
-    DEBUG_END_PASSIVE, DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT, DEBUG_INTERRUPT_ACTIVE,
-    DEBUG_MODNAME_MODULE, DEBUG_MODULE_PARAMETERS, DEBUG_OUTCTL_THIS_CLIENT,
-    DEBUG_SCOPE_GROUP_LOCALS, DEBUG_STACK_FRAME, DEBUG_STATUS_BREAK, DEBUG_STATUS_GO,
-    DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_NO_DEBUGGEE,
-    DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO, DEBUG_STATUS_STEP_OVER,
-    DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
-    DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM,
+    DEBUG_END_ACTIVE_TERMINATE, DEBUG_END_PASSIVE, DEBUG_ENGOPT_INITIAL_BREAK,
+    DEBUG_EXECUTE_DEFAULT, DEBUG_INTERRUPT_ACTIVE, DEBUG_MODNAME_MODULE, DEBUG_MODULE_PARAMETERS,
+    DEBUG_OUTCTL_THIS_CLIENT, DEBUG_SCOPE_GROUP_LOCALS, DEBUG_STACK_FRAME, DEBUG_STATUS_BREAK,
+    DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED,
+    DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO,
+    DEBUG_STATUS_STEP_OVER, DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED,
+    DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM,
 };
 use windows::Win32::System::Diagnostics::Debug::SYMOPT_NO_IMAGE_SEARCH;
 use windows::Win32::System::Threading::{
@@ -1094,17 +1094,23 @@ impl Engine {
         }
     }
 
-    /// End the session. Ports the C++ `Detach`: a live session uses
+    /// End the session. Ports the C++ `Detach`: a live session normally uses
     /// `EndSession(DEBUG_END_ACTIVE_DETACH)` (detaches AND releases module file mappings, so the
     /// target's image is not left locked — `DetachProcesses` would leave locks); a dump uses
     /// `DEBUG_END_PASSIVE`. The engine is normally dropped right after detach (Phase 3 model), so
     /// no in-place state reset beyond clearing `is_dump` is required.
     ///
-    /// The dump-vs-live choice reads the engine's own `is_dump` (set by `open_dump` in Phase 4),
-    /// not a caller parameter, so the flag can never disagree with the actual session kind.
-    pub fn detach(&mut self) -> Result<(), EngineError> {
+    /// `terminate` selects kill-vs-detach for a **live** session: when `terminate` is set (and the
+    /// session is not a dump), `EndSession(DEBUG_END_ACTIVE_TERMINATE)` kills the debuggee instead
+    /// of leaving it running. A dump session ignores `terminate` (there is no live process to kill);
+    /// it always ends `DEBUG_END_PASSIVE`. The dump-vs-live choice reads the engine's own `is_dump`
+    /// (set by `open_dump` in Phase 4), not a caller parameter, so the flag can never disagree with
+    /// the actual session kind.
+    pub fn detach(&mut self, terminate: bool) -> Result<(), EngineError> {
         let flags = if self.is_dump {
             DEBUG_END_PASSIVE
+        } else if terminate {
+            DEBUG_END_ACTIVE_TERMINATE
         } else {
             DEBUG_END_ACTIVE_DETACH
         };

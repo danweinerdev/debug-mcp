@@ -51,6 +51,9 @@ pub enum EngineCmd {
         reply: Reply<StopOutcome>,
     },
     Detach {
+        /// Kill the live debuggee (vs. a plain detach). Carried to `EngineOps::detach`; ignored
+        /// for a dump session.
+        terminate: bool,
         reply: Reply<()>,
     },
     Go {
@@ -217,8 +220,9 @@ fn engine_thread_main<F>(
     let handle = engine.interrupt_handle();
     if ready_tx.send(Ok(handle)).is_err() {
         // The caller dropped the readiness receiver before we became ready — nothing will ever
-        // send a command. Tear down and exit (the spawn wrapper fires `terminated`).
-        let _ = engine.detach();
+        // send a command. Tear down and exit (the spawn wrapper fires `terminated`). Teardown never
+        // kills the debuggee — `detach(false)`.
+        let _ = engine.detach(false);
         return;
     }
 
@@ -231,8 +235,9 @@ fn engine_thread_main<F>(
 
     // 5. Channel closed (the backend and all clones of the sender dropped): best-effort detach so
     //    the target's image is not left locked, then drop `_com` (uninit COM) on the way out. The
-    //    spawn wrapper fires the `terminated` signal (the read-loop-ended analog).
-    let _ = engine.detach();
+    //    spawn wrapper fires the `terminated` signal (the read-loop-ended analog). Teardown never
+    //    kills the debuggee — `detach(false)`; an explicit terminate is the disconnect path only.
+    let _ = engine.detach(false);
 }
 
 /// Dispatch one command to the engine and send the result back over its reply channel. A dropped
@@ -246,8 +251,8 @@ fn dispatch(engine: &mut dyn EngineOps, cmd: EngineCmd) {
         EngineCmd::AttachPid { pid, reply } => {
             let _ = reply.send(engine.attach_pid(pid));
         }
-        EngineCmd::Detach { reply } => {
-            let _ = reply.send(engine.detach());
+        EngineCmd::Detach { terminate, reply } => {
+            let _ = reply.send(engine.detach(terminate));
         }
         EngineCmd::Go { timeout_ms, reply } => {
             let _ = reply.send(engine.go(timeout_ms));

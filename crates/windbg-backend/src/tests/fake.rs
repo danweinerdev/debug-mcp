@@ -5,7 +5,7 @@
 //! engine thread by the constructor closure.
 
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dbgeng_sys::{BpLoc, InterruptHandle, LaunchReq, OutputKind, OutputSink};
 use debugger_core::{
@@ -16,15 +16,53 @@ use debugger_core::{
 use crate::engine_ops::EngineOps;
 use crate::error::EngineError;
 
+/// A flattened, comparable view of a [`BpLoc`] the recorder stores per `set_breakpoint` call (the
+/// real `BpLoc` is neither `Clone` nor `PartialEq`). Lets a test assert exactly which breakpoint
+/// locations the backend flushed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedBp {
+    Address(u64),
+    FileLine { file: String, line: u32 },
+    Function(String),
+}
+
+impl RecordedBp {
+    fn from_loc(loc: &BpLoc) -> RecordedBp {
+        match loc {
+            BpLoc::Address(addr) => RecordedBp::Address(*addr),
+            BpLoc::FileLine { file, line } => RecordedBp::FileLine {
+                file: file.clone(),
+                line: *line,
+            },
+            BpLoc::Function(name) => RecordedBp::Function(name.clone()),
+        }
+    }
+}
+
+/// What the fake records as the backend drives it, shared with the test via an `Arc<Mutex<…>>`.
+/// The fake is moved onto the engine thread, so a test holds a clone of this `Arc` to read back
+/// what was marshaled (the analog of inspecting the DAP peer's received frames).
+#[derive(Debug, Default)]
+pub struct Recorder {
+    /// Each `set_breakpoint(loc, condition)` call, in order — proves the launch breakpoint flush.
+    pub breakpoints: Vec<(RecordedBp, String)>,
+    /// The `terminate` flag of each `detach(terminate)` call, in order — proves disconnect's
+    /// kill-vs-detach choice round-trips.
+    pub detaches: Vec<bool>,
+}
+
 /// A scripted engine. Each field is the canned reply for the matching [`EngineOps`] method; the
 /// defaults are benign so a test only sets the fields it asserts on. `interrupt_flag` is shared
-/// with the [`InterruptHandle`] `interrupt_handle()` mints, so a test can observe a `pause()`.
+/// with the [`InterruptHandle`] `interrupt_handle()` mints, so a test can observe a `pause()`;
+/// `recorder` is shared with the test so it can assert which ops the backend marshaled.
 pub struct FakeEngine {
     pub threads: Vec<ThreadInfo>,
     pub modules: Vec<ModuleInfo>,
     pub stop_outcome: StopOutcome,
     /// The interrupt flag the minted [`InterruptHandle`] shares.
     pub interrupt_flag: Arc<AtomicBool>,
+    /// The shared call recorder (breakpoint flush, detach terminate flag).
+    pub recorder: Arc<Mutex<Recorder>>,
 }
 
 impl Default for FakeEngine {
@@ -39,6 +77,7 @@ impl Default for FakeEngine {
                 hit_breakpoint_ids: Vec::new(),
             }),
             interrupt_flag: Arc::new(AtomicBool::new(false)),
+            recorder: Arc::new(Mutex::new(Recorder::default())),
         }
     }
 }
@@ -51,6 +90,22 @@ impl FakeEngine {
             ..FakeEngine::default()
         }
     }
+
+    /// A fake scripted to return `outcome` from `launch`/`attach`/`go`/`step`, sharing the given
+    /// `recorder` so a test can read back the marshaled `set_breakpoint`/`detach` calls.
+    pub fn scripted(outcome: StopOutcome, recorder: Arc<Mutex<Recorder>>) -> FakeEngine {
+        FakeEngine {
+            stop_outcome: outcome,
+            recorder,
+            ..FakeEngine::default()
+        }
+    }
+
+    /// Lock the recorder, recovering from a poisoned mutex rather than re-panicking on the engine
+    /// thread.
+    fn recorder(&self) -> std::sync::MutexGuard<'_, Recorder> {
+        self.recorder.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 impl EngineOps for FakeEngine {
@@ -62,7 +117,8 @@ impl EngineOps for FakeEngine {
         Ok(self.stop_outcome.clone())
     }
 
-    fn detach(&mut self) -> Result<(), EngineError> {
+    fn detach(&mut self, terminate: bool) -> Result<(), EngineError> {
+        self.recorder().detaches.push(terminate);
         Ok(())
     }
 
@@ -80,9 +136,12 @@ impl EngineOps for FakeEngine {
 
     fn set_breakpoint(
         &mut self,
-        _loc: &BpLoc,
-        _condition: &str,
+        loc: &BpLoc,
+        condition: &str,
     ) -> Result<BreakpointResult, EngineError> {
+        self.recorder()
+            .breakpoints
+            .push((RecordedBp::from_loc(loc), condition.to_string()));
         Ok(BreakpointResult {
             id: 1,
             verified: true,

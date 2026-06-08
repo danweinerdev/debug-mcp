@@ -10,8 +10,11 @@
 //! No `unsafe`: the backend only ever holds channel endpoints and a `Send`
 //! [`InterruptHandle`](dbgeng_sys::InterruptHandle); all DbgEng/COM work is on the engine thread.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
-use dbgeng_sys::InterruptHandle;
+use dbgeng_sys::{find_process_by_name, BpLoc, InterruptHandle, LaunchReq};
 use debugger_core::{
     AttachOutcome, AttachSpec, BackendError, BreakpointResult, DebuggerBackend, EvalMode,
     EvalResult, Frame, FunctionBp, Granularity, Instruction, LaunchOutcome, LaunchSpec, MemoryRead,
@@ -21,6 +24,14 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::EngineError;
 use crate::thread::EngineCmd;
+
+/// The `wait_for` poll interval — how often `attach`'s `wait_for` path snapshots the process list
+/// looking for the named process to appear.
+const WAIT_FOR_POLL: Duration = Duration::from_millis(75);
+
+/// The `wait_for` overall bound — how long `attach` waits for the named process to appear before
+/// giving up with a clear error.
+const WAIT_FOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The WinDbg backend handle held above the seam as `Arc<dyn DebuggerBackend>`.
 ///
@@ -36,10 +47,14 @@ pub struct WinDbgBackend {
     /// which the engine thread's in-flight `go` poll loop observes and turns into a real break
     /// (the flag-only R4 design).
     interrupt: InterruptHandle,
-    /// The debugger pid, when one is known. DbgEng runs in-process (no debugger subprocess), so
-    /// this is `None` in the normal case; kept on the struct so a future kernel/remote mode can
-    /// populate it and [`DebuggerBackend::debugger_pid`] can surface it.
-    debugger_pid: Option<i64>,
+    /// The target pid, when one is known, behind a `Mutex` for interior mutability: `attach` sets
+    /// it (to the supplied pid, or the pid resolved from `wait_for`) *after* construction, and
+    /// [`DebuggerBackend::debugger_pid`] reads it. DbgEng runs in-process with no debugger
+    /// subprocess, and the engine surface does not readily expose a launched target's own pid, so
+    /// `launch` leaves it `None`; it is meaningful mainly for attach-by-`wait_for` (Spec FR-5.6 —
+    /// attach-by-pid already reports the supplied pid at the tool layer). The `Mutex` is only ever
+    /// locked for a synchronous read/write that drops the guard before any `.await`.
+    target_pid: Mutex<Option<i64>>,
     /// The engine thread's join handle, owned here so the thread is not silently detached: this
     /// makes the thread's lifetime observable and gives Phase 5 a hook for the R2 orphan-thread
     /// teardown. We deliberately do NOT join it on `Drop` — a thread blocked in a long `go`
@@ -61,9 +76,24 @@ impl WinDbgBackend {
         WinDbgBackend {
             cmd_tx,
             interrupt,
-            debugger_pid,
+            target_pid: Mutex::new(debugger_pid),
             _engine_thread: engine_thread,
         }
+    }
+
+    /// Record the target pid (set by `attach`). Locks the pid cell, writes, and drops the guard
+    /// before returning — never held across an `.await`.
+    fn set_target_pid(&self, pid: Option<i64>) {
+        let mut guard = self.target_pid.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = pid;
+    }
+
+    /// Resolve `attach`'s `wait_for` mode: poll the process list for a process named `name` to
+    /// appear, returning its pid once found. Delegates to [`poll_for_process`] with the real
+    /// `dbgeng_sys::find_process_by_name` lookup — that lookup does only a Toolhelp32 snapshot (no
+    /// DbgEng/COM), so it is safe to call directly from this async side off the engine thread.
+    async fn resolve_wait_for(&self, name: &str) -> Result<u32, BackendError> {
+        poll_for_process(name, find_process_by_name, WAIT_FOR_POLL, WAIT_FOR_TIMEOUT).await
     }
 
     /// The marshaling primitive: build an [`EngineCmd`] carrying a fresh reply `oneshot`, send it
@@ -96,6 +126,36 @@ impl WinDbgBackend {
     }
 }
 
+/// Poll `lookup(name)` every `interval` until it returns `Some(pid)` or `timeout` elapses, mapping
+/// a never-appears to a clear [`BackendError`]. Factored out (with the lookup injected) so the
+/// `wait_for` polling logic is unit-testable with a scripted lookup — production passes
+/// [`find_process_by_name`].
+///
+/// The lookup runs directly on the async side (it is a plain Toolhelp32 snapshot, no DbgEng/COM),
+/// and the wait is broken into `interval` `tokio::time::sleep`s so the task yields between snapshots
+/// rather than busy-spinning. A Toolhelp32 snapshot is typically sub-millisecond, so we accept it on
+/// the worker thread rather than paying `spawn_blocking` overhead on each of the (up to ~400) polls;
+/// if profiling ever shows it stalling the runtime, wrap `lookup` in `tokio::task::spawn_blocking`.
+pub(crate) async fn poll_for_process(
+    name: &str,
+    lookup: impl Fn(&str) -> Option<u32>,
+    interval: Duration,
+    timeout: Duration,
+) -> Result<u32, BackendError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(pid) = lookup(name) {
+            return Ok(pid);
+        }
+        if Instant::now() >= deadline {
+            return Err(BackendError::Dap {
+                message: format!("wait_for: no process named '{name}' appeared"),
+            });
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 /// Map a `dbgeng-sys` [`EngineError`] onto the neutral [`BackendError`]. The full per-op Go-string
 /// wording is owned by the tool layer / later tasks; here we carry the engine's verbatim message
 /// in the closest neutral variant so nothing is lost: a COM/engine failure becomes
@@ -111,27 +171,116 @@ pub(crate) fn map_engine_err(err: EngineError) -> BackendError {
 impl DebuggerBackend for WinDbgBackend {
     // --- lifecycle ---
 
-    async fn launch(&self, _spec: LaunchSpec) -> Result<LaunchOutcome, BackendError> {
-        // TODO(3.2): translate LaunchSpec → dbgeng_sys::LaunchReq, flush breakpoints, marshal
-        // EngineCmd::Launch, and map StopOutcome → LaunchOutcome.
-        Err(BackendError::Send(
-            "launch: not yet implemented (phase 3.2)".into(),
-        ))
+    async fn launch(&self, spec: LaunchSpec) -> Result<LaunchOutcome, BackendError> {
+        // Map the neutral LaunchSpec onto the engine's minimal LaunchReq. The engine's LaunchReq
+        // carries no environment — WinDbg env injection is NOT wired (DbgEng's CreateProcess2 path
+        // here inherits our environment). A non-empty `spec.env` is therefore a known gap: it is
+        // silently ignored rather than failing the launch (the agent's launch still succeeds; only
+        // custom env vars are not applied). Documented here per the task; revisit if a backend-level
+        // env channel is added.
+        let req = LaunchReq {
+            program: spec.program,
+            args: spec.args,
+            cwd: spec.cwd,
+        };
+
+        // Marshal the launch. The engine always stops at the loader (INITIAL_BREAK) break, so a
+        // successful launch yields StopOutcome::Stopped even when stop_on_entry is false.
+        let outcome = self.call(|reply| EngineCmd::Launch { req, reply }).await?;
+
+        // On a stop (the normal launch result), flush the pending breakpoints the session tracked
+        // when the tool set them: launch flushes, attach does not. Each set is best-effort — a
+        // breakpoint that fails to resolve (e.g. no symbols yet) must NOT abort the launch; the
+        // per-bp result is discarded here and the session's own tracking carries verification.
+        if matches!(outcome, StopOutcome::Stopped(_)) {
+            for (file, bps) in &spec.source_breakpoints {
+                for bp in bps {
+                    // `SourceBp::line` is i64; a line outside u32 range is malformed — skip it
+                    // (best-effort flush) rather than wrap-casting to a bogus line.
+                    let Ok(line) = u32::try_from(bp.line) else {
+                        continue;
+                    };
+                    let loc = BpLoc::FileLine {
+                        file: file.clone(),
+                        line,
+                    };
+                    let condition = bp.condition.clone();
+                    let _ = self
+                        .call(|reply| EngineCmd::SetBreakpoint {
+                            loc,
+                            condition,
+                            reply,
+                        })
+                        .await;
+                }
+            }
+            for bp in &spec.function_breakpoints {
+                let loc = BpLoc::Function(bp.name.clone());
+                let condition = bp.condition.clone();
+                let _ = self
+                    .call(|reply| EngineCmd::SetBreakpoint {
+                        loc,
+                        condition,
+                        reply,
+                    })
+                    .await;
+            }
+        }
+
+        // Map the engine StopOutcome onto the neutral LaunchOutcome. WinDbg always stops at the
+        // loader break (DbgEng INITIAL_BREAK) — a deliberate behavior difference from lldb's
+        // stop_on_entry: launch returns Stopped even when stop_on_entry is false, and we do NOT
+        // auto-continue (that would block the engine thread). The agent issues `continue` next; the
+        // breakpoints are already set. A `Terminated` (no live target) maps to Exited{code:None}.
+        // `LaunchOutcome::Running` is unreachable from WinDbg by design (it would require
+        // auto-continuing, which would block the engine thread) — not an omission.
+        Ok(match outcome {
+            StopOutcome::Stopped(info) => LaunchOutcome::Stopped(info),
+            StopOutcome::Exited { code } => LaunchOutcome::Exited { code },
+            StopOutcome::Terminated => LaunchOutcome::Exited { code: None },
+        })
     }
 
-    async fn attach(&self, _spec: AttachSpec) -> Result<AttachOutcome, BackendError> {
-        // TODO(3.2): marshal EngineCmd::AttachPid (pid path) and map StopOutcome → AttachOutcome.
-        Err(BackendError::Send(
-            "attach: not yet implemented (phase 3.2)".into(),
-        ))
+    async fn attach(&self, spec: AttachSpec) -> Result<AttachOutcome, BackendError> {
+        // Resolve the pid to attach to: an explicit pid takes precedence (the tool layer already
+        // enforces pid XOR wait_for); otherwise poll for the named process to appear (wait_for).
+        let pid = match spec.pid {
+            // The tool layer validates `pid > 0`; guard the i64→u32 conversion anyway so a
+            // malformed value surfaces a clear error instead of wrap-casting to a bogus pid.
+            Some(pid) => u32::try_from(pid).map_err(|_| BackendError::Dap {
+                message: format!("attach: pid {pid} is out of range"),
+            })?,
+            None => match &spec.wait_for {
+                Some(name) => self.resolve_wait_for(name).await?,
+                None => {
+                    return Err(BackendError::Dap {
+                        message: "attach: neither pid nor wait_for was supplied".to_string(),
+                    })
+                }
+            },
+        };
+
+        // Record the resolved target pid for `debugger_pid` (lock + write + drop before any await).
+        self.set_target_pid(Some(pid as i64));
+
+        // Marshal the attach and map the engine StopOutcome onto the neutral AttachOutcome.
+        let outcome = self
+            .call(|reply| EngineCmd::AttachPid { pid, reply })
+            .await?;
+        Ok(match outcome {
+            StopOutcome::Stopped(info) => AttachOutcome::Stopped(info),
+            StopOutcome::Exited { code } => AttachOutcome::Exited { code },
+            StopOutcome::Terminated => AttachOutcome::Terminated,
+        })
     }
 
-    async fn disconnect(&self, _terminate: bool) {
-        // Best-effort detach (never errors, Spec FR-6). The full terminate-vs-detach semantics
-        // are 3.2; here we marshal a plain detach so the engine releases the target, and discard
-        // any error. Dropping the backend afterwards closes the channel and ends the thread.
-        // TODO(3.2): honor `terminate` (kill vs detach) once the engine exposes the distinction.
-        let _ = self.call(|reply| EngineCmd::Detach { reply }).await;
+    async fn disconnect(&self, terminate: bool) {
+        // Best-effort detach (never errors, Spec FR-6): marshal Detach carrying `terminate` (kill
+        // vs. plain detach, honored by the engine), and discard any error. Dropping the backend
+        // afterwards closes the channel and ends the thread (whose own teardown never kills).
+        let _ = self
+            .call(|reply| EngineCmd::Detach { terminate, reply })
+            .await;
     }
 
     // --- breakpoints ---
@@ -264,7 +413,8 @@ impl DebuggerBackend for WinDbgBackend {
     }
 
     fn debugger_pid(&self) -> Option<i64> {
-        self.debugger_pid
+        // Read the recorded target pid (set by `attach`). Lock + read + drop the guard — no await.
+        *self.target_pid.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     // --- capability-gated (WinDbg-only verbs) ---

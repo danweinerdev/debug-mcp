@@ -3,6 +3,7 @@
 //! live engine** (and no COM on the calling thread), so they run on any Windows host.
 
 mod fake;
+mod lifecycle;
 mod marshal;
 
 use tokio::sync::oneshot;

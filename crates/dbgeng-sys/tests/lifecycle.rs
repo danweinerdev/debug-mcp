@@ -61,7 +61,7 @@ fn launch_stops_at_initial_break() {
         ),
         other => panic!("expected Stopped at the initial break, got {other:?}"),
     }
-    engine.detach().expect("detach");
+    engine.detach(false).expect("detach");
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn attach_pid_stops_a_running_process() {
     let result = engine.attach_pid(child.id());
 
     // Always detach + kill the child, even if the assertion below fails.
-    let _ = engine.detach();
+    let _ = engine.detach(false);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -89,6 +89,47 @@ fn attach_pid_stops_a_running_process() {
         StopOutcome::Stopped(_) => {}
         other => panic!("expected Stopped after attach, got {other:?}"),
     }
+}
+
+#[test]
+fn detach_terminate_kills_the_target() {
+    if should_skip() {
+        return;
+    }
+    let _guard = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Spawn the sleep-forever fixture ourselves (so we hold its pid + can observe its exit), attach
+    // to it, then detach with terminate=true (DEBUG_END_ACTIVE_TERMINATE). That must KILL the
+    // debuggee — proven by the child exiting on its own afterward. (A plain detach(false) would leave
+    // `wait` sleeping forever and `try_wait` would keep returning Ok(None).)
+    let mut child = Command::new(fixture())
+        .arg("wait")
+        .spawn()
+        .expect("spawn test_target wait");
+
+    let mut engine = Engine::create().expect("create engine");
+    engine.attach_pid(child.id()).expect("attach");
+    engine.detach(true).expect("detach(true)");
+    drop(engine);
+
+    // Poll briefly for the child to be reaped — DEBUG_END_ACTIVE_TERMINATE killed it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut exited = false;
+    while std::time::Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Always reap the child (kill if the terminate somehow didn't take), so it is `wait()`ed on
+    // every path, then assert the terminate actually killed it.
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        exited,
+        "detach(true) should have terminated the debuggee, but it was still running"
+    );
 }
 
 #[test]
@@ -102,7 +143,7 @@ fn detach_allows_a_fresh_session() {
     {
         let mut engine = Engine::create().expect("create engine 1");
         engine.launch(&launch_req("normal")).expect("launch 1");
-        engine.detach().expect("detach 1");
+        engine.detach(false).expect("detach 1");
     }
 
     // A second full session on a fresh engine proves the first tore down cleanly — `EndSession`
@@ -119,7 +160,7 @@ fn detach_allows_a_fresh_session() {
         matches!(outcome, StopOutcome::Stopped(_)),
         "a second session should launch and stop after the first detached"
     );
-    engine2.detach().expect("detach 2");
+    engine2.detach(false).expect("detach 2");
 }
 
 #[test]

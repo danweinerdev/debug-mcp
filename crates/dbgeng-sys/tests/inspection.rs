@@ -117,7 +117,7 @@ fn breakpoint_set_list_hit_remove() {
         bp.id
     );
 
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `threads` returns at least one thread at the breakpoint.
@@ -136,7 +136,7 @@ fn threads_returns_at_least_one() {
         !threads.is_empty(),
         "a running target should have at least one thread, got {threads:?}"
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `stack_trace` at the `compute` breakpoint includes a frame named `compute` (and likely `main`).
@@ -163,7 +163,7 @@ fn stack_trace_includes_compute() {
         "the top frame should have an instruction pointer, got {:?}",
         frames[0]
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `locals(0)` at the `compute` breakpoint includes `sum` and/or `i`.
@@ -183,7 +183,7 @@ fn locals_at_compute_include_sum_or_i() {
         names.iter().any(|n| *n == "sum" || *n == "i"),
         "locals at compute should include `sum` and/or `i`, got {names:?}"
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `locals(1)` exercises the `frame_index > 0` scope-switch path (`GetStackTrace` + `SetScope` +
@@ -210,7 +210,7 @@ fn locals_at_frame_one_uses_the_scope_switch_path() {
             .any(|n| *n == "mode" || *n == "r" || *n == "argc" || *n == "argv"),
         "locals at frame 1 (main) should include a main local, got {names:?}"
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `evaluate("10 + 1")` returns a result whose text mentions `11` (DbgEng renders as `0n11`/`0xb`,
@@ -231,7 +231,7 @@ fn evaluate_arithmetic() {
         "evaluate(\"10 + 1\") should mention 11, got {:?}",
         eval.result
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `read_memory` of a code address (the top frame's IP) returns a non-empty byte slice.
@@ -256,7 +256,7 @@ fn read_memory_returns_bytes() {
         !mem.data.is_empty(),
         "reading 16 bytes of live code should return some bytes"
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `disassemble` of the IP returns instructions, each with non-empty mnemonic text.
@@ -282,7 +282,7 @@ fn disassemble_returns_instructions() {
             "each disassembled instruction should carry mnemonic text, got {ins:?}"
         );
     }
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `execute("r")` returns non-empty register text.
@@ -301,7 +301,7 @@ fn execute_register_command() {
         !out.trim().is_empty(),
         "the `r` register dump should produce output, got {out:?}"
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `modules()` includes the fixture exe module, carrying a symbol_status token.
@@ -337,7 +337,7 @@ fn modules_include_the_exe() {
         "base should be hex, got {:?}",
         exe.base
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `current_source_location()` at the `compute` breakpoint returns `Some((file, line))` that names
@@ -365,7 +365,7 @@ fn current_source_location_at_compute() {
         }
         None => panic!("expected a source location at the compute breakpoint, got None"),
     }
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// Helper: the instruction pointer of the top stack frame for `thread_id`, used by the memory /

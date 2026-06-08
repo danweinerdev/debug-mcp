@@ -76,7 +76,7 @@ fn go_runs_to_exit_with_no_breakpoints() {
         other => panic!("expected Exited(0) after go-to-exit, got {other:?}"),
     }
     // Detach after the process has exited is a no-op-ish cleanup; ignore any error.
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `step` Over from the initial break must land on a real stop (not run to exit). A single
@@ -96,7 +96,7 @@ fn step_over_from_initial_break_stops() {
         matches!(outcome, StopOutcome::Stopped(_)),
         "a single step-over from the initial break should land Stopped, got {outcome:?}"
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `step` Into from the initial break must likewise land Stopped.
@@ -115,7 +115,7 @@ fn step_into_from_initial_break_stops() {
         matches!(outcome, StopOutcome::Stopped(_)),
         "a single step-into from the initial break should land Stopped, got {outcome:?}"
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `step` Out exercises the distinct `Execute("gu")` path (no `DEBUG_STATUS_STEP_OUT` exists).
@@ -142,7 +142,7 @@ fn step_out_runs_gu_and_returns_a_stop() {
         ),
         "step-out via `gu` should return a stop, got {outcome:?}"
     );
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// `go` with a short timeout against `test_target wait` (an infinite Sleep loop) must time out
@@ -171,7 +171,7 @@ fn go_times_out_still_running_then_break_in_recovers() {
         "break_in should regain a Stopped after a still-running go, got {recovered:?}"
     );
 
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// An `InterruptHandle.interrupt()` from another thread while `go()` blocks on `test_target wait`
@@ -210,7 +210,7 @@ fn interrupt_handle_breaks_running_go_from_another_thread() {
         "interrupt latency should be ~1s (flag poll ≤200ms + SetInterrupt break), was {elapsed:?}"
     );
 
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }
 
 /// After an interrupted `go`, a subsequent `go()` on a still-running target must NOT return paused
@@ -255,5 +255,5 @@ fn go_resets_interrupt_flag_at_entry() {
 
     // Recover a context and detach cleanly.
     let _ = engine.break_in();
-    let _ = engine.detach();
+    let _ = engine.detach(false);
 }

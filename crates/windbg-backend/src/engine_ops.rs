@@ -29,7 +29,9 @@ use crate::error::EngineError;
 pub trait EngineOps {
     fn launch(&mut self, req: &LaunchReq) -> Result<StopOutcome, EngineError>;
     fn attach_pid(&mut self, pid: u32) -> Result<StopOutcome, EngineError>;
-    fn detach(&mut self) -> Result<(), EngineError>;
+    /// End the session. `terminate` kills the live debuggee (vs. a plain detach); ignored for a
+    /// dump session. See [`dbgeng_sys::Engine::detach`].
+    fn detach(&mut self, terminate: bool) -> Result<(), EngineError>;
     fn go(&mut self, timeout_ms: u32) -> Result<Option<StopOutcome>, EngineError>;
     fn step(&mut self, kind: StepKind) -> Result<StopOutcome, EngineError>;
     fn break_in(&mut self) -> Result<StopOutcome, EngineError>;
@@ -66,8 +68,8 @@ impl EngineOps for Engine {
         Engine::attach_pid(self, pid)
     }
 
-    fn detach(&mut self) -> Result<(), EngineError> {
-        Engine::detach(self)
+    fn detach(&mut self, terminate: bool) -> Result<(), EngineError> {
+        Engine::detach(self, terminate)
     }
 
     fn go(&mut self, timeout_ms: u32) -> Result<Option<StopOutcome>, EngineError> {

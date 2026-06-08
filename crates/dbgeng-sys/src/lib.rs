@@ -29,6 +29,7 @@ mod callbacks;
 mod com;
 mod engine;
 mod error;
+mod process;
 
 #[cfg(test)]
 mod tests;
@@ -37,3 +38,4 @@ pub use callbacks::{exception_breaks, OutputKind, OutputSink};
 pub use com::ComApartment;
 pub use engine::{BpLoc, Engine, InterruptHandle, LaunchReq};
 pub use error::EngineError;
+pub use process::find_process_by_name;

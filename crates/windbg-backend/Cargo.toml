@@ -14,3 +14,9 @@ dbgeng-sys.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+
+# Live integration tests (Windows-only, skip cleanly if the fixture is absent). The crate's own
+# `tokio`/`debugger-core` already cover the unit suite; the live `tests/` crate also needs them.
+[target.'cfg(windows)'.dev-dependencies]
+tokio.workspace = true
+debugger-core.workspace = true
