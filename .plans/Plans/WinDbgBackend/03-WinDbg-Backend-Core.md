@@ -25,12 +25,12 @@ tasks:
     depends_on: ["3.2"]
   - id: "3.4"
     title: "Inspection / memory translation to neutral types"
-    status: in-progress
+    status: complete
     verification: "Unit tests against `FakeEngine` pin the DbgEng→neutral translation tables (frame/thread/variable/instruction field mapping, scopes→Locals group, `Variable.named`/`indexed`) without a live target; live integration then confirms at a known fixture stop that `threads`/`stack_trace`/`scopes`/`variables`/`evaluate`/`read_memory`/`disassemble` produce neutral structs the **existing** mcp-tools handlers format without modification; a full launch→breakpoint→backtrace(finds `main`)→variables(include locals)→step-over→evaluate flow succeeds through the real tool dispatch path; `run_command` routes a raw WinDbg command through `evaluate(EvalMode::Repl)` → `Engine::execute`."
     depends_on: ["3.3"]
   - id: "3.5"
     title: "Register WinDbgFactory + per-OS default + Normal/Attach/Pause integration"
-    status: pending
+    status: in-progress
     verification: "`WinDbgFactory` is registered in `main.rs` under `cfg(windows)` with `capabilities()` all-true; the per-OS default resolves to `windbg` on Windows (overridable via the `backend` arg / `DEBUG_BACKEND`); `list_tools` shows 25 on Windows; the `integration-windbg` Normal/Attach/Pause groups (port of the C++ `test_suite.py`) pass against the ported `testdata/win/test_target` fixture; the existing lldb suite stays green; ThreadSanitizer is clean over the engine-thread/`InterruptHandle` interaction."
     depends_on: ["3.4"]
 ---
