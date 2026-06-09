@@ -3,16 +3,21 @@ title: "Parity Hardening — cond-BP, cancel/interrupt, test_suite port, CI lane
 type: phase
 plan: WinDbgBackend
 phase: 5
-status: pending
+status: in-progress
 created: 2026-06-03
-updated: 2026-06-03
+updated: 2026-06-09
 deliverable: "Behavioral parity with the C++ oracle closed out: engine-side conditional breakpoints, the R6 ASLR address-BP handling, the R2 orphaned-thread pump fix, cancellation/interrupt + Break recovery, backend-aware error strings, the ported Error test group + a differential Windows lane, and a CI Windows lane — with CLAUDE.md parity notes finalized."
 tasks:
+  - id: "5.0"
+    title: "Runtime debugger-extension path discovery (R8 refinement)"
+    status: in-progress
+    verification: "`ensure_extensions_loaded` no longer hardcodes the WinKits install path: it discovers the Debuggers\\x64 root at runtime (registry `KitsRoot10` under `SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots`, native + WOW6432Node views; then `WindowsSdkDir` env; then the former hardcoded default as a last resort), appends only the `winext`/`winxp`/base dirs that actually EXIST to the `.extpath`, then `.load ext.dll`; the discovery result (resolved root or 'no extensions found') is observable, not silently swallowed. Live on a host with the full Debugging Tools installed, `analyze()` returns a real `!analyze -v` report (contains a recognizable token e.g. `EXCEPTION`/`FAULTING`/`ACCESS_VIOLATION`), and the 4.4 integration analyze assertion is tightened to take the strict branch; on a host WITHOUT the extensions the discovery degrades cleanly (empty extpath, `analyze` returns the engine's `No export analyze found`) with no panic. The registry read is confined `unsafe` in `dbgeng-sys` with `// SAFETY:` comments; unit tests cover the path-assembly/existence-filter logic with injected roots."
+    depends_on: []
   - id: "5.1"
     title: "Engine-side conditional breakpoints"
     status: pending
     verification: "A conditional breakpoint fires only when the condition holds (e.g. `i == 5` in a loop fixture): the `go` poll loop, on a BP stop, evaluates `@@c++( (cond) ? 1 : 0 )` and resumes when false; an **unresolvable** condition (variable out of scope) silently skips (the documented C++ footgun) — both paths are covered by fixture tests; conditions survive in the engine-side map across `remove`/`list`."
-    depends_on: []
+    depends_on: ["5.0"]
   - id: "5.2"
     title: "R6 ASLR address-BP handling + R2 orphaned-thread pump fix"
     status: pending
@@ -44,6 +49,34 @@ trickier risks (R2 orphaned thread, R6 ASLR address BPs), port the C++ Error tes
 differential Windows lane, and wire the CI Windows lane. After this phase the WinDbg backend is
 feature-complete and parity-validated. Mirrors design Decisions 4/5, Open Risks R2/R3/R6/R7, and
 Migration Phase 4.
+
+## 5.0: Runtime debugger-extension path discovery (R8 refinement)
+
+Pulled forward from the R8 deferral (Phase 4 used the C++-parity hardcoded `.extpath`). Surfaced
+by the 4.4 debrief: on a host without the full *Debugging Tools for Windows* at the exact default
+path, the hardcoded `.extpath` points at non-existent dirs, `.load ext.dll` silently fails, and
+`analyze_crash` returns the engine's `No export analyze found` for every call — affecting any
+non-default / partial install. Doing it now (while a full toolset is installed for testing) lets
+the resolved path be validated live.
+
+### Subtasks
+- [ ] Replace the hardcoded `.extpath` in `ensure_extensions_loaded` with runtime discovery of the
+      `Debuggers\x64` root: registry `KitsRoot10` (`HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`
+      and the `WOW6432Node` view) → `WindowsSdkDir` env → the former hardcoded default as last resort.
+- [ ] Build the `.extpath` from only the candidate dirs (`<root>\winext`, `<root>\winxp`, `<root>`)
+      that actually EXIST; `.load ext.dll` after. Make the outcome observable (log the resolved root
+      or a clear "no debugger extensions found" rather than silently swallowing).
+- [ ] Confine the registry read to `dbgeng-sys` with `// SAFETY:` comments; unit-test the
+      path-assembly + existence-filter with injected roots (no live registry needed for the logic).
+- [ ] Tighten the 4.4 integration analyze assertion: with the extension now resolvable on the test
+      host, assert a real `!analyze -v` token (drop the lenient `No export` branch, or keep it as a
+      documented graceful-degradation fallback for extension-less CI hosts).
+
+### Notes
+Discovery makes `analyze_crash` and `run_command("!...")` work wherever the SDK is actually
+installed, not just the default path — the generalization the C++ hardcoding missed. On a host with
+no extensions installed at all it degrades cleanly (empty extpath, the engine's own
+`No export analyze found`), no panic.
 
 ## 5.1: Conditional breakpoints
 

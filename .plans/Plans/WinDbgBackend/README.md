@@ -28,7 +28,7 @@ phases:
     depends_on: [3]
   - id: 5
     title: "Parity Hardening — cond-BP, cancel/interrupt, test_suite port, CI lane"
-    status: pending
+    status: in-progress
     doc: "05-Parity-Hardening.md"
     depends_on: [4]
 ---
