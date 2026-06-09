@@ -8,7 +8,12 @@ use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::server::ToolServer;
-use crate::tests::fake::{single_factory_registry, FakeBackend, FakeFactory, FakeState};
+use debugger_core::BackendError;
+
+use crate::tests::fake::{
+    single_factory_registry, windbg_like_connect_error_factory, windbg_like_factory, FakeBackend,
+    FakeFactory, FakeState,
+};
 use crate::ToolOutcome;
 
 /// A test harness: the server, the shared session, and the shared fake-backend state.
@@ -26,6 +31,39 @@ impl Harness {
         let state = Arc::new(Mutex::new(FakeState::default()));
         let session = Arc::new(SessionManager::new());
         let factory = Arc::new(FakeFactory::new(Arc::clone(&state)));
+        let server = ToolServer::new(Arc::clone(&session), single_factory_registry(factory));
+        Harness {
+            server,
+            session,
+            state,
+        }
+    }
+
+    /// Build a server over a fresh session whose ONLY registered factory is named
+    /// `"windbg"` (all-true capabilities), with **no** backend connected. The
+    /// `open_crash_dump`/`attach_kernel` connect-point tools force-select `"windbg"`, so this
+    /// lets a cross-platform test drive their full connect → backend-call → response path
+    /// (scripting the outcome via the shared `state`) without a live DbgEng engine.
+    pub fn new_windbg() -> Harness {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let session = Arc::new(SessionManager::new());
+        let factory = windbg_like_factory(Arc::clone(&state));
+        let server = ToolServer::new(Arc::clone(&session), single_factory_registry(factory));
+        Harness {
+            server,
+            session,
+            state,
+        }
+    }
+
+    /// Build a server whose ONLY registered factory is named `"windbg"` but whose
+    /// `connect()` fails with `err`. The force-select succeeds (name-based), so the FAILURE
+    /// lands at the connect phase — exercising the `open_crash_dump`/`attach_kernel`
+    /// connect-error branch (`session.reset()` + `clear_backend()` + `connect_error`).
+    pub fn new_windbg_connect_error(err: BackendError) -> Harness {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let session = Arc::new(SessionManager::new());
+        let factory = windbg_like_connect_error_factory(Arc::clone(&state), err);
         let server = ToolServer::new(Arc::clone(&session), single_factory_registry(factory));
         Harness {
             server,

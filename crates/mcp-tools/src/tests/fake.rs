@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use debugger_core::{
-    AttachOutcome, AttachSpec, BackendError, BackendEvent, BackendFactory, BreakpointResult,
-    Connection, DebuggerBackend, EvalMode, EvalResult, Frame, FunctionBp, Granularity, Instruction,
-    LaunchOutcome, LaunchSpec, MemoryRead, Scope, SourceBp, StepKind, StopOutcome, ThreadInfo,
-    Variable,
+    AttachOutcome, AttachSpec, BackendCapabilities, BackendError, BackendEvent, BackendFactory,
+    BreakpointResult, Connection, DebuggerBackend, DumpOutcome, EvalMode, EvalResult, Frame,
+    FunctionBp, Granularity, Instruction, LaunchOutcome, LaunchSpec, MemoryRead, ModuleInfo, Scope,
+    SourceBp, StepKind, StopOutcome, ThreadInfo, Variable,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use tokio::sync::oneshot;
@@ -67,6 +67,14 @@ pub enum Call {
         address: String,
         count: i64,
     },
+    OpenDump {
+        path: String,
+    },
+    AttachKernel {
+        connection: String,
+    },
+    Analyze,
+    Modules,
 }
 
 /// Canned responses + a recording of the calls made. Wrap in an `Arc` and share between
@@ -89,6 +97,14 @@ pub struct FakeState {
     pub evaluate_result: Option<Result<EvalResult, BackendError>>,
     pub read_memory_result: Option<Result<MemoryRead, BackendError>>,
     pub disassemble_result: Option<Result<Vec<Instruction>, BackendError>>,
+
+    // The four WinDbg-only methods. `None` ⇒ the trait-default `Unsupported` (matching a
+    // backend that does not implement them, e.g. lldb); set them to script a success outcome
+    // and pin the handler's response shape.
+    pub open_dump_result: Option<Result<DumpOutcome, BackendError>>,
+    pub attach_kernel_result: Option<Result<AttachOutcome, BackendError>>,
+    pub analyze_result: Option<Result<String, BackendError>>,
+    pub modules_result: Option<Result<Vec<ModuleInfo>, BackendError>>,
 
     /// When set, the `cont` call awaits this receiver before returning — lets a test hold a
     /// `continue` blocked while another op (`pause`) runs (the concurrency test).
@@ -336,6 +352,51 @@ impl DebuggerBackend for FakeBackend {
             .unwrap_or(Ok(Vec::new()))
     }
 
+    async fn open_dump(&self, path: &str) -> Result<DumpOutcome, BackendError> {
+        self.record(Call::OpenDump {
+            path: path.to_string(),
+        });
+        // `None` ⇒ the trait-default `Unsupported("open_crash_dump")` (the lldb path).
+        self.state
+            .lock()
+            .unwrap()
+            .open_dump_result
+            .take()
+            .unwrap_or(Err(BackendError::Unsupported("open_crash_dump")))
+    }
+
+    async fn attach_kernel(&self, connection: &str) -> Result<AttachOutcome, BackendError> {
+        self.record(Call::AttachKernel {
+            connection: connection.to_string(),
+        });
+        self.state
+            .lock()
+            .unwrap()
+            .attach_kernel_result
+            .take()
+            .unwrap_or(Err(BackendError::Unsupported("attach_kernel")))
+    }
+
+    async fn analyze(&self) -> Result<String, BackendError> {
+        self.record(Call::Analyze);
+        self.state
+            .lock()
+            .unwrap()
+            .analyze_result
+            .take()
+            .unwrap_or(Err(BackendError::Unsupported("analyze_crash")))
+    }
+
+    async fn modules(&self) -> Result<Vec<ModuleInfo>, BackendError> {
+        self.record(Call::Modules);
+        self.state
+            .lock()
+            .unwrap()
+            .modules_result
+            .take()
+            .unwrap_or(Err(BackendError::Unsupported("get_modules")))
+    }
+
     fn supports_command_repl_mode(&self) -> bool {
         self.state.lock().unwrap().repl_capable
     }
@@ -353,6 +414,9 @@ pub struct FakeFactory {
     /// The name reported via `BackendFactory::name()` — drives the registry key and the
     /// backend-aware `connect_error` wording. Defaults to `"fake"`.
     pub name: &'static str,
+    /// The capabilities reported via `BackendFactory::capabilities()` — drives the
+    /// capability-gated tool surface. Defaults to all-false (lldb).
+    pub capabilities: BackendCapabilities,
 }
 
 impl FakeFactory {
@@ -361,6 +425,7 @@ impl FakeFactory {
             state,
             connect_error: Mutex::new(None),
             name: "fake",
+            capabilities: BackendCapabilities::default(),
         }
     }
 
@@ -369,6 +434,7 @@ impl FakeFactory {
             state,
             connect_error: Mutex::new(Some(err)),
             name: "fake",
+            capabilities: BackendCapabilities::default(),
         }
     }
 
@@ -384,6 +450,7 @@ impl FakeFactory {
             state,
             connect_error: Mutex::new(Some(err)),
             name,
+            capabilities: BackendCapabilities::default(),
         }
     }
 }
@@ -392,6 +459,10 @@ impl FakeFactory {
 impl BackendFactory for FakeFactory {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        self.capabilities
     }
 
     async fn connect(&self) -> Result<Connection, BackendError> {
@@ -420,6 +491,46 @@ pub fn named_factory(name: &'static str, state: Arc<Mutex<FakeState>>) -> Arc<Fa
         state,
         connect_error: Mutex::new(None),
         name,
+        capabilities: BackendCapabilities::default(),
+    })
+}
+
+/// A [`FakeFactory`] named `"windbg"` reporting all-true capabilities — stands in for the
+/// real `WinDbgFactory` so the cross-platform handler tests can force-select `"windbg"`
+/// (the `open_crash_dump`/`attach_kernel` connect path) and exercise the four
+/// capability-gated tools' SUCCESS response shapes without a live DbgEng engine.
+pub fn windbg_like_factory(state: Arc<Mutex<FakeState>>) -> Arc<FakeFactory> {
+    Arc::new(FakeFactory {
+        state,
+        connect_error: Mutex::new(None),
+        name: "windbg",
+        capabilities: BackendCapabilities {
+            crash_dump: true,
+            kernel: true,
+            analyze: true,
+            modules: true,
+        },
+    })
+}
+
+/// A [`FakeFactory`] named `"windbg"` (all-true capabilities, like [`windbg_like_factory`])
+/// whose `connect()` fails with `err`. Lets a cross-platform test force-select `"windbg"`
+/// successfully (the select is name-based) and exercise the connect-FAILURE branch of the
+/// `open_crash_dump`/`attach_kernel` handlers (reset + clear_backend + `connect_error`).
+pub fn windbg_like_connect_error_factory(
+    state: Arc<Mutex<FakeState>>,
+    err: BackendError,
+) -> Arc<FakeFactory> {
+    Arc::new(FakeFactory {
+        state,
+        connect_error: Mutex::new(Some(err)),
+        name: "windbg",
+        capabilities: BackendCapabilities {
+            crash_dump: true,
+            kernel: true,
+            analyze: true,
+            modules: true,
+        },
     })
 }
 
