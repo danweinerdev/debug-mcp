@@ -15,12 +15,12 @@ tasks:
     depends_on: []
   - id: "5.1"
     title: "Engine-side conditional breakpoints"
-    status: pending
+    status: complete
     verification: "A conditional breakpoint fires only when the condition holds (e.g. `i == 5` in a loop fixture): the `go` poll loop, on a BP stop, evaluates `@@c++( (cond) ? 1 : 0 )` and resumes when false; an **unresolvable** condition (variable out of scope) silently skips (the documented C++ footgun) — both paths are covered by fixture tests; conditions survive in the engine-side map across `remove`/`list`."
     depends_on: ["5.0"]
   - id: "5.2"
     title: "R6 ASLR address-BP handling + R2 orphaned-thread pump fix"
-    status: pending
+    status: in-progress
     verification: "A `module!sym` function breakpoint re-flushes correctly across a relaunch (rebase-stable); a bare `0x<addr>` breakpoint is routed via `run_command(\"bp <addr>\")` and is **not** session-tracked — a relaunch test shows no misplaced breakpoint, and the `set_function_breakpoint` description warns about address+ASLR when windbg is active; an orphaned kernel-attach engine thread still drives the session to `terminated` via a synthetic `Terminated` (dead-flag / explicit event-sender close), so a fresh `launch` reconnects without a hung event-pump."
     depends_on: ["5.1"]
   - id: "5.3"
