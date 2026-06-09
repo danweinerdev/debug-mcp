@@ -3,9 +3,9 @@ title: "WinDbg Extras — dump / kernel / analyze / modules (25 tools)"
 type: phase
 plan: WinDbgBackend
 phase: 4
-status: in-progress
+status: complete
 created: 2026-06-03
-updated: 2026-06-08
+updated: 2026-06-09
 deliverable: "The four WinDbg-only capabilities wired end-to-end: open_crash_dump, attach_kernel, analyze_crash, get_modules — backed by dbgeng-sys dump/kernel/analyze/modules and the windbg-backend trait methods — with the Crash and Dump integration groups green and 25 tools live on Windows."
 tasks:
   - id: "4.1"
@@ -25,7 +25,7 @@ tasks:
     depends_on: ["4.2"]
   - id: "4.4"
     title: "Integration: Crash + Dump groups"
-    status: in-progress
+    status: complete
     verification: "The `integration-windbg` Crash group (breakpoint on the crash function, access-violation detection, `!analyze -v`, exception record) and Dump group (generate a dump via `.dump`, `open_crash_dump`, full analyze→backtrace→variables) pass against the ported fixture; the lldb suite stays green; clippy `-D warnings`/`fmt` clean on the Windows lane."
     depends_on: ["4.3"]
 ---
