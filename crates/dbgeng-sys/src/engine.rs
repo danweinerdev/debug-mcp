@@ -38,13 +38,14 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     IDebugSystemObjects4, DEBUG_ANY_ID, DEBUG_ATTACH_DEFAULT, DEBUG_ATTACH_KERNEL_CONNECTION,
     DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED, DEBUG_CREATE_PROCESS_OPTIONS,
     DEBUG_END_ACTIVE_DETACH, DEBUG_END_ACTIVE_TERMINATE, DEBUG_END_PASSIVE,
-    DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EXECUTE_DEFAULT, DEBUG_EXECUTE_NOT_LOGGED,
-    DEBUG_INTERRUPT_ACTIVE, DEBUG_MODNAME_MODULE, DEBUG_MODULE_PARAMETERS, DEBUG_OUTCTL_IGNORE,
-    DEBUG_OUTCTL_THIS_CLIENT, DEBUG_SCOPE_GROUP_LOCALS, DEBUG_STACK_FRAME, DEBUG_STATUS_BREAK,
-    DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED,
-    DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO,
-    DEBUG_STATUS_STEP_OVER, DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED,
-    DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM,
+    DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_DEFAULT,
+    DEBUG_EXECUTE_NOT_LOGGED, DEBUG_INTERRUPT_ACTIVE, DEBUG_LAST_EVENT_INFO_BREAKPOINT,
+    DEBUG_MODNAME_MODULE, DEBUG_MODULE_PARAMETERS, DEBUG_OUTCTL_IGNORE, DEBUG_OUTCTL_THIS_CLIENT,
+    DEBUG_SCOPE_GROUP_LOCALS, DEBUG_STACK_FRAME, DEBUG_STATUS_BREAK, DEBUG_STATUS_GO,
+    DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_NO_DEBUGGEE,
+    DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO, DEBUG_STATUS_STEP_OVER,
+    DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
+    DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_INT64,
 };
 use windows::Win32::System::Diagnostics::Debug::SYMOPT_NO_IMAGE_SEARCH;
 use windows::Win32::System::Registry::{
@@ -408,9 +409,16 @@ impl Engine {
     /// absolute offset, then `AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)` →
     /// `SetOffset(addr)` → `AddFlags(DEBUG_BREAKPOINT_ENABLED)` → `GetId()`.
     ///
-    /// The `condition` is *stored* (keyed by breakpoint id) but not yet evaluated: DbgEng's
-    /// command-string conditions cannot work with our `WaitForEvent` poll loop, so the conditional
-    /// re-loop in `wait_for_event` is deferred to Phase 5. An empty `condition` stores nothing.
+    /// The `condition` is *stored* (keyed by breakpoint id) and evaluated engine-side in the
+    /// `wait_for_event` conditional re-loop (DbgEng's command-string conditions cannot drive our
+    /// `WaitForEvent` poll loop). An empty `condition` stores nothing.
+    ///
+    /// # Condition evaluation
+    ///
+    /// A `condition` that fails to evaluate at the stop (out-of-scope variable, typo, or partial
+    /// parse) is treated as `false` — the breakpoint is silently SKIPPED, matching C++ DbgEng
+    /// behavior. There is no API-level notification; a condition referencing a not-yet-loaded symbol
+    /// will never fire.
     pub fn set_breakpoint(
         &mut self,
         loc: &BpLoc,
@@ -1604,6 +1612,73 @@ impl Engine {
         }
     }
 
+    /// Whether the stored condition for breakpoint `bp_id` is satisfied at the current stop. Ports
+    /// the C++ `EvaluateBreakpointCondition`:
+    ///
+    /// - **No stored condition** → `true` (an unconditional breakpoint always stops). This is the
+    ///   common case for the not-found path; the `wait_for_event` hook only calls this when the
+    ///   condition map is non-empty, but a hit on a *different* (unconditional) breakpoint still
+    ///   lands here and must stop.
+    /// - **Has a condition** → evaluate `@@c++( (<cond>) ? 1 : 0 )` as a typed `INT64` via
+    ///   `IDebugControl::Evaluate`. A successful eval stops iff the result is non-zero.
+    /// - **Eval failed** (`Err`) → `false` (skip). The documented C++ footgun: a condition that
+    ///   references a variable not yet in scope fails to evaluate, and we treat that as
+    ///   "condition not met" so the breakpoint is silently resumed rather than spuriously stopping.
+    fn breakpoint_condition_met(&mut self, bp_id: u32) -> bool {
+        let Some(condition) = self.breakpoint_conditions.get(&bp_id) else {
+            return true; // No condition — always stop.
+        };
+
+        // Wrap the C++ condition in a boolean projection so the typed result is exactly 0 or 1.
+        let expr = condition_expr(condition);
+        // Bind the NUL-terminated string to a named local so its backing allocation outlives the
+        // `Evaluate` call (the runtime-string lifetime rule — a `CString` temporary would be freed
+        // before the FFI read otherwise). On an interior NUL the condition is unusable: skip.
+        let Ok(expr_c) = CString::new(expr) else {
+            return false;
+        };
+
+        // The byte length of the expression *excluding* the NUL terminator. `Evaluate` writes
+        // `remainder` as the index of the first character it did NOT consume; a fully-parsed
+        // expression consumes the whole string, so `remainder` lands at the end (the NUL index,
+        // i.e. == `expr_len`). A *partial* parse stops earlier (`remainder < expr_len`).
+        let expr_len = expr_c.as_bytes().len() as u32;
+        let mut value = DEBUG_VALUE::default();
+        let mut remainder = 0u32;
+        // SAFETY: `self.control` is a live `IDebugControl4` from `create`. `expr_c` is NUL-terminated
+        // and outlives the call (the engine reads it synchronously here); `DEBUG_VALUE_INT64` is a
+        // documented desired-type constant; `value`/`remainder` are valid &mut out-params. Evaluate
+        // does not retain any pointer past the call.
+        let eval = unsafe {
+            self.control.Evaluate(
+                PCSTR(expr_c.as_ptr().cast()),
+                DEBUG_VALUE_INT64,
+                &mut value,
+                Some(&mut remainder),
+            )
+        };
+        if eval.is_err() {
+            // Eval failed — likely the variable isn't in scope yet (the documented footgun). Treat
+            // as "condition not met" and skip the stop.
+            return false;
+        }
+        // Partial-parse guard: `remainder` is the index of the first character `Evaluate` did not
+        // consume. A complete parse reaches the end (`remainder >= expr_len`); a partial parse stops
+        // before the expression's end (`remainder < expr_len`), leaving `value` from a fragment.
+        // Treat a partial parse as eval-failure and skip (same policy as the `is_err()` branch
+        // above), so a future `condition_expr` bug is a safe skip rather than a silent wrong result.
+        if remainder < expr_len {
+            return false;
+        }
+        // SAFETY: `Evaluate` succeeded with `DEBUG_VALUE_INT64` as the desired type, so the engine
+        // populated the `I64` arm of the `DEBUG_VALUE` union; reading that arm of the union is the
+        // active variant. (The C++ oracle reads `result.I64`; in the windows-crate the field lives
+        // at `Anonymous.Anonymous.I64`.) Note the `I64` field is `ULONG64`/`u64` despite its name;
+        // the only operation here is `!= 0`, which is correct for either signedness.
+        let cond_value: u64 = unsafe { value.Anonymous.Anonymous.I64 };
+        cond_value != 0
+    }
+
     /// Wait for the next debug event, distinguishing a real event (`S_OK`) from a timeout
     /// (`S_FALSE`). Ports the C++ `WaitForEvent` helper, incl. the "resumed by a BP command →
     /// keep waiting" loop. Shared by launch/attach (here) and go/step (task 2.4).
@@ -1634,8 +1709,10 @@ impl Engine {
                 // SAFETY: live control interface; returns a u32 by value.
                 let status = unsafe { self.control.GetExecutionStatus() }
                     .map_err(|e| EngineError::op("GetExecutionStatus", e))?;
-                // If a breakpoint command resumed execution, keep waiting (C++ behavior). The
-                // conditional-breakpoint re-loop (GetLastEventInformation + Evaluate) is Phase 5.
+                // If a breakpoint command resumed execution, keep waiting (C++ behavior). This is
+                // the *resumed* case (the engine reports a GO/STEP status); the conditional re-loop
+                // below is the other case — a genuine `DEBUG_STATUS_BREAK` stop whose stored
+                // condition is false.
                 if matches!(
                     status,
                     DEBUG_STATUS_GO
@@ -1647,6 +1724,63 @@ impl Engine {
                 ) {
                     continue;
                 }
+
+                // Conditional-breakpoint re-loop (ports the C++ `WaitForEvent` tail). DbgEng's
+                // command-string conditions can't drive our poll loop, so the condition lives in
+                // `breakpoint_conditions` and is evaluated here. Only meaningful for a genuine
+                // BREAK stop with at least one stored condition.
+                if status == DEBUG_STATUS_BREAK && !self.breakpoint_conditions.is_empty() {
+                    let mut event_type = 0u32;
+                    let mut process_id = 0u32;
+                    let mut thread_id = 0u32;
+                    let mut bp_info = DEBUG_LAST_EVENT_INFO_BREAKPOINT::default();
+                    let mut extra_used = 0u32;
+                    // SAFETY: `self.control` is a live `IDebugControl4`. The three id out-params are
+                    // valid `&mut u32`s; `bp_info` is a valid `DEBUG_LAST_EVENT_INFO_BREAKPOINT` we
+                    // pass as the extra-information buffer with its true byte size, and `extra_used`
+                    // receives the bytes written. We pass `None`/`None` for the description buffer
+                    // (the C++ passes `nullptr, 0, nullptr`). The engine writes only into these
+                    // locals and retains no pointer past the call.
+                    let last_event = unsafe {
+                        self.control.GetLastEventInformation(
+                            &mut event_type,
+                            &mut process_id,
+                            &mut thread_id,
+                            Some((&mut bp_info as *mut DEBUG_LAST_EVENT_INFO_BREAKPOINT).cast()),
+                            std::mem::size_of::<DEBUG_LAST_EVENT_INFO_BREAKPOINT>() as u32,
+                            Some(&mut extra_used),
+                            None,
+                            None,
+                        )
+                    };
+
+                    if last_event.is_ok()
+                        && event_type == DEBUG_EVENT_BREAKPOINT
+                        && !self.breakpoint_condition_met(bp_info.Id)
+                    {
+                        // The stop is a breakpoint whose condition is false: resume and keep
+                        // waiting. `continue` re-enters *this* `wait_for_event` call's loop, so a
+                        // `go(timeout_ms)` poll slice that resumes a false-condition BP keeps
+                        // waiting up to its own 200 ms slice, times out (S_FALSE → `TimedOut`), and
+                        // the outer `go` loop re-polls — leaving the interrupt-flag/deadline checks
+                        // in `go` fully intact (a resumed-then-still-running slice is just a normal
+                        // timeout to `go`). The non-poll callers (launch/attach/break paths) use a
+                        // single long `wait_for_event`, where the re-loop simply waits again within
+                        // that one call.
+                        // SAFETY: live control interface; `DEBUG_STATUS_GO` is the documented resume
+                        // status u32. No pointers cross the boundary.
+                        unsafe { self.control.SetExecutionStatus(DEBUG_STATUS_GO) }
+                            .map_err(|e| EngineError::op("SetExecutionStatus(GO)", e))?;
+                        // Bounded per-slice for finite-timeout callers (each `go` slice is 200 ms,
+                        // interrupt checked between slices). For `attach_kernel(INFINITE)` a rapid
+                        // false-condition BP loop would be unbounded here with no interrupt check —
+                        // mitigated in practice by `breakpoint_conditions.clear()` at attach entry
+                        // (no conditions exist at the initial kernel break, so this branch can't be
+                        // reached on that path).
+                        continue;
+                    }
+                }
+
                 return Ok(WaitResult::Event(self.build_stop_outcome(status)?));
             } else if hr == windows::core::HRESULT(1) {
                 // S_FALSE: the wait reached its deadline with no event.
@@ -1803,6 +1937,14 @@ impl Bp {
 fn cstr_from_buf(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Build the typed-evaluator expression for a breakpoint condition. Ports the C++
+/// `EvaluateBreakpointCondition` string: wrap the user's C++ condition in `@@c++( (<cond>) ? 1 : 0 )`
+/// so `IDebugControl::Evaluate` with `DEBUG_VALUE_INT64` yields exactly `0` or `1`. Pure (FFI-free)
+/// so the formatting is unit-testable; the live tests carry the evaluation itself.
+pub(crate) fn condition_expr(condition: &str) -> String {
+    format!("@@c++( ({condition}) ? 1 : 0 )")
 }
 
 /// Read the `KitsRoot10` value (REG_SZ or REG_EXPAND_SZ — see the flags below) from

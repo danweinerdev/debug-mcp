@@ -13,8 +13,8 @@ use debugger_core::ModuleInfo;
 use std::path::Path;
 
 use crate::engine::{
-    discover_debuggers_root_with, extension_dirs, select_existing_root, symbol_status,
-    truncate_output,
+    condition_expr, discover_debuggers_root_with, extension_dirs, select_existing_root,
+    symbol_status, truncate_output,
 };
 use crate::InterruptHandle;
 
@@ -26,6 +26,25 @@ use crate::InterruptHandle;
 fn interrupt_handle_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<InterruptHandle>();
+}
+
+/// The breakpoint-condition expression builder wraps the user's C++ condition in the
+/// `@@c++( (<cond>) ? 1 : 0 )` boolean projection the typed `Evaluate(DEBUG_VALUE_INT64)` call
+/// expects (so the result is exactly 0 or 1). This is the one pure, FFI-free slice of the
+/// conditional-breakpoint logic; the evaluation itself is exercised by the live tests in
+/// `tests/conditional_breakpoints.rs`.
+#[test]
+fn condition_expr_wraps_in_the_cpp_boolean_projection() {
+    assert_eq!(condition_expr("i == 5"), "@@c++( (i == 5) ? 1 : 0 )");
+    assert_eq!(
+        condition_expr("nonexistent_xyz == 1"),
+        "@@c++( (nonexistent_xyz == 1) ? 1 : 0 )"
+    );
+    // The condition is embedded verbatim (no escaping) — parity with the C++ string concatenation.
+    assert_eq!(
+        condition_expr("sum > 0 && i < n"),
+        "@@c++( (sum > 0 && i < n) ? 1 : 0 )"
+    );
 }
 
 /// The `symbol_status` map produces exactly the documented neutral vocabulary
