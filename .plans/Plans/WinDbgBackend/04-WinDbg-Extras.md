@@ -15,12 +15,12 @@ tasks:
     depends_on: []
   - id: "4.2"
     title: "windbg-backend: the four trait methods → engine"
-    status: in-progress
+    status: complete
     verification: "`open_dump`/`attach_kernel`/`analyze`/`modules` trait impls marshal to the engine thread and return the neutral types; `WinDbgFactory::capabilities()` reflects all four as supported; `open_dump`/`attach_kernel` follow the connect-point pattern (a fresh engine thread per session); a dump session correctly maps the `cannot continue a crash-dump session` error from the engine."
     depends_on: ["4.1"]
   - id: "4.3"
     title: "Wire the four tools end-to-end + capability listing"
-    status: pending
+    status: in-progress
     verification: "`open_crash_dump`/`attach_kernel` (connect points selecting windbg) and `analyze_crash`/`get_modules` (active backend) drive their engine methods; an end-to-end dump flow (`open_crash_dump` → `analyze_crash` → `backtrace` → `variables`) succeeds; `get_modules` returns the module list; the `attach_kernel` error path returns/cancels cleanly; `list_tools` advertises 25 on Windows; the four tools still return `Unsupported` against an active lldb session."
     depends_on: ["4.2"]
   - id: "4.4"
