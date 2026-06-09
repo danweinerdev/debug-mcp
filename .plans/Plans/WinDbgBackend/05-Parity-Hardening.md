@@ -10,7 +10,7 @@ deliverable: "Behavioral parity with the C++ oracle closed out: engine-side cond
 tasks:
   - id: "5.0"
     title: "Runtime debugger-extension path discovery (R8 refinement)"
-    status: in-progress
+    status: complete
     verification: "`ensure_extensions_loaded` no longer hardcodes the WinKits install path: it discovers the Debuggers\\x64 root at runtime (registry `KitsRoot10` under `SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots`, native + WOW6432Node views; then `WindowsSdkDir` env; then the former hardcoded default as a last resort), appends only the `winext`/`winxp`/base dirs that actually EXIST to the `.extpath`, then `.load ext.dll`; the discovery result (resolved root or 'no extensions found') is observable, not silently swallowed. Live on a host with the full Debugging Tools installed, `analyze()` returns a real `!analyze -v` report (contains a recognizable token e.g. `EXCEPTION`/`FAULTING`/`ACCESS_VIOLATION`), and the 4.4 integration analyze assertion is tightened to take the strict branch; on a host WITHOUT the extensions the discovery degrades cleanly (empty extpath, `analyze` returns the engine's `No export analyze found`) with no panic. The registry read is confined `unsafe` in `dbgeng-sys` with `// SAFETY:` comments; unit tests cover the path-assembly/existence-filter logic with injected roots."
     depends_on: []
   - id: "5.1"
