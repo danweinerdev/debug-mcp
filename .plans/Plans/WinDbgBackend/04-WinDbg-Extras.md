@@ -20,12 +20,12 @@ tasks:
     depends_on: ["4.1"]
   - id: "4.3"
     title: "Wire the four tools end-to-end + capability listing"
-    status: in-progress
+    status: complete
     verification: "`open_crash_dump`/`attach_kernel` (connect points selecting windbg) and `analyze_crash`/`get_modules` (active backend) drive their engine methods; an end-to-end dump flow (`open_crash_dump` → `analyze_crash` → `backtrace` → `variables`) succeeds; `get_modules` returns the module list; the `attach_kernel` error path returns/cancels cleanly; `list_tools` advertises 25 on Windows; the four tools still return `Unsupported` against an active lldb session."
     depends_on: ["4.2"]
   - id: "4.4"
     title: "Integration: Crash + Dump groups"
-    status: pending
+    status: in-progress
     verification: "The `integration-windbg` Crash group (breakpoint on the crash function, access-violation detection, `!analyze -v`, exception record) and Dump group (generate a dump via `.dump`, `open_crash_dump`, full analyze→backtrace→variables) pass against the ported fixture; the lldb suite stays green; clippy `-D warnings`/`fmt` clean on the Windows lane."
     depends_on: ["4.3"]
 ---
