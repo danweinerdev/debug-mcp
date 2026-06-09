@@ -199,9 +199,11 @@ fn open_dump_missing_file_errors_and_fresh_engine_is_runnable() {
 /// session is refused by `ensure_runnable`/`go` with the frozen literal. The temp dump file is
 /// removed on every path.
 ///
-/// Leniency: `!analyze -v` output varies with symbol availability (no public symbol server is
-/// assumed here), so the analyze assertion is "non-empty" rather than a specific token. The
-/// `crash_location` may be `Some` or `None` depending on line-info resolution; both are accepted.
+/// Analyze assertion (task 5.0): runtime extension discovery makes the rich `!analyze -v` report
+/// available on a properly-installed host, so the test now PREFERS the strict crash-token check and
+/// only falls back to graceful degradation on the explicit `No export` sentinel (an extension-less
+/// CI host). The `crash_location` may be `Some` or `None` depending on line-info resolution; both
+/// are accepted.
 #[test]
 fn live_dump_round_trip_open_analyze_modules_guard() {
     if should_skip() {
@@ -316,12 +318,39 @@ fn live_dump_round_trip_open_analyze_modules_guard() {
             }
         }
 
-        // analyze() must return non-empty text (content varies by symbols — lenient).
+        // analyze() must return a non-empty report. With the task-5.0 runtime extension discovery
+        // and a full Debugging Tools install, `!analyze -v` resolves and yields a RICH report; we
+        // assert the strict token check and only fall back to the documented graceful-degradation
+        // branch on the explicit `No export` sentinel (an extension-less CI host).
         let report = engine.analyze().map_err(|e| format!("analyze: {e}"))?;
         if report.trim().is_empty() {
             return Err("analyze() returned empty text".to_string());
         }
         eprintln!("analyze() returned {} bytes", report.len());
+        eprintln!(
+            "analyze() head: {}",
+            report.chars().take(400).collect::<String>()
+        );
+        let lc = report.to_ascii_lowercase();
+        if lc.contains("no export") {
+            // Extension did not resolve (no Debugging Tools on this host) — degrade gracefully.
+            eprintln!(
+                "analyze() degraded: '!analyze' extension unavailable (No export) — \
+                 install Debugging Tools for Windows for the rich report"
+            );
+        } else {
+            // Strict branch: a real crash report mentions one of these tokens.
+            let has_token = ["exception", "faulting", "access_violation", "bugcheck"]
+                .iter()
+                .any(|t| lc.contains(t));
+            if !has_token {
+                return Err(format!(
+                    "analyze() resolved the extension but the report lacks a recognizable \
+                     crash token (exception/faulting/access_violation/bugcheck); head: {}",
+                    report.chars().take(400).collect::<String>()
+                ));
+            }
+        }
 
         let _ = engine.detach(false);
         Ok(())
@@ -332,6 +361,58 @@ fn live_dump_round_trip_open_analyze_modules_guard() {
     if let Err(msg) = result {
         panic!("{msg}");
     }
+}
+
+/// Live analyze-resolves proof (task 5.0, Windows, skip-if-fixture-absent + LIVE mutex). Launch the
+/// crashing `null` fixture, run to the access violation, and call `analyze()` on the LIVE session —
+/// the whole point of runtime extension discovery is that `!analyze -v` now resolves wherever the
+/// Debugging Tools are installed (not just the default path). On a properly-installed host this
+/// yields a RICH report (asserted via the strict crash-token check); on an extension-less CI host it
+/// degrades gracefully (the `No export` sentinel). On any non-graceful miss we surface the exact
+/// `analyze()` head so a failure tells us whether discovery actually worked.
+#[test]
+fn live_analyze_resolves_on_a_launched_crash() {
+    if should_skip() {
+        return;
+    }
+    let _guard = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+
+    let mut engine = Engine::create().expect("create engine");
+    engine.launch(&launch_req("null")).expect("launch null");
+
+    // Run to the access violation (crash_null writes to 0x0). `go` returns the AV stop.
+    let outcome = engine.go(10_000);
+    eprintln!("go-to-AV outcome = {outcome:?}");
+
+    let report = engine.analyze().expect("analyze");
+    assert!(!report.trim().is_empty(), "analyze() returned empty text");
+    eprintln!("live analyze() returned {} bytes", report.len());
+    eprintln!(
+        "live analyze() head: {}",
+        report.chars().take(400).collect::<String>()
+    );
+
+    let lc = report.to_ascii_lowercase();
+    if lc.contains("no export") {
+        // Graceful-degradation branch: the extension did not resolve (no Debugging Tools here).
+        eprintln!(
+            "live analyze() degraded: '!analyze' extension unavailable (No export) — \
+             install Debugging Tools for Windows for the rich report"
+        );
+    } else {
+        // Strict branch: a real crash report names one of these tokens (case-insensitive).
+        let has_token = ["exception", "faulting", "access_violation", "bugcheck"]
+            .iter()
+            .any(|t| lc.contains(t));
+        assert!(
+            has_token,
+            "analyze() resolved the extension but the report lacks a recognizable crash token \
+             (exception/faulting/access_violation/bugcheck); head: {}",
+            report.chars().take(400).collect::<String>()
+        );
+    }
+
+    let _ = engine.detach(true);
 }
 
 /// Live KDNET kernel attach. `#[ignore]` by default: it needs a REACHABLE KDNET target (a VM

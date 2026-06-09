@@ -622,22 +622,18 @@ async fn crash_session_detects_access_violation_and_analyzes() {
         "the faulting backtrace must contain crash_null, got {frame_names:?}"
     );
 
-    // analyze_crash → returns an `analysis` string. The C++ asserts a long report with
-    // specific `!analyze -v` tokens (EXCEPTION_RECORD / STACK_TEXT /
-    // FAULTING_LOCAL_VARIABLE_NAME), but `!analyze -v`'s output depends on the analyze
-    // EXTENSION (`ext.dll`) resolving in this environment. This host has only the SDK
-    // debugger-support subset, NOT a full "Debugging Tools for Windows" install, so the
-    // extension does not resolve and `analyze_crash` returns the DbgEng error string
-    // `"No export analyze found\n"` (24 chars) for BOTH the live session here AND the dump
-    // session (see the dump test) — the two comments are consistent on this point. Resolving
-    // the rich report requires the analyze extension to be found via the R8 `.extpath`, which
-    // is a Phase-5 concern (runtime ext-path discovery); it is NOT asserted on either session.
+    // analyze_crash → returns an `analysis` string. The C++ asserts a long report with specific
+    // `!analyze -v` tokens (EXCEPTION_RECORD / STACK_TEXT / FAULTING_LOCAL_VARIABLE_NAME). The rich
+    // report requires the analyze EXTENSION (`ext.dll`) to resolve via the `.extpath`; task 5.0
+    // (runtime ext-path discovery: registry `KitsRoot10` → `WindowsSdkDir` → default, existence-
+    // filtered) makes that resolve wherever the Debugging Tools for Windows are installed, so on a
+    // properly-installed host this is now a RICH report and the STRICT token branch fires.
     //
-    // So the STRUCTURAL contract we assert is only that `analyze_crash` returns a non-empty
-    // `analysis` string through the tool layer. The unconditional branch tolerates the
-    // missing-extension case (Phase-5 ext-path discovery); the conditional branch makes the
-    // test meaningfully falsifiable on a full-install machine: if the extension HAS resolved
-    // (no "No export" error), a resolved-but-broken analyze path that returns garbage fails.
+    // We therefore PREFER the strict crash-token check and only fall back to graceful degradation on
+    // the explicit `No export` sentinel — the documented escape for an extension-less CI host that
+    // lacks the Debugging Tools entirely (there `analyze_crash` returns the DbgEng error string
+    // `"No export analyze found\n"`). A resolved-but-garbage analyze path still fails the strict
+    // branch.
     let analyzed = h.call_default("analyze_crash", empty()).await;
     let analyzed = expect_json_obj("analyze_crash", &analyzed);
     let analysis = analyzed["analysis"].as_str().unwrap_or("");
@@ -645,8 +641,13 @@ async fn crash_session_detects_access_violation_and_analyzes() {
         !analysis.trim().is_empty(),
         "analyze_crash returns a non-empty analysis string"
     );
-    if !analysis.contains("No export") {
-        // The analyze extension resolved — assert it's a real crash report, not garbage.
+    if analysis.to_ascii_lowercase().contains("no export") {
+        eprintln!(
+            "analyze_crash degraded: '!analyze' extension unavailable (No export) — \
+             install Debugging Tools for Windows for the rich report"
+        );
+    } else {
+        // The analyze extension resolved (task 5.0) — assert it's a real crash report, not garbage.
         let lower = analysis.to_lowercase();
         assert!(
             ["exception", "faulting", "stack", "access_violation"]
@@ -875,14 +876,11 @@ async fn dump_generate_open_analyze_and_reject_execution() {
         "get_modules on the dump must include test_target, got {mod_names:?}"
     );
 
-    // analyze_crash → non-empty. Like the live crash session, the rich `!analyze -v` report
-    // depends on the analyze EXTENSION (`ext.dll`) resolving via the R8 `.extpath`; on this
-    // host (SDK debugger-support subset, no full "Debugging Tools for Windows" install) it
-    // returns the DbgEng `"No export analyze found"` error for both live and dump targets, so
-    // we assert only the structural contract — a non-empty `analysis` string through the tool
-    // layer. The unconditional branch tolerates the missing-extension case (Phase-5 ext-path
-    // discovery); the conditional branch guards against a resolved-but-broken analyze path —
-    // where the extension resolves, this same call must yield a recognizable crash report.
+    // analyze_crash → non-empty. Like the live crash session, the rich `!analyze -v` report depends
+    // on the analyze EXTENSION (`ext.dll`) resolving via the `.extpath`; task 5.0 (runtime ext-path
+    // discovery via the registry `KitsRoot10`) makes that resolve on a properly-installed host, so
+    // we PREFER the strict crash-token check here too and only fall back to graceful degradation on
+    // the explicit `No export` sentinel (an extension-less CI host with no Debugging Tools install).
     let analyzed = h.call_default("analyze_crash", empty()).await;
     let analyzed = expect_json_obj("analyze_crash(dump)", &analyzed);
     let analysis = analyzed["analysis"].as_str().unwrap_or("");
@@ -890,8 +888,13 @@ async fn dump_generate_open_analyze_and_reject_execution() {
         !analysis.trim().is_empty(),
         "analyze_crash returns a non-empty analysis string"
     );
-    if !analysis.contains("No export") {
-        // The analyze extension resolved — assert it's a real crash report, not garbage.
+    if analysis.to_ascii_lowercase().contains("no export") {
+        eprintln!(
+            "analyze_crash(dump) degraded: '!analyze' extension unavailable (No export) — \
+             install Debugging Tools for Windows for the rich report"
+        );
+    } else {
+        // The analyze extension resolved (task 5.0) — assert it's a real crash report, not garbage.
         let lower = analysis.to_lowercase();
         assert!(
             ["exception", "faulting", "stack", "access_violation"]

@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::mem::ManuallyDrop;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,6 +47,10 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM,
 };
 use windows::Win32::System::Diagnostics::Debug::SYMOPT_NO_IMAGE_SEARCH;
+use windows::Win32::System::Registry::{
+    RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY,
+    RRF_SUBKEY_WOW6464KEY,
+};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW, DEBUG_ONLY_THIS_PROCESS, INFINITE,
 };
@@ -1498,40 +1503,85 @@ impl Engine {
         Ok(truncate_output(output))
     }
 
-    /// Load the WinDbg debugger extensions once per session: `.extpath <WinKits x64 paths>` then
-    /// `.load ext.dll`. Ports the C++ `EnsureExtensionsLoaded` (the R8 ext-path discovery), guarded
-    /// by [`Engine::extensions_loaded`] so it runs at most once per session (reset by `detach`).
+    /// Load the WinDbg debugger extensions once per session: `.extpath <discovered x64 dirs>` then
+    /// `.load ext.dll`. Ports the C++ `EnsureExtensionsLoaded`, guarded by
+    /// [`Engine::extensions_loaded`] so it runs at most once per session (reset by `detach`).
     ///
-    /// ## R8 — hardcoded WinKits paths (parity with the C++)
+    /// ## R8 refinement — runtime discovery of the `Debuggers\x64` root (task 5.0)
     ///
-    /// The C++ hardcodes the x64 Windows Kits 10 debugger extension directories; we replicate that
-    /// hardcoded `.extpath` verbatim. Runtime discovery (the registry `KitsRoot10` value or the
-    /// `WindowsSdkDir` env var) is a possible refinement, but the hardcoded path is the documented
-    /// C++ behavior and is correct for a standard SDK install; we deliberately match it for strict
-    /// parity rather than diverge here. Both commands run with `DEBUG_OUTCTL_IGNORE` (no output
-    /// routed to our callbacks) and `DEBUG_EXECUTE_NOT_LOGGED`, and any failure is swallowed —
-    /// extension load is best-effort, exactly as the C++ ignores both `Execute` HRESULTs.
+    /// The C++ HARDCODED the x64 Windows Kits 10 debugger extension directories
+    /// (`C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\{winext,WINXP,base}`), so `!analyze`
+    /// and other `!`-extension commands only resolved on a default-path SDK install. This refinement
+    /// discovers the `Debuggers\x64` root at RUNTIME so the extensions resolve wherever the SDK is
+    /// actually installed:
+    ///
+    /// 1. Registry `KitsRoot10` (`HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`, REG_SZ),
+    ///    native view then the `WOW6432Node` view, joined with `Debuggers\x64`.
+    /// 2. The `WindowsSdkDir` env var, joined with `Debuggers\x64`.
+    /// 3. The former hardcoded default `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64`.
+    ///
+    /// The first candidate whose base dir EXISTS wins (see [`discover_debuggers_root`]). From that
+    /// root, the extension search path is built from only the EXISTING subdirs (`winext`, `winxp`,
+    /// and the root itself; see [`extension_dirs`]) joined with `;`. If discovery finds nothing the
+    /// load is SKIPPED (logged to stderr — `!analyze`/`!`-commands are then unavailable) and the
+    /// guard is still set so it is not retried every call.
+    ///
+    /// Both commands run with `DEBUG_OUTCTL_IGNORE` (no output routed to our callbacks) and
+    /// `DEBUG_EXECUTE_NOT_LOGGED`, and any `Execute` failure is swallowed — extension load is
+    /// best-effort, exactly as the C++ ignored both `Execute` HRESULTs.
     fn ensure_extensions_loaded(&mut self) {
         if self.extensions_loaded {
             return;
         }
         // Set the guard before issuing the commands (matching the C++, which sets
-        // `extensionsLoaded_ = true` up front) so a re-entrant call cannot double-load.
+        // `extensionsLoaded_ = true` up front) so a re-entrant call cannot double-load — and so a
+        // failed/empty discovery is not retried on every subsequent `execute`/`analyze`.
         self.extensions_loaded = true;
 
-        // Hardcoded WinKits x64 extension search path (R8 — mirrors the C++ verbatim).
-        // SAFETY: live control interface; `s!(...)` is a 'static NUL-terminated ANSI string valid
-        // for the call (the engine copies it). `DEBUG_OUTCTL_IGNORE`/`DEBUG_EXECUTE_NOT_LOGGED` are
-        // documented u32 flags. Best-effort: the HRESULT is intentionally ignored (C++ parity).
-        let _ = unsafe {
-            self.control.Execute(
-                DEBUG_OUTCTL_IGNORE,
-                s!(".extpath C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\winext;C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64\\WINXP;C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64"),
-                DEBUG_EXECUTE_NOT_LOGGED,
-            )
+        // Discover the real `Debuggers\x64` root (registry → env → default) and build `.extpath`
+        // from only the dirs that exist. Make the result observable so an operator can tell WHY
+        // `!analyze` failed (a missing SDK) versus succeeded.
+        let dirs = match discover_debuggers_root() {
+            Some(root) => extension_dirs(&root, |p| p.exists()),
+            None => Vec::new(),
         };
-        // SAFETY: same invariants as the `.extpath` call above; `s!(".load ext.dll")` is a 'static
-        // NUL-terminated ANSI string. Best-effort: the HRESULT is intentionally ignored.
+        if dirs.is_empty() {
+            eprintln!(
+                "dbgeng: no debugger extensions found (KitsRoot10 not located) — \
+                 !analyze/!-commands unavailable"
+            );
+            return;
+        }
+        let joined = dirs
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(";");
+        eprintln!("dbgeng: extensions search path = {joined}");
+
+        // Build the `.extpath <dirs>` command as a NUL-terminated ANSI string bound to a NAMED
+        // LOCAL that outlives the `Execute` call below — the string is now RUNTIME-built (not an
+        // `s!` 'static), so it must not be a temporary that drops before the FFI call reads it.
+        // Paths cannot contain an interior NUL, so the `Ok` is taken; on the impossible NUL case we
+        // skip the `.extpath` (the `.load` below still runs and may resolve via the default path).
+        if let Ok(extpath_cmd) = CString::new(format!(".extpath {joined}")) {
+            // SAFETY: `self.control` is the live `IDebugControl4` from `create`. `extpath_cmd` is a
+            // NUL-terminated ANSI string owned by this stack frame for the whole call (the engine
+            // copies it); the `PCSTR` borrows `extpath_cmd.as_ptr()` and does NOT outlive this
+            // statement — `extpath_cmd` lives to the end of the enclosing scope. `DEBUG_OUTCTL_IGNORE`
+            // / `DEBUG_EXECUTE_NOT_LOGGED` are documented u32 flags. Best-effort: the HRESULT is
+            // intentionally ignored (C++ parity).
+            let _ = unsafe {
+                self.control.Execute(
+                    DEBUG_OUTCTL_IGNORE,
+                    PCSTR(extpath_cmd.as_ptr().cast()),
+                    DEBUG_EXECUTE_NOT_LOGGED,
+                )
+            };
+        }
+        // SAFETY: same invariants as `execute`'s `Execute` call; `s!(".load ext.dll")` is a 'static
+        // NUL-terminated ANSI string valid for the call. Best-effort: the HRESULT is intentionally
+        // ignored (C++ parity).
         let _ = unsafe {
             self.control.Execute(
                 DEBUG_OUTCTL_IGNORE,
@@ -1753,6 +1803,196 @@ impl Bp {
 fn cstr_from_buf(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Read the `KitsRoot10` value (REG_SZ or REG_EXPAND_SZ — see the flags below) from
+/// `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`, returning the install root (e.g.
+/// `C:\Program Files (x86)\Windows Kits\10\`) or `None` if the key or value is absent. `wow6432`
+/// selects the WOW6432Node view (the 32-bit registry view) so a 64-bit process can still find a
+/// value written under `WOW6432Node`; otherwise the native view is read.
+///
+/// This is the lone live-registry wrapper (the thin FFI boundary) behind the
+/// [`discover_debuggers_root_with`] seam; the rest of discovery (its consumption — env + default +
+/// existence selection + the `Debuggers\x64` join + dedup) is pure, injectable, and unit-tested via
+/// that seam. This function's own FFI correctness is covered incidentally by the live
+/// `live_analyze_resolves_on_a_launched_crash` test (which only resolves on a real machine when this
+/// read succeeds). A key/value absence is NOT an error here — it returns `None` so discovery can
+/// fall through to the next candidate.
+fn read_kits_root10(wow6432: bool) -> Option<PathBuf> {
+    // The subkey + value are constant UTF-16 literals (NUL-terminated for the wide FFI). `RegGetValueW`
+    // wants `PCWSTR`s; we build owned wide buffers so the pointers are valid for the call.
+    let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value: Vec<u16> = "KitsRoot10"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // Accept REG_SZ and REG_EXPAND_SZ (a non-standard SDK installer could write `KitsRoot10` as
+    // REG_EXPAND_SZ, e.g. `%ProgramFiles(x86)%...`; with `RRF_RT_REG_EXPAND_SZ` set `RegGetValueW`
+    // auto-expands it before returning, so we get a usable absolute path either way). Pick the
+    // registry view explicitly (native vs WOW6432Node).
+    let flags = RRF_RT_REG_SZ
+        | RRF_RT_REG_EXPAND_SZ
+        | if wow6432 {
+            RRF_SUBKEY_WOW6432KEY
+        } else {
+            RRF_SUBKEY_WOW6464KEY
+        };
+
+    // First call with no buffer to learn the byte size, then a second call to read the data.
+    let mut cb: u32 = 0;
+    // SAFETY: `HKEY_LOCAL_MACHINE` is a documented predefined key handle. `subkey`/`value` are
+    // NUL-terminated UTF-16 buffers owned on this stack and outliving the call; the `PCWSTR`s borrow
+    // their pointers only for this call. `pvdata = None` with a valid `pcbdata` is the documented
+    // "query required size" form. The return is a `WIN32_ERROR`; no out-pointers are read on failure.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            flags,
+            None,
+            None,
+            Some(&mut cb),
+        )
+    };
+    if rc.is_err() || cb == 0 {
+        return None;
+    }
+
+    // `cb` is a byte count; REG_SZ data is UTF-16, so allocate that many u16 elements (rounded up).
+    let mut buf: Vec<u16> = vec![0u16; (cb as usize).div_ceil(2)];
+    let mut cb2: u32 = cb;
+    // SAFETY: same key/subkey/value invariants as the sizing call above. `buf` has at least `cb2`
+    // bytes of backing storage (`div_ceil(cb, 2)` u16 elements ≥ `cb` = `cb2` bytes), so the API can
+    // write up to `cb2` bytes safely; `buf` is owned here for the call, `pvdata` points at its bytes,
+    // and `pcbdata` (`cb2`) is updated to the bytes written. The `windows` crate copies nothing it
+    // retains.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            flags,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut cb2),
+        )
+    };
+    if rc.is_err() {
+        return None;
+    }
+    // Trim to the returned byte length and drop the trailing NUL(s) REG_SZ includes.
+    let n = (cb2 as usize) / 2;
+    let slice = &buf[..n.min(buf.len())];
+    let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+    let s = String::from_utf16_lossy(&slice[..end]);
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+/// Discover the `Debuggers\x64` root of an installed *Debugging Tools for Windows* at RUNTIME, the
+/// R8 refinement that replaces the C++'s hardcoded path (task 5.0). Resolution order, returning the
+/// FIRST candidate whose base dir EXISTS:
+///
+/// 1. Registry `KitsRoot10` (native view, then the `WOW6432Node` view) joined with `Debuggers\x64`.
+/// 2. The `WindowsSdkDir` env var joined with `Debuggers\x64`.
+/// 3. The former hardcoded default `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64`.
+///
+/// Returns `None` if none of the candidates exist. This is a thin production wrapper: it binds the
+/// live registry reader ([`read_kits_root10`]), the `WindowsSdkDir` env var, and `Path::exists` into
+/// the pure [`discover_debuggers_root_with`] seam, which holds all the resolution logic and is
+/// unit-tested with injected fakes (no registry/COM/FS).
+fn discover_debuggers_root() -> Option<PathBuf> {
+    discover_debuggers_root_with(read_kits_root10, std::env::var("WindowsSdkDir").ok(), |p| {
+        p.exists()
+    })
+}
+
+/// Pure resolution logic of [`discover_debuggers_root`] with the registry, env, and filesystem
+/// dependencies injected so it is unit-testable without a live registry/COM/filesystem:
+///
+/// - `reg_reader(wow6432)` yields the `KitsRoot10` install root for the requested registry view
+///   (native = `false`, WOW6432Node = `true`), or `None` when absent. In production this is
+///   [`read_kits_root10`].
+/// - `env_sdk_dir` is the `WindowsSdkDir` env var value (`None`/empty = unset).
+/// - `exists(path)` is the base-dir existence predicate (`Path::exists` in production).
+///
+/// It assembles candidates in priority order — registry native view, registry WOW6432Node view,
+/// env, then the former hardcoded default — joining each base with `Debuggers\x64`, de-duplicates
+/// adjacent/identical candidates (the native and WOW6432 views usually return the SAME path, so the
+/// derived `Debuggers\x64` candidate would otherwise appear twice), and returns the first candidate
+/// whose base dir satisfies `exists`. The priority order (native registry → WOW6432 → env → default)
+/// is preserved: dedup only drops a path already present earlier in the list, so the native view
+/// still wins when both views agree.
+pub(crate) fn discover_debuggers_root_with(
+    reg_reader: impl Fn(bool) -> Option<PathBuf>,
+    env_sdk_dir: Option<String>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let push_unique = |cand: PathBuf, candidates: &mut Vec<PathBuf>| {
+        if !candidates.contains(&cand) {
+            candidates.push(cand);
+        }
+    };
+    // 1. Registry KitsRoot10 — native view first, then WOW6432Node.
+    for wow in [false, true] {
+        if let Some(root) = reg_reader(wow) {
+            push_unique(root.join("Debuggers").join("x64"), &mut candidates);
+        }
+    }
+    // 2. WindowsSdkDir env var.
+    if let Some(sdk) = env_sdk_dir {
+        if !sdk.is_empty() {
+            push_unique(
+                PathBuf::from(sdk).join("Debuggers").join("x64"),
+                &mut candidates,
+            );
+        }
+    }
+    // 3. The former hardcoded default, as a last resort.
+    push_unique(
+        PathBuf::from("C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x64"),
+        &mut candidates,
+    );
+
+    select_existing_root(candidates, exists)
+}
+
+/// Pure selection step of [`discover_debuggers_root`]: return the first candidate whose base dir
+/// satisfies the `exists` predicate, or `None`. Factored out so the ordering/selection logic is
+/// unit-testable without touching the live filesystem or registry.
+pub(crate) fn select_existing_root(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    candidates.into_iter().find(|p| exists(p))
+}
+
+/// Build the debugger-extension search dirs from a resolved `Debuggers\x64` root, filtered to the
+/// dirs that actually exist (per the injected `exists` predicate). Mirrors the C++ winext/WINXP/base
+/// set: `<root>\winext`, `<root>\winxp`, and `<root>` itself, in that order. The C++ used `WINXP`
+/// (uppercase); `Path::exists` is case-insensitive on Windows, so the literal case here does not
+/// matter. The returned list (joined with `;`) becomes the `.extpath` argument; an empty list means
+/// no extensions are available and `.extpath` is skipped.
+pub(crate) fn extension_dirs(
+    debuggers_x64_root: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    [
+        debuggers_x64_root.join("winext"),
+        debuggers_x64_root.join("winxp"),
+        debuggers_x64_root.to_path_buf(),
+    ]
+    .into_iter()
+    .filter(|p| exists(p))
+    .collect()
 }
 
 /// Cap a long command report at 32 KiB, appending the C++ truncation marker. Ports the C++
