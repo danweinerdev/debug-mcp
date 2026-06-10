@@ -294,6 +294,8 @@ pub fn breakpoints(body: &Option<Value>) -> Result<Vec<BreakpointResult>, Backen
             verified: b.verified,
             line: b.line,
             message: b.message,
+            // lldb never rejects: every result (verified or pending-symbol) is trackable.
+            rejected: false,
         })
         .collect())
 }

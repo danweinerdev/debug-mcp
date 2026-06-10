@@ -172,6 +172,13 @@ pub struct BreakpointResult {
     pub verified: bool,
     pub line: i64,
     pub message: String,
+    /// The backend DECLINED to register this breakpoint (it will never resolve and must NOT be
+    /// tracked/re-flushed) — distinct from an unverified-but-pending breakpoint that may resolve
+    /// later. Set only by a backend that rejects a location it cannot safely track (the WinDbg
+    /// ASLR-unsafe bare-address rejection, R6); lldb leaves it false (every lldb result, verified
+    /// or pending, is trackable). Default false ⇒ a strict no-op for existing backends.
+    #[serde(default)]
+    pub rejected: bool,
 }
 
 /// Result of an `evaluate`. Go origin: the `EvaluateResponse` fields surfaced by

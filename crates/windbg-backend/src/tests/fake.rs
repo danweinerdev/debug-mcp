@@ -292,6 +292,7 @@ impl EngineOps for FakeEngine {
                 verified: true,
                 line: 0,
                 message: String::new(),
+                rejected: false,
             }),
         }
     }

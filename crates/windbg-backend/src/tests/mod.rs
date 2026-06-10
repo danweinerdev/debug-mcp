@@ -3,6 +3,7 @@
 //! live engine** (and no COM on the calling thread), so they run on any Windows host.
 
 mod breakpoints;
+mod event_stream;
 mod execution;
 mod extras;
 mod fake;
@@ -34,8 +35,12 @@ async fn backend_over_fake(
         // The thread died before signaling readiness — surface as an engine error for the test.
         Err(_) => return Err(EngineError::engine("engine thread exited before readiness")),
     };
+    // The unit suite drives the backend ops directly (not the event stream), so it does not need the
+    // R2 drop signal's receiver — give the backend a never-observed sender. The event-stream behavior
+    // (the drop signal's effect) is covered directly over `build_event_stream` in `event_stream.rs`.
+    let (drop_tx, _drop_rx) = oneshot::channel::<()>();
     Ok((
-        WinDbgBackend::new(cmd_tx, interrupt, None, engine_thread),
+        WinDbgBackend::new(cmd_tx, interrupt, None, engine_thread, drop_tx),
         term_rx,
     ))
 }

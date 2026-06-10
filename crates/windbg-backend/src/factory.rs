@@ -19,6 +19,7 @@ use dbgeng_sys::{Engine, OutputKind};
 use debugger_core::{
     BackendCapabilities, BackendError, BackendEvent, BackendFactory, Connection, DebuggerBackend,
 };
+use futures::future::FutureExt;
 use futures::stream::{self, BoxStream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
@@ -126,12 +127,25 @@ impl BackendFactory for WinDbgFactory {
             ));
         }
 
+        // R2 — the backend-drop signal: a oneshot whose SENDER lives on the backend (never sent on)
+        // and whose RECEIVER feeds `build_event_stream`. When the last backend `Arc` drops (the
+        // session's `clear_backend`/disconnect path, or the cancel-cleanup path), the sender drops and
+        // `drop_rx` resolves with `Err`, forcing a synthetic `Terminated` so the pump completes even
+        // when an orphaned kernel-attach thread is stuck in `WaitForEvent(INFINITE)` (still holding
+        // the output sink open, never firing `term_rx`). See `WinDbgBackend::_drop_signal`.
+        let (drop_tx, drop_rx) = oneshot::channel::<()>();
+
         // Assemble the neutral BackendEvent stream (mirror lldb_backend::build_event_stream).
-        let events = build_event_stream(out_rx, term_rx);
+        let events = build_event_stream(out_rx, term_rx, drop_rx);
 
         // DbgEng runs in-process — there is no debugger subprocess pid to report.
-        let backend: Arc<dyn DebuggerBackend> =
-            Arc::new(WinDbgBackend::new(cmd_tx, interrupt, None, engine_thread));
+        let backend: Arc<dyn DebuggerBackend> = Arc::new(WinDbgBackend::new(
+            cmd_tx,
+            interrupt,
+            None,
+            engine_thread,
+            drop_tx,
+        ));
         Ok(Connection { backend, events })
     }
 }
@@ -155,37 +169,101 @@ fn category_for(kind: OutputKind) -> &'static str {
     }
 }
 
+/// The internal state threaded through the [`build_event_stream`] `unfold`: the output receiver,
+/// the pinned "terminate" future (the race of `term_rx` and `drop_rx`), and whether the terminal
+/// `Terminated` has already been emitted (so the stream ends after exactly one — no double, no
+/// regression on the normal path).
+struct StreamState {
+    out_rx: mpsc::UnboundedReceiver<(OutputKind, String)>,
+    /// The terminate future: resolves to the exit code (real, from `term_rx`) when EITHER the engine
+    /// fires `term_rx` OR the backend drops (`drop_rx` resolves `Err` → `None` code). Pinned/boxed so
+    /// it can be polled repeatedly across `unfold` iterations while output is still flowing.
+    terminate: futures::future::BoxFuture<'static, Option<i64>>,
+    /// Set once the single `Terminated` event has been yielded; the next poll ends the stream.
+    terminated: bool,
+}
+
 /// Adapt the engine thread's output (`mpsc`) + terminated (`oneshot`) channels into one neutral
 /// [`BackendEvent`] stream (design Decision 5), mirroring `lldb_backend::build_event_stream`:
-/// every output line becomes `Output{category,text}`; the single terminated signal becomes
-/// `Terminated{code}` and (with the output stream's end) terminates the merged stream. The stream
-/// is `'static` + `Send` so the session's event-pump can own it after `connect()` returns.
+/// every output line becomes `Output{category,text}`, then a single `Terminated{code}` ends the
+/// stream. The stream is `'static` + `Send` so the session's event-pump can own it after
+/// `connect()` returns.
+///
+/// R2 — the termination trigger is whichever fires FIRST: the engine `term_rx` (carrying the real
+/// exit code) OR `drop_rx` (the backend was dropped → a synthetic `Terminated { code: None }`). The
+/// merged stream emits `Output` events UNTIL that race resolves, then emits exactly ONE `Terminated`
+/// and ENDS. Crucially the end does NOT depend on `out_rx` closing — an orphaned kernel-attach
+/// thread stuck in `WaitForEvent(INFINITE)` keeps the output sink (and thus `out_rx`) open forever,
+/// so relying on `out_rx`'s end would hang the pump. Two invariants hold:
+/// - NORMAL path: the engine fires `term_rx` on clean exit/disconnect → exactly one
+///   `Terminated{real code}`, then the stream ends. A later `drop_rx` firing is harmless (the
+///   stream already ended — `terminated` is set, so no second `Terminated`).
+/// - ORPHAN path: `term_rx` never fires and `out_rx` never closes → the backend drop resolves
+///   `drop_rx` → synthetic `Terminated{None}` → the stream ends.
 pub(crate) fn build_event_stream(
     out_rx: mpsc::UnboundedReceiver<(OutputKind, String)>,
     term_rx: oneshot::Receiver<Option<i64>>,
+    drop_rx: oneshot::Receiver<()>,
 ) -> BoxStream<'static, BackendEvent> {
-    // Output lines → BackendEvent::Output, in arrival order.
-    let output_stream = stream::unfold(out_rx, |mut rx| async move {
-        rx.recv().await.map(|(kind, text)| {
-            (
-                BackendEvent::Output {
-                    category: category_for(kind).to_string(),
-                    text,
-                },
-                rx,
-            )
-        })
-    });
+    // The terminate race: the FIRST of `term_rx` (real exit code) and `drop_rx` (backend dropped →
+    // synthetic `None` code) wins. A dropped `term_rx` sender (the engine thread exited without an
+    // explicit code) also resolves it with `None` — the same terminal outcome.
+    let terminate = async move {
+        tokio::select! {
+            biased;
+            // The engine's real terminated signal: `Ok(code)` carries the exit code; an `Err`
+            // (sender dropped without a value) collapses to `None`.
+            res = term_rx => res.unwrap_or(None),
+            // The backend-drop signal: it is never sent on, so it only ever resolves `Err` on drop —
+            // a synthetic termination with no exit code.
+            _ = drop_rx => None,
+        }
+    }
+    .boxed();
 
-    // The terminated signal → a single Terminated event (a dropped sender yields no event — the
-    // output stream's end then terminates the merged stream). Modeled as a 0-or-1 stream.
-    let terminated_stream = stream::once(async move {
-        match term_rx.await {
-            Ok(code) => Some(BackendEvent::Terminated { code }),
-            Err(_) => None,
+    let state = StreamState {
+        out_rx,
+        terminate,
+        terminated: false,
+    };
+
+    stream::unfold(state, |mut state| async move {
+        // Already emitted the one terminal event — end the stream.
+        if state.terminated {
+            return None;
+        }
+        // Race the next output line against termination. Output keeps flowing until the terminate
+        // future resolves; once it does, emit the single `Terminated` and mark the stream to end on
+        // the next poll. `biased` makes `out_rx.recv()` the first branch polled, so all buffered
+        // output is DRAINED before `Terminated` is emitted: when output and termination are both
+        // ready, we never drop a buffered line in favor of the terminal event. This is safe because
+        // the `terminated` flag already guarantees `Terminated` is emitted exactly once — biasing
+        // toward output only delays the (single) terminal event until the buffer is empty.
+        tokio::select! {
+            biased;
+            line = state.out_rx.recv() => match line {
+                Some((kind, text)) => Some((
+                    BackendEvent::Output {
+                        category: category_for(kind).to_string(),
+                        text,
+                    },
+                    state,
+                )),
+                // The output channel closed WITHOUT a prior termination signal (the engine thread
+                // ended normally, dropping the sink, and `term_rx`/`drop_rx` have not yet resolved):
+                // await the terminate future to produce the real terminal event, then end. This
+                // preserves the normal-teardown ordering (the engine's `term_rx` fires on exit).
+                None => {
+                    let code = (&mut state.terminate).await;
+                    state.terminated = true;
+                    Some((BackendEvent::Terminated { code }, state))
+                }
+            },
+            code = &mut state.terminate => {
+                state.terminated = true;
+                Some((BackendEvent::Terminated { code }, state))
+            }
         }
     })
-    .filter_map(|e| async move { e });
-
-    stream::select(output_stream, terminated_stream).boxed()
+    .boxed()
 }

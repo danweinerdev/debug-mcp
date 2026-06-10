@@ -68,6 +68,7 @@ async fn set_breakpoint_accepts_fractional_line_truncating() {
         verified: true,
         line: 4,
         message: String::new(),
+        rejected: false,
     }]));
     let a = args(&[("file", json!("/f.c")), ("line", json!(4.7))]);
     let out = h.server.handle_set_breakpoint(&crate::Args::new(&a)).await;
@@ -84,12 +85,14 @@ async fn set_breakpoint_stopped_selects_exact_line_match() {
             verified: true,
             line: 6,
             message: String::new(),
+            rejected: false,
         },
         BreakpointResult {
             id: 11,
             verified: false,
             line: 9,
             message: "pending".to_string(),
+            rejected: false,
         },
     ]));
     let a = args(&[("file", json!("/loop.c")), ("line", json!(9))]);
@@ -116,12 +119,14 @@ async fn set_breakpoint_stopped_falls_back_to_last_when_no_line_match() {
             verified: true,
             line: 100,
             message: String::new(),
+            rejected: false,
         },
         BreakpointResult {
             id: 2,
             verified: true,
             line: 200,
             message: String::new(),
+            rejected: false,
         },
     ]));
     let a = args(&[("file", json!("/f.c")), ("line", json!(7))]);
@@ -219,6 +224,7 @@ async fn set_function_breakpoint_stopped_synthesizes_message_when_verified() {
         verified: true,
         line: 0,
         message: String::new(),
+        rejected: false,
     }]));
     let a = args(&[("name", json!("foo"))]);
     let out = h
@@ -240,6 +246,7 @@ async fn set_function_breakpoint_stopped_synthesizes_unverified_message() {
         verified: false,
         line: 0,
         message: String::new(),
+        rejected: false,
     }]));
     let a = args(&[("name", json!("bar"))]);
     let out = h
@@ -261,6 +268,7 @@ async fn set_function_breakpoint_keeps_nonempty_message() {
         verified: true,
         line: 0,
         message: "resolved at 0x1000".to_string(),
+        rejected: false,
     }]));
     let a = args(&[("name", json!("baz"))]);
     let out = h
@@ -269,6 +277,63 @@ async fn set_function_breakpoint_keeps_nonempty_message() {
         .await;
     let v = expect_json(&out);
     assert_eq!(v["message"], json!("resolved at 0x1000"));
+}
+
+#[tokio::test]
+async fn set_function_breakpoint_unrejected_pending_is_still_tracked() {
+    // lldb-not-regressed: a pending-symbol shape (the lldb unverified result — `verified:false`,
+    // a real engine id, `rejected:false`) MUST still be tracked and appear in list_breakpoints.
+    // This proves the `!rejected` gate does not drop lldb's legitimate pending BPs (lldb always
+    // emits `rejected:false`).
+    let h = Harness::connected(State::Stopped).await;
+    h.state.lock().unwrap().function_bp_result = Some(Ok(vec![BreakpointResult {
+        id: 7,
+        verified: false,
+        line: 0,
+        message: String::new(),
+        rejected: false,
+    }]));
+    let a = args(&[("name", json!("pending_sym"))]);
+    let out = h
+        .server
+        .handle_set_function_breakpoint(&crate::Args::new(&a))
+        .await;
+    assert!(!out.is_error());
+    // Tracked + listed (count 1) despite being unverified — `rejected:false` is the trackable case.
+    assert_eq!(h.session.all_function_breakpoints().len(), 1);
+    let list = h.session.list_breakpoints();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].function, "pending_sym");
+    assert!(!list[0].verified);
+}
+
+#[tokio::test]
+async fn set_function_breakpoint_rejected_is_not_tracked() {
+    // The neutral `rejected:true` signal (WinDbg's ASLR-unsafe address rejection, R6) must NOT
+    // enter session state: the phantom is neither tracked nor listed, and the backend's guidance
+    // message is surfaced as a tool-error. The gate reads only `rejected` — no `0x` detection in
+    // the handler.
+    let h = Harness::connected(State::Stopped).await;
+    h.state.lock().unwrap().function_bp_result = Some(Ok(vec![BreakpointResult {
+        id: 0,
+        verified: false,
+        line: 0,
+        message: "address breakpoints are not ASLR-stable".to_string(),
+        rejected: true,
+    }]));
+    let a = args(&[("name", json!("0x7ff6abcd1234"))]);
+    let out = h
+        .server
+        .handle_set_function_breakpoint(&crate::Args::new(&a))
+        .await;
+    // Surfaced as a tool-error carrying the guidance.
+    assert_eq!(
+        expect_error(&out),
+        "address breakpoints are not ASLR-stable"
+    );
+    // Never tracked: no function bp, nothing listed — so it cannot re-flush on relaunch.
+    assert!(h.session.all_function_breakpoints().is_empty());
+    assert!(h.session.list_breakpoints().is_empty());
 }
 
 #[tokio::test]

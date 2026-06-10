@@ -76,6 +76,27 @@ pub struct WinDbgBackend {
     /// closing the command channel (dropping `cmd_tx`), which ends the loop in the normal path; a
     /// genuinely-stuck thread is left to exit at process end (R2, Phase 5).
     _engine_thread: std::thread::JoinHandle<()>,
+    /// R2 — the backend-drop signal for the orphaned-kernel-thread event-pump fix. Held only for
+    /// its `Drop` side effect: it is NEVER sent on, so when this backend (the last
+    /// `Arc<dyn DebuggerBackend>`) drops, the channel closes and the paired `drop_rx` in
+    /// [`build_event_stream`](crate::factory::build_event_stream) resolves with `Err(RecvError)` —
+    /// forcing the merged event stream to emit a synthetic `Terminated` and END.
+    ///
+    /// Why this is needed: `attach_kernel` calls `WaitForEvent(INFINITE)`; an unreachable KDNET
+    /// target blocks the engine thread there FOREVER. That orphaned thread never fires the real
+    /// `term_rx` AND still owns the output-sink sender (so `out_rx` never closes), so without this
+    /// the session's event-pump would wait forever for a stream end that never comes. Closing the
+    /// command channel (dropping `cmd_tx`) does NOT unblock the stuck COM call, so it cannot be the
+    /// trigger. This drop signal is independent of the orphaned thread: it fires on the LAST backend
+    /// `Arc` drop (the session's `clear_backend`/disconnect path, and the cancel-cleanup path),
+    /// letting the pump complete and a fresh `launch` connect a new engine thread. The orphan leaks
+    /// until process exit (documented C++ behavior; recovery = disconnect/restart).
+    ///
+    // NOTE: drop order is load-bearing — `cmd_tx` (declared above) must drop before
+    // `_drop_signal` so the engine thread gets its shutdown signal (closed command channel)
+    // before the pump receives the synthetic Terminated. Rust drops fields in declaration
+    // order, so keep `_drop_signal` declared AFTER `cmd_tx`.
+    _drop_signal: oneshot::Sender<()>,
 }
 
 /// The backend's per-category breakpoint tracking, keyed by source location so the runtime setters
@@ -104,6 +125,7 @@ impl WinDbgBackend {
         interrupt: InterruptHandle,
         debugger_pid: Option<i64>,
         engine_thread: std::thread::JoinHandle<()>,
+        drop_signal: oneshot::Sender<()>,
     ) -> WinDbgBackend {
         WinDbgBackend {
             cmd_tx,
@@ -111,6 +133,7 @@ impl WinDbgBackend {
             target_pid: Mutex::new(debugger_pid),
             breakpoints: Mutex::new(BreakpointTable::default()),
             _engine_thread: engine_thread,
+            _drop_signal: drop_signal,
         }
     }
 
@@ -131,12 +154,16 @@ impl WinDbgBackend {
         ));
         // A trivially-finished thread so the JoinHandle field is populated without a live engine.
         let engine_thread = std::thread::spawn(|| {});
+        // A never-sent drop signal (its receiver is unused here — this constructor exists only to
+        // drive the dead-channel `call` path, not the event stream).
+        let (drop_tx, _drop_rx) = oneshot::channel::<()>();
         WinDbgBackend {
             cmd_tx,
             interrupt,
             target_pid: Mutex::new(None),
             breakpoints: Mutex::new(BreakpointTable::default()),
             _engine_thread: engine_thread,
+            _drop_signal: drop_tx,
         }
     }
 
@@ -281,6 +308,32 @@ pub(crate) fn map_engine_err(err: EngineError) -> BackendError {
     }
 }
 
+/// The guidance message returned for a bare-address function-breakpoint name (R6). Surfaced as the
+/// `message` of an unverified [`BreakpointResult`] (kept in one place so the unit test asserts the
+/// exact text the handler relays to the agent).
+pub(crate) const ADDRESS_BP_GUIDANCE: &str =
+    "address breakpoints are not ASLR-stable when set via \
+set_function_breakpoint under WinDbg (they would be misplaced on relaunch); use \
+run_command(\"bp <addr>\") for an address breakpoint instead";
+
+/// True when a `set_function_breakpoint` `name` is a **bare address** (R6).
+///
+/// The neutral surface splits source vs function breakpoints and has NO address variant, so a bare
+/// `0x<addr>` would ride in the function-bp `name` field. But `mcp-session` tracks function BPs by
+/// name and RE-FLUSHES them on the next launch, and an absolute address re-applied to a relaunched,
+/// ASLR-rebased image silently misplaces the breakpoint. A `module!sym` (or a plain identifier),
+/// by contrast, is rebase-STABLE — it re-resolves correctly on every launch — so it flows through.
+///
+/// Detection mirrors the C++ oracle (`breakpoint_tools.cpp:39` — `location.substr(0,2) == "0x" ||
+/// "0X"`): ONLY a `0x`/`0X` PREFIX signals an address. This is deliberately narrow — a bare-hex
+/// identifier like `deadbeef` is also a plausible function name, so we do NOT treat all-hex names
+/// as addresses; a `module!sym` (contains `!`) is never an address. Matching the C++'s prefix rule
+/// keeps the address/symbol split parity-exact.
+fn is_bare_address_name(name: &str) -> bool {
+    let trimmed = name.trim_start();
+    trimmed.starts_with("0x") || trimmed.starts_with("0X")
+}
+
 /// Resolve one breakpoint's [`SetBreakpoint`](EngineCmd::SetBreakpoint) call into a per-bp result,
 /// applying the lldb-parity per-bp-failure rule used by both runtime breakpoint setters.
 ///
@@ -316,6 +369,9 @@ fn bp_result_or_continue(
             verified: false,
             line: unverified_line,
             message: other.to_string(),
+            // An unresolvable SYMBOL is the lldb-parity unverified case that may resolve on
+            // relaunch — it is trackable. Only the ASLR-unsafe ADDRESS rejection sets `rejected`.
+            rejected: false,
         }),
     }
 }
@@ -383,6 +439,13 @@ impl DebuggerBackend for WinDbgBackend {
                 }
             }
             for bp in &spec.function_breakpoints {
+                // R6 — same ASLR-safe rejection as the runtime setter: a bare `0x…` "name" is an
+                // absolute address that an ASLR-rebased relaunch would misplace, so the launch flush
+                // never sets it on the engine and never tracks it (it has no rebase-stable resolution).
+                // A `module!sym`/plain name re-resolves correctly and is flushed normally.
+                if is_bare_address_name(&bp.name) {
+                    continue;
+                }
                 let loc = BpLoc::Function(bp.name.clone());
                 let condition = bp.condition.clone();
                 let result = self
@@ -508,6 +571,9 @@ impl DebuggerBackend for WinDbgBackend {
                         id: 0,
                         verified: false,
                         line: bp.line,
+                        // An out-of-range source line is the lldb-parity unverified case, not an
+                        // ASLR-unsafe address rejection — it stays trackable.
+                        rejected: false,
                         message: format!("{file}:{}: line out of range", bp.line),
                     });
                     continue;
@@ -606,6 +672,33 @@ impl DebuggerBackend for WinDbgBackend {
         let mut results = Vec::with_capacity(bps.len());
         let mut new_map: HashMap<String, BreakpointResult> = HashMap::new();
         for bp in bps {
+            // R6 — ASLR-safe address handling. A bare `0x…` "name" is an absolute address; setting it
+            // here would let `mcp-session` track it by name and RE-FLUSH it on the next launch, where
+            // an ASLR-rebased image silently misplaces it. So we reject it WITHOUT touching the engine
+            // and WITHOUT tracking it: not inserted into `new_map`/`desired_names` (so it is never
+            // cached, never re-flushed, and the stale-removal pass below never tries to reuse/remove
+            // it). The rejection rides the same per-bp `verified:false` pattern as an unresolvable bp
+            // (`bp_result_or_continue`), so a batch with one address name still processes the others.
+            // A `module!sym` (rebase-stable) or plain name is NOT an address and flows through the
+            // reconcile unchanged — the dbgeng-sys resolver re-resolves `module!sym` via
+            // `GetOffsetByName` on every launch, so re-flushing it is correct.
+            //
+            // PARITY: this WinDbg-only rejection is below the seam — lldb's `set_function_breakpoints`
+            // never sees it, and the frozen `set_function_breakpoint` tool SCHEMA is unchanged (the
+            // behavior difference is surfaced via the message). A CLAUDE.md parity note for this is
+            // OWED in task 5.5.
+            if is_bare_address_name(&bp.name) {
+                results.push(BreakpointResult {
+                    id: 0,
+                    verified: false,
+                    line: 0,
+                    message: ADDRESS_BP_GUIDANCE.to_string(),
+                    // R6 — the only `rejected:true` site: the tool layer reads this neutral flag and
+                    // skips session tracking so the phantom never enters state nor re-flushes.
+                    rejected: true,
+                });
+                continue;
+            }
             desired_names.insert(bp.name.clone());
 
             // Already set for this function name — reuse the cached result (preserving the engine id).

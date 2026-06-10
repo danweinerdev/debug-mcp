@@ -129,6 +129,11 @@ impl ToolServer {
         let condition = args.get_string("condition", "");
 
         if self.session.state() == State::Idle {
+            // Idle buffers the pending bp without calling the backend (no `rejected` signal is
+            // available yet — there is no backend connection). A bare-address `name` buffered here
+            // is silently DROPPED at launch by the backend's flush-skip (the same R6 ASLR guard,
+            // applied below the seam), so the safety backstop holds without any `0x` detection in
+            // this handler.
             self.session
                 .add_pending_function_breakpoint(&name, &condition);
             return ToolOutcome::Json(
@@ -165,6 +170,21 @@ impl ToolServer {
             Ok(r) => r,
             Err(e) => return ToolOutcome::error(errors::SET_FUNCTION_BREAKPOINTS.render(e)),
         };
+
+        // The new breakpoint is the last in the response (positional with the request). A
+        // backend may DECLINE to register a location it cannot safely track — the neutral
+        // `rejected` flag (set by WinDbg's ASLR-unsafe bare-address rejection, R6). When set we
+        // must NOT track it (no `add_function_breakpoint`/`add_breakpoint_response`), so the
+        // phantom never enters session state nor re-flushes on the next launch; we surface the
+        // backend's guidance message as a tool-error so the agent sees how to set it correctly.
+        // This gate is BACKEND-NEUTRAL: it reads only `rejected`, with no address/`0x` detection
+        // here. lldb results are always `rejected:false` ⇒ zero behavior change for lldb (incl.
+        // its pending-symbol unverified BPs, which stay tracked).
+        if let Some(bp) = results.last() {
+            if bp.rejected {
+                return ToolOutcome::error(bp.message.clone());
+            }
+        }
 
         // DAP succeeded — commit the session mutation. The new breakpoint is the last in
         // the response (positional with the request).

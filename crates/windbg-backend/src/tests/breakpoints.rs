@@ -63,12 +63,14 @@ async fn set_source_breakpoints_sets_each_line_in_order() {
             verified: true,
             line: 10,
             message: String::new(),
+            rejected: false,
         }),
         ScriptedBp::Ok(BreakpointResult {
             id: 12,
             verified: true,
             line: 20,
             message: String::new(),
+            rejected: false,
         }),
     ])
     .await;
@@ -124,6 +126,7 @@ async fn set_source_breakpoints_skips_a_line_out_of_u32_range() {
         verified: true,
         line: 42,
         message: String::new(),
+        rejected: false,
     })])
     .await;
 
@@ -183,12 +186,14 @@ async fn set_function_breakpoints_sets_each_function_in_order() {
             verified: true,
             line: 0,
             message: String::new(),
+            rejected: false,
         }),
         ScriptedBp::Ok(BreakpointResult {
             id: 2,
             verified: true,
             line: 0,
             message: String::new(),
+            rejected: false,
         }),
     ])
     .await;
@@ -238,6 +243,7 @@ async fn set_function_breakpoints_unresolvable_is_unverified_not_fatal() {
             verified: true,
             line: 0,
             message: String::new(),
+            rejected: false,
         }),
         // Second function does NOT resolve — the engine surfaces an error (mapped by the backend to
         // BackendError::Dap, the non-transport per-bp failure path).
@@ -250,6 +256,7 @@ async fn set_function_breakpoints_unresolvable_is_unverified_not_fatal() {
             verified: true,
             line: 0,
             message: String::new(),
+            rejected: false,
         }),
     ])
     .await;
@@ -293,6 +300,11 @@ async fn set_function_breakpoints_unresolvable_is_unverified_not_fatal() {
         results[1].message
     );
     assert!(
+        !results[1].rejected,
+        "an unresolvable SYMBOL is the lldb-parity unverified case (may resolve on relaunch), \
+         NOT rejected — so the tool layer still tracks it; only the ADDRESS rejection sets rejected"
+    );
+    assert!(
         results[2].verified,
         "the batch continued and resolved the function after the failure"
     );
@@ -309,6 +321,7 @@ async fn set_source_breakpoints_unresolvable_line_is_unverified_not_fatal() {
             verified: true,
             line: 5,
             message: String::new(),
+            rejected: false,
         }),
         ScriptedBp::Err(EngineError::engine(
             "GetOffsetByLine failed: no code at line",
@@ -356,6 +369,7 @@ async fn set_function_breakpoints_reconciles_reuses_id_and_removes_stale() {
             verified: true,
             line: 0,
             message: String::new(),
+            rejected: false,
         }),
         // main → id 2
         ScriptedBp::Ok(BreakpointResult {
@@ -363,6 +377,7 @@ async fn set_function_breakpoints_reconciles_reuses_id_and_removes_stale() {
             verified: true,
             line: 0,
             message: String::new(),
+            rejected: false,
         }),
     ])
     .await;
@@ -490,6 +505,7 @@ async fn set_source_breakpoints_reconciles_reuses_id_and_removes_stale() {
             verified: true,
             line: 10,
             message: String::new(),
+            rejected: false,
         }),
         // line 20 → id 12
         ScriptedBp::Ok(BreakpointResult {
@@ -497,6 +513,7 @@ async fn set_source_breakpoints_reconciles_reuses_id_and_removes_stale() {
             verified: true,
             line: 20,
             message: String::new(),
+            rejected: false,
         }),
     ])
     .await;
@@ -589,6 +606,7 @@ async fn breakpoint_categories_do_not_cross_remove() {
             verified: true,
             line: 0,
             message: String::new(),
+            rejected: false,
         }),
         // A: source line 10 → id 101
         ScriptedBp::Ok(BreakpointResult {
@@ -596,6 +614,7 @@ async fn breakpoint_categories_do_not_cross_remove() {
             verified: true,
             line: 10,
             message: String::new(),
+            rejected: false,
         }),
         // B: source line 30 → id 200
         ScriptedBp::Ok(BreakpointResult {
@@ -603,6 +622,7 @@ async fn breakpoint_categories_do_not_cross_remove() {
             verified: true,
             line: 30,
             message: String::new(),
+            rejected: false,
         }),
         // B: function helper → id 201
         ScriptedBp::Ok(BreakpointResult {
@@ -610,6 +630,7 @@ async fn breakpoint_categories_do_not_cross_remove() {
             verified: true,
             line: 0,
             message: String::new(),
+            rejected: false,
         }),
     ])
     .await;
@@ -701,6 +722,163 @@ async fn breakpoint_categories_do_not_cross_remove() {
     );
 }
 
+/// R6 — ASLR-safe address breakpoints. A bare-address function-bp `name` (`0x…` prefix) is REJECTED
+/// without touching the engine: it yields an unverified result carrying the guidance message, the
+/// engine is NEVER asked to set it (the recorder shows no `SetBreakpoint` for that name), and it is
+/// NOT tracked (a later reconcile that drops it never tries to remove an id for it — no spurious
+/// remove). A `module!sym` name and a plain name in the SAME batch flow through normally (engine set,
+/// tracked), proving the rejection is per-bp and does not abort the batch.
+#[tokio::test]
+async fn set_function_breakpoints_rejects_bare_address_keeps_module_sym() {
+    use crate::backend::ADDRESS_BP_GUIDANCE;
+
+    let (backend, recorder) = backend_with_scripted_bps(vec![
+        // `test_target!compute` (module!sym) resolves → id 1.
+        ScriptedBp::Ok(BreakpointResult {
+            id: 1,
+            verified: true,
+            line: 0,
+            message: String::new(),
+            rejected: false,
+        }),
+        // `compute` (plain name) resolves → id 2.
+        ScriptedBp::Ok(BreakpointResult {
+            id: 2,
+            verified: true,
+            line: 0,
+            message: String::new(),
+            rejected: false,
+        }),
+    ])
+    .await;
+
+    let bps = [
+        FunctionBp {
+            name: "0x7ff6abcd1234".to_string(),
+            condition: String::new(),
+        },
+        FunctionBp {
+            name: "test_target!compute".to_string(),
+            condition: String::new(),
+        },
+        FunctionBp {
+            name: "compute".to_string(),
+            condition: String::new(),
+        },
+    ];
+    let results = backend
+        .set_function_breakpoints(&bps)
+        .await
+        .expect("a bare-address name must not fail the batch");
+
+    assert_eq!(results.len(), 3, "one positional result per input");
+
+    // The bare-address name → unverified, id-0 sentinel, no line, the guidance message.
+    assert!(
+        !results[0].verified,
+        "the bare-address name is rejected as unverified"
+    );
+    assert_eq!(results[0].id, 0, "the rejection uses the id-0 sentinel");
+    assert_eq!(results[0].line, 0, "the rejection carries no line");
+    assert_eq!(
+        results[0].message, ADDRESS_BP_GUIDANCE,
+        "the rejection carries the address-bp guidance message"
+    );
+    assert!(
+        results[0].rejected,
+        "the bare-address result carries the neutral rejected flag so the tool layer skips tracking"
+    );
+
+    // The `module!sym` and plain names flow through and resolve normally — and are NOT rejected.
+    assert!(
+        results[1].verified && results[1].id == 1 && !results[1].rejected,
+        "module!sym resolves and is tracked (id 1), rejected:false"
+    );
+    assert!(
+        results[2].verified && results[2].id == 2 && !results[2].rejected,
+        "the plain name resolves and is tracked (id 2), rejected:false"
+    );
+
+    // The engine was asked to set ONLY the module!sym and the plain name — never the bare address.
+    let bps_set = recorded(&recorder);
+    assert_eq!(
+        bps_set,
+        vec![
+            (
+                RecordedBp::Function("test_target!compute".to_string()),
+                String::new(),
+            ),
+            (RecordedBp::Function("compute".to_string()), String::new()),
+        ],
+        "the bare-address name never reaches the engine; only module!sym + plain do, got {bps_set:?}"
+    );
+    assert!(
+        !bps_set
+            .iter()
+            .any(|(loc, _)| *loc == RecordedBp::Function("0x7ff6abcd1234".to_string())),
+        "the engine was never asked to set the bare-address name"
+    );
+
+    // The bare address is NOT tracked: a follow-up reconcile that drops everything must remove the
+    // two REAL tracked ids (module!sym + plain) but NEVER an id for the address (it was never cached).
+    backend
+        .set_function_breakpoints(&[])
+        .await
+        .expect("clear functions");
+    let removes = removed(&recorder);
+    assert_eq!(
+        removes.iter().copied().collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([1, 2]),
+        "only the two tracked (resolvable) ids are removed; the un-tracked address produces no remove, got {removes:?}"
+    );
+    assert!(
+        !removes.contains(&0),
+        "the id-0 address sentinel must never be sent to the engine's remove path"
+    );
+}
+
+/// R6 — a `module!sym` (or plain name) is rebase-stable: re-sending it across reconciles reuses its
+/// id and it is tracked normally (the rejection is ONLY for bare `0x…` names). This guards that the
+/// address rule did not accidentally start rejecting `module!sym` (which contains no `0x` prefix).
+#[tokio::test]
+async fn set_function_breakpoints_module_sym_is_tracked_and_reused() {
+    let (backend, recorder) = backend_with_scripted_bps(vec![ScriptedBp::Ok(BreakpointResult {
+        id: 7,
+        verified: true,
+        line: 0,
+        message: String::new(),
+        rejected: false,
+    })])
+    .await;
+
+    let sym = FunctionBp {
+        name: "test_target!compute".to_string(),
+        condition: String::new(),
+    };
+
+    let r1 = backend
+        .set_function_breakpoints(std::slice::from_ref(&sym))
+        .await
+        .expect("set module!sym");
+    assert_eq!(r1[0].id, 7, "module!sym resolves to a real engine id");
+
+    // Re-send the same module!sym — it must be REUSED (tracked), not set again.
+    let r2 = backend
+        .set_function_breakpoints(std::slice::from_ref(&sym))
+        .await
+        .expect("re-send module!sym");
+    assert_eq!(r2[0].id, 7, "module!sym keeps its id (tracked/reused)");
+
+    let sets = recorded(&recorder)
+        .iter()
+        .filter(|(loc, _)| *loc == RecordedBp::Function("test_target!compute".to_string()))
+        .count();
+    assert_eq!(
+        sets, 1,
+        "module!sym is set on the engine exactly once (tracked + reused), not rejected"
+    );
+}
+
 /// Condition-change behavior (PINNED, intentional/deferred): re-sending the SAME location with a
 /// DIFFERENT condition reuses the cached result and does NOT re-apply the condition to the engine
 /// (conditional-eval is a deferred Phase-5 feature; a re-sent location keeps its original
@@ -714,6 +892,7 @@ async fn set_source_breakpoints_resend_with_changed_condition_does_not_reapply()
         verified: true,
         line: 42,
         message: String::new(),
+        rejected: false,
     })])
     .await;
 

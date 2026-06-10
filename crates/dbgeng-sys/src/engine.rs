@@ -457,6 +457,8 @@ impl Engine {
             verified: true,
             line: line.unwrap_or(0) as i64,
             message: String::new(),
+            // A real engine set result is trackable.
+            rejected: false,
         })
     }
 
@@ -575,6 +577,8 @@ impl Engine {
                 verified: true,
                 line: 0,
                 message,
+                // A real engine list result is trackable.
+                rejected: false,
             });
         }
         Ok(result)

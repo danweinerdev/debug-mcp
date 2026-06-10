@@ -482,6 +482,107 @@ fn runtime_set_function_breakpoint_resolves_then_unresolvable_is_unverified() {
     });
 }
 
+/// R6 (live, light) — ASLR-safe address breakpoints. Two assertions over the real engine:
+///   1. A bare-address function-bp name (`0x…`) is REJECTED as an unverified result (the address-bp
+///      guidance) WITHOUT erroring the call, while `compute` (a plain, rebase-stable name) in the
+///      SAME batch resolves to a verified bp — the rejection is per-bp and below the seam.
+///   2. Rebase-stability across a relaunch: a plain `compute` function bp re-resolves to a verified
+///      bp on a FRESH launch (a new ASLR-rebased image) — the rebase-stable name re-resolves by name,
+///      so re-flushing it is correct. (A full "the address would be misplaced after relaunch" proof
+///      is unnecessary — we never set the address at all, asserted in (1) and the unit suite.)
+///
+/// A full relaunch-and-hit cross-session test is heavier and flaky; per the task this lighter
+/// "module/plain name resolves on a fresh launch, address is rejected and never set" is the must-have
+/// live coverage (the rejection + non-tracking is fully pinned by the unit suite).
+#[test]
+fn runtime_address_bp_rejected_plain_name_rebase_stable_across_relaunch() {
+    if should_skip() {
+        return;
+    }
+    let _guard = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+
+    runtime().block_on(async {
+        let conn = WinDbgFactory::new()
+            .connect()
+            .await
+            .expect("connect a live WinDbg backend");
+        let backend = conn.backend;
+
+        // Launch #1.
+        match backend.launch(launch_spec("normal")).await.expect("launch") {
+            LaunchOutcome::Stopped(_) => {}
+            other => panic!("launch must stop at the loader break, got {other:?}"),
+        }
+
+        // A batch with a bare-address name AND `compute`: the address is rejected (unverified,
+        // guidance message), `compute` resolves (verified). The call does NOT error.
+        let results = backend
+            .set_function_breakpoints(&[
+                FunctionBp {
+                    name: "0x7ff600001234".to_string(),
+                    condition: String::new(),
+                },
+                FunctionBp {
+                    name: "compute".to_string(),
+                    condition: String::new(),
+                },
+            ])
+            .await
+            .expect("a bare-address name must not error the batch");
+        assert_eq!(results.len(), 2, "one positional result per input bp");
+        assert!(
+            !results[0].verified,
+            "the bare-address name must be rejected (unverified), got {:?}",
+            results[0]
+        );
+        assert!(
+            results[0].message.to_ascii_lowercase().contains("aslr")
+                || results[0].message.contains("run_command"),
+            "the rejection carries the address-bp guidance, got {:?}",
+            results[0].message
+        );
+        assert!(
+            results[1].verified,
+            "the plain `compute` name must resolve to a verified bp, got {:?}",
+            results[1]
+        );
+
+        // Disconnect, then RELAUNCH a fresh (ASLR-rebased) image and re-resolve `compute` by name.
+        // A rebase-stable name re-resolves correctly on the new image, so re-flushing it is correct.
+        backend.disconnect(true).await;
+
+        let conn2 = WinDbgFactory::new()
+            .connect()
+            .await
+            .expect("connect a second live WinDbg backend");
+        let backend2 = conn2.backend;
+        match backend2
+            .launch(launch_spec_with_compute_bp())
+            .await
+            .expect("relaunch")
+        {
+            LaunchOutcome::Stopped(_) => {}
+            other => panic!("relaunch must stop at the loader break, got {other:?}"),
+        }
+        // The relaunch flushed the pending `compute` bp; setting it again confirms it re-resolves on
+        // the fresh (rebased) image to a verified bp (rebase-stable by name).
+        let again = backend2
+            .set_function_breakpoints(&[FunctionBp {
+                name: "compute".to_string(),
+                condition: String::new(),
+            }])
+            .await
+            .expect("re-set compute on the relaunched image");
+        assert!(
+            again[0].verified,
+            "the plain `compute` name re-resolves to a verified bp on the rebased relaunch, got {:?}",
+            again[0]
+        );
+
+        backend2.disconnect(true).await;
+    });
+}
+
 /// `step` Over and `step` Into from the loader break each land `Stopped` (a single source step
 /// stays inside the loader/CRT). thread_id and gran are ignored (WinDbg steps the current thread,
 /// source/line-oriented — no instruction-granularity knob).

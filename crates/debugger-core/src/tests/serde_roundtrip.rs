@@ -125,6 +125,15 @@ fn inspection_types_roundtrip() {
         verified: true,
         line: 6,
         message: String::new(),
+        rejected: false,
+    });
+    // A rejected result roundtrips with the flag preserved.
+    roundtrip(&BreakpointResult {
+        id: 0,
+        verified: false,
+        line: 0,
+        message: "rejected".to_string(),
+        rejected: true,
     });
     roundtrip(&EvalResult {
         result: "46".to_string(),
@@ -143,6 +152,24 @@ fn inspection_types_roundtrip() {
         source_path: Some("loop.c".to_string()),
         line: 6,
     });
+}
+
+#[test]
+fn breakpoint_result_missing_rejected_defaults_false() {
+    // A JSON shape from before the `rejected` field existed deserializes with `rejected:false`
+    // (the `#[serde(default)]`), so the seam contract is backward-compatible.
+    let json = r#"{"id":1,"verified":true,"line":6,"message":""}"#;
+    let back: BreakpointResult = serde_json::from_str(json).expect("deserialize legacy shape");
+    assert_eq!(
+        back,
+        BreakpointResult {
+            id: 1,
+            verified: true,
+            line: 6,
+            message: String::new(),
+            rejected: false,
+        }
+    );
 }
 
 #[test]

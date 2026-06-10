@@ -374,6 +374,73 @@ async fn normal_session_breakpoint_workflow() {
     h.disconnect_cleanup().await;
 }
 
+/// R6 end-to-end (live): on a STOPPED session, a bare-address `set_function_breakpoint("0x…")` is
+/// REJECTED — the response carries the ASLR guidance and is unverified, and crucially the address
+/// NEVER enters the tracked breakpoint table (`list_breakpoints` does not contain it). A subsequent
+/// `set_function_breakpoint("compute")` then lists ONLY `compute` (count 1) — proving no phantom
+/// `0x…` entry accumulates. This is the regression the earlier `id != 0` gate could not express
+/// (DbgEng numbers BPs from 0, so a legitimate first BP has id 0). The fix gates on the neutral
+/// `BreakpointResult.rejected` flag instead, so a legitimate id-0 BP is still tracked.
+#[tokio::test]
+async fn address_function_breakpoint_rejected_and_not_tracked() {
+    if should_skip_windbg("address_function_breakpoint_rejected_and_not_tracked") {
+        return;
+    }
+    let _guard = live_guard().await;
+
+    let h = Harness::new_windbg();
+    let _ = h.launch_windbg(&windbg_fixture_path(), "normal").await;
+
+    // A bare-address function breakpoint is rejected (ASLR guidance, unverified) and NOT tracked.
+    let addr = h
+        .call_default(
+            "set_function_breakpoint",
+            obj(&[("name", Value::String("0x7ff6abcd1234".into()))]),
+        )
+        .await;
+    // The handler surfaces the backend's neutral rejection. It is either a tool-error carrying the
+    // guidance or an unverified JSON result carrying the guidance message — accept either shape, but
+    // the guidance text must be present and the bp must NOT be tracked.
+    let addr_text = format!("{addr:?}");
+    assert!(
+        addr_text.contains("ASLR") || addr_text.contains("address breakpoints are not"),
+        "the address bp response must carry the ASLR guidance, got {addr_text}"
+    );
+
+    // list_breakpoints must NOT contain the address entry — nothing was tracked.
+    let list = h.call_default("list_breakpoints", empty()).await;
+    let list = expect_json_obj("list_breakpoints(after address reject)", &list);
+    assert_eq!(
+        list["count"].as_i64(),
+        Some(0),
+        "the rejected address bp must not be tracked, got {list:?}"
+    );
+
+    // A legitimate `compute` function bp is then tracked and listed alone (count 1) — no phantom
+    // `0x…` accumulation, and the legitimate first BP (id may be 0 under DbgEng) is NOT dropped.
+    let _ = h
+        .call_default(
+            "set_function_breakpoint",
+            obj(&[("name", Value::String("compute".into()))]),
+        )
+        .await;
+    let list2 = h.call_default("list_breakpoints", empty()).await;
+    let list2 = expect_json_obj("list_breakpoints(after compute)", &list2);
+    assert_eq!(
+        list2["count"].as_i64(),
+        Some(1),
+        "only the legitimate compute bp is tracked, got {list2:?}"
+    );
+    let only = &list2["breakpoints"].as_array().unwrap()[0];
+    assert_eq!(
+        only.get("function").and_then(Value::as_str),
+        Some("compute"),
+        "the single tracked bp is compute, not a phantom address, got {only:?}"
+    );
+
+    h.disconnect_cleanup().await;
+}
+
 // --- ATTACH group (live: port of test_attach) ------------------------------------------
 
 /// A spawned `test_target.exe wait` child that is ALWAYS killed + reaped on every path
