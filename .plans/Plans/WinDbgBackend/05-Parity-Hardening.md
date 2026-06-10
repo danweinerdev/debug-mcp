@@ -20,12 +20,12 @@ tasks:
     depends_on: ["5.0"]
   - id: "5.2"
     title: "R6 ASLR address-BP handling + R2 orphaned-thread pump fix"
-    status: in-progress
+    status: complete
     verification: "A `module!sym` function breakpoint re-flushes correctly across a relaunch (rebase-stable); a bare `0x<addr>` breakpoint is routed via `run_command(\"bp <addr>\")` and is **not** session-tracked — a relaunch test shows no misplaced breakpoint, and the `set_function_breakpoint` description warns about address+ASLR when windbg is active; an orphaned kernel-attach engine thread still drives the session to `terminated` via a synthetic `Terminated` (dead-flag / explicit event-sender close), so a fresh `launch` reconnects without a hung event-pump."
     depends_on: ["5.1"]
   - id: "5.3"
     title: "Cancellation / interrupt + Break recovery + backend-aware error strings"
-    status: pending
+    status: in-progress
     verification: "A `continue` that times out returns 'still running' and a subsequent `pause` regains context via the C++ `Break()` recovery (R3); a cancelled `launch`/`attach` resets the session to idle and drops the backend; a rebuild-after-detach test is **re-run in the Phase-5 regression sweep** to confirm no module file lock is left (the task 2.3 criterion held end-to-end); windbg connect-error strings (`Debugging Tools for Windows not found` / `failed to initialize DbgEng`) surface for the windbg factory while lldb's strings are unchanged; `BackendError::Unsupported` maps to the exact `\"<tool> is not supported by the <backend> backend\"` text."
     depends_on: ["5.2"]
   - id: "5.4"
