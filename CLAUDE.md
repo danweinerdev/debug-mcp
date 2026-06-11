@@ -3,10 +3,10 @@
 ## Project: debug-mcp
 
 MCP server that exposes interactive native debugging to AI agents through a **pluggable
-debugger backend**. The current backend wraps `lldb-dap` via the Debug Adapter Protocol;
-the architecture is built so a second backend (e.g. WinDbg) can be added without touching
-the tool layer. Rust rewrite of the original Go `lldb-debug-mcp` (kept feature-identical;
-see `.plans/{Specs,Designs,Plans}/RustPort`).
+debugger backend**. Two backends ship: `lldb-dap` (macOS/Linux) via the Debug Adapter
+Protocol, and **WinDbg** (Windows) via DbgEng/COM — both behind the same neutral seam, added
+without touching the tool layer. Rust rewrite of the original Go `lldb-debug-mcp` (kept
+feature-identical; see `.plans/{Specs,Designs,Plans}/RustPort`).
 
 ## Build
 
@@ -25,6 +25,12 @@ cargo test --workspace
 make -C testdata
 cargo test -p mcp-tools --features integration -- --test-threads=1
 
+# Live WinDbg integration (Windows only; requires the compiled fixture)
+testdata\win\build.bat            # from a VS x64 Native Tools prompt (builds test_target.exe + .pdb)
+make integration-windbg           # builds debug-mcp + runs the windbg suite single-threaded
+# (each test self-skips when the fixture is absent; DbgEng is OS-bundled, so core debugging
+#  needs no extra install; `analyze_crash` degrades gracefully without the full Debugging Tools.)
+
 # Full gate (also: make clippy / fmt-check / seam / tsan)
 make all
 ```
@@ -37,9 +43,9 @@ AI Agent <-stdio/MCP(rmcp)-> [debug-mcp]
                                           -> lldb-backend -> dap-client -> lldb-dap -> target
 ```
 
-Six-crate Cargo workspace under `crates/` (a WinDbg port adds two more — see below). The
-seam is **compiler-enforced**: `mcp-tools`/`mcp-session` depend only on the neutral
-`debugger-core` and cannot name a DAP, lldb, or DbgEng type.
+Eight-crate Cargo workspace under `crates/` (six neutral/lldb crates + the two `cfg(windows)`
+WinDbg crates below the seam). The seam is **compiler-enforced**: `mcp-tools`/`mcp-session`
+depend only on the neutral `debugger-core` and cannot name a DAP, lldb, or DbgEng type.
 
 | Crate | Responsibility |
 |-------|----------------|
@@ -48,7 +54,9 @@ seam is **compiler-enforced**: `mcp-tools`/`mcp-session` depend only on the neut
 | `lldb-backend` | `LldbBackend`/`LldbFactory`: lldb-dap detect/spawn, the launch/attach handshake, op→neutral translation |
 | `mcp-session` | state machine (incl. the `is_dump` flag), breakpoint tracking, output buffer, frame-map cache, the `BackendEvent` event-pump |
 | `mcp-tools` | the MCP tool handlers, `BackendRegistry` (runtime backend switcher), `Args` accessor, response/format/flatten helpers, the rmcp server |
-| `debug-mcp` | the binary: builds a `BackendRegistry`, registers the platform's backend (`LldbFactory` under `cfg(not(windows))`; `WinDbgFactory` under `cfg(windows)` once it lands), serves stdio |
+| `debug-mcp` | the binary: builds a `BackendRegistry`, registers the platform's backend (`LldbFactory` under `cfg(not(windows))`; `WinDbgFactory` under `cfg(windows)`), serves stdio |
+| `dbgeng-sys` *(cfg(windows))* | the **only** crate with `unsafe`: all DbgEng COM/FFI confined behind a safe synchronous `Engine`, built on the `windows` crate |
+| `windbg-backend` *(cfg(windows))* | `#![forbid(unsafe_code)]`: a dedicated engine thread + `WinDbgBackend`/`WinDbgFactory`; op→neutral translation below the seam |
 
 `crates/integration-tests/` holds the live-suite harness (dev-dependency only, so the seam stays intact).
 
@@ -71,11 +79,13 @@ capability-gated: the 21 base tools always, plus the four WinDbg-only tools (`op
 `attach_kernel`, `analyze_crash`, `get_modules`) when a registered factory's
 `BackendCapabilities` enables them (so non-Windows = exactly 21).
 
-**WinDbg port (in progress; see `.plans/{Designs,Plans}/WinDbgBackend`).** Adds two
+**WinDbg port (shipped + parity-validated; see `.plans/{Designs,Plans}/WinDbgBackend`).** Two
 `cfg(windows)` crates *below* the seam: `dbgeng-sys` (the **only** crate with `unsafe` — all
 DbgEng COM/FFI confined behind a safe synchronous `Engine`, built on the `windows` crate) and
 `windbg-backend` (`#![forbid(unsafe_code)]`: a dedicated engine thread + `WinDbgBackend`/
-`WinDbgFactory`). Nothing above the seam changes.
+`WinDbgFactory`). The `WinDbgFactory` is registered by the binary under `cfg(windows)`, and the
+live `integration-windbg` suite drives it against the OS-bundled DbgEng. Nothing above the seam
+changes.
 
 ## Code Conventions
 
@@ -93,8 +103,8 @@ DbgEng COM/FFI confined behind a safe synchronous `Engine`, built on the `window
 - **`unsafe` is confined to one crate.** Every crate is `#![forbid(unsafe_code)]` except
   `dbgeng-sys` (the WinDbg COM/FFI layer), where `unsafe` is unavoidable but isolated and each
   block carries a `// SAFETY:` comment. This is a deliberate, documented deviation from the
-  original "target zero `unsafe`" goal — a CI grep gate asserts `unsafe` appears only under
-  `crates/dbgeng-sys/src/`. (`dbgeng-sys` does not exist yet; the rule applies as it lands.)
+  original "target zero `unsafe`" goal — a CI grep gate (`make unsafe-gate`, also run on the
+  Windows lane) asserts `unsafe` appears only under `crates/dbgeng-sys/src/`.
 
 ## Parity notes (vs the Go oracle)
 
@@ -120,3 +130,46 @@ lldb tools stay byte-identical:
   `execute_command` (raw command escape hatch).
 - **Crash-dump sessions** are `State::Stopped` with an `is_dump` flag; `continue`/`step_*`
   reject them with the frozen literal `"cannot continue a crash-dump session"`.
+
+## WinDbg backend behavior notes (below the seam; frozen tool schema unchanged)
+
+These are `windbg-backend`/`dbgeng-sys` behavior differences from the lldb backend. They live
+*below* the seam — the frozen tool schemas and descriptions are byte-identical to the lldb
+surface; only the runtime behavior differs (surfaced via result messages where it matters).
+
+- **Address breakpoints (R6 / ASLR).** A bare `0x<address>` passed to `set_function_breakpoint`
+  is **rejected** under WinDbg (an unverified result with guidance, not an engine breakpoint):
+  `mcp-session` tracks function BPs **by name** and re-flushes them on every (re)launch, where a
+  raw address would be ASLR-misplaced on the rebased image. `module!sym` (rebase-stable) is
+  allowed and re-resolved via `GetOffsetByName` on each launch; for an address breakpoint use
+  `run_command("bp <addr>")`. (Implementation: `windbg-backend/src/backend.rs`, the R6 rejection
+  with `rejected:true`.)
+- **`get_all_stacks` deviation.** The C++ plugin's `get_all_stacks` fast module-table /
+  binary-search frame-resolution optimization was **not** ported; `stack_trace` resolves
+  per-frame. A deliberate deviation, deferred unless per-frame latency proves material.
+- **Extension path discovery (`!`-commands).** `analyze_crash` and `run_command("!...")` need the
+  Debugging Tools for Windows extensions; the backend discovers the extension path at runtime
+  (registry `KitsRoot10` → `WindowsSdkDir` → a built-in default). On a host without the extensions
+  installed, `!analyze` returns the engine's `No export analyze found` (graceful degradation). The
+  OS-bundled DbgEng (`System32`) drives **core** debugging without the full Tools installed.
+- **Debuggee stdout is not surfaced** through `read_output` under WinDbg: DbgEng's output
+  callbacks carry **engine** output, not the child's `printf`, and the target is spawned
+  `CREATE_NO_WINDOW`. (`read_output` still returns engine/event text.)
+- **`evaluate` ignores `frame_id`** — it evaluates in the engine's current frame.
+- **Failing conditional breakpoints are silently skipped.** A conditional breakpoint whose
+  condition fails to evaluate (out-of-scope symbol, typo) is silently **not** taken — C++ DbgEng
+  parity; DbgEng provides no API notification for the evaluation failure.
+
+## CI / sanitizer coverage notes
+
+- **ThreadSanitizer** (the `tsan` Make target / CI job) covers the `dap-client` concurrency on
+  **Linux** only (it's an LLVM/Linux facility); it does **not** cover the Windows engine-thread
+  path on the MSVC toolchain. That interaction is instead covered by `#![forbid(unsafe_code)]` on
+  `windbg-backend`, the `unsafe-gate` (unsafe confined to `dbgeng-sys`), the flag-only `AtomicBool`
+  interrupt, and the live WinDbg pause tests.
+- **Miri** runs over the neutral crates but is **excluded for `dbgeng-sys`**: COM FFI is not
+  Miri-compatible.
+- The **Windows CI lane** (`windows-latest`) is the only place the `cfg(windows)` code compiles:
+  it runs `cargo build`/`clippy -D warnings`/`fmt --check`/the unsafe-gate/`cargo test` as hard
+  gates, then builds the fixture (via `ilammy/msvc-dev-cmd` + `testdata/win/build.bat`) and runs
+  the live `integration-windbg` suite (the live step self-skips if the fixture is absent).

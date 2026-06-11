@@ -685,8 +685,8 @@ impl DebuggerBackend for WinDbgBackend {
             //
             // PARITY: this WinDbg-only rejection is below the seam — lldb's `set_function_breakpoints`
             // never sees it, and the frozen `set_function_breakpoint` tool SCHEMA is unchanged (the
-            // behavior difference is surfaced via the message). A CLAUDE.md parity note for this is
-            // OWED in task 5.5.
+            // behavior difference is surfaced via the message). See CLAUDE.md, "WinDbg backend
+            // behavior notes" → "Address breakpoints (R6 / ASLR)".
             if is_bare_address_name(&bp.name) {
                 results.push(BreakpointResult {
                     id: 0,

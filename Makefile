@@ -4,7 +4,7 @@
 MANIFEST := $(CURDIR)/Cargo.toml
 CARGO := cargo
 
-.PHONY: all build clippy fmt fmt-check test integration tsan check seam unsafe-gate
+.PHONY: all build clippy fmt fmt-check test integration integration-windbg tsan check seam unsafe-gate
 
 # The full gate, in the order the phase verification runs it.
 all: fmt-check build clippy test seam unsafe-gate
@@ -34,6 +34,17 @@ test:
 integration:
 	$(CARGO) build --manifest-path $(MANIFEST) -p debug-mcp
 	$(CARGO) test --manifest-path $(MANIFEST) -p mcp-tools --features integration -- --test-threads=1
+
+# Live WinDbg integration suite (Windows-only), parallel to `integration` above. Requires
+# the compiled fixture `testdata/win/test_target.exe` (build it via `testdata/win/build.bat`
+# from a VS x64 Native Tools prompt). Each test skips cleanly (logs + passes) when the
+# fixture is absent. Single-threaded because DbgEng keeps process-global engine state.
+# Core debugging is driven by the OS-bundled DbgEng (System32); tests that need the full
+# Debugging Tools for Windows (the `!analyze` rich report) degrade gracefully when only the
+# OS-bundled DbgEng is present.
+integration-windbg:
+	$(CARGO) build --manifest-path $(MANIFEST) -p debug-mcp
+	$(CARGO) test --manifest-path $(MANIFEST) -p mcp-tools --features integration-windbg -- --test-threads=1
 
 # ThreadSanitizer over the dap-client concurrency tests (stop waiter, read-loop EOF
 # recovery, send/correlate/cancel). Needs nightly + rust-src; builds std instrumented.

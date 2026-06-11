@@ -92,3 +92,74 @@ jobs:
           # Make the differential lane a hard requirement only when the Go oracle built;
           # otherwise it skips cleanly (and the golden lane + ported scenarios still run).
           REQUIRE_GO_DIFFERENTIAL: ${{ steps.go_oracle.outputs.built == '1' && '1' || '0' }}
+
+  # The Windows lane is a NEW job alongside the three Ubuntu jobs above; it does NOT alter
+  # them. The WinDbg crates (`dbgeng-sys`, `windbg-backend`) and the `integration-windbg`
+  # suite are `cfg(windows)`, so they're absent on Ubuntu — this lane is the ONLY place the
+  # COM/FFI + engine-thread code is compiled, linted, and exercised.
+  #
+  # No ThreadSanitizer here: tsan is an LLVM/Linux facility and does not cover the Windows
+  # engine-thread path on the MSVC toolchain (the existing `tsan` job stays Ubuntu-only,
+  # covering the dap-client concurrency). The engine-thread confinement is enforced instead
+  # by `#![forbid(unsafe_code)]` on windbg-backend + the unsafe-gate (unsafe only under
+  # dbgeng-sys) + the flag-only AtomicBool interrupt + the live pause tests below (the
+  # Phase-3 debrief rationale). Miri is likewise not run: COM FFI in dbgeng-sys is not
+  # Miri-compatible.
+  windows:
+    name: Windows (WinDbg backend gates + live integration)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      # Put MSVC `cl`/`link` + INCLUDE/LIB on PATH so the fixture build below works. `cl` is
+      # preinstalled on windows-latest but needs the vcvars env; this action sets it up.
+      - name: Set up MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # Build the live fixture (test_target.exe + .pdb) so the integration tests RUN rather
+      # than self-skip. Non-fatal: if `cl` is somehow unavailable the live step below still
+      # skips cleanly (the tests skip when the fixture is absent); the hard gates do not need
+      # the fixture.
+      - name: Build the Windows test fixture (best-effort)
+        continue-on-error: true
+        shell: cmd
+        run: testdata\win\build.bat
+
+      # ---- Hard structural gates (no fixture required) ----
+      # These compile/lint/test the cfg(windows) code that Ubuntu cannot reach.
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo clippy -D warnings (lints windbg-backend + dbgeng-sys + integration-windbg)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # The confined-unsafe gate (same grep as the Makefile `unsafe-gate` recipe). Run under
+      # bash (Git Bash + grep ship on windows-latest). The dbgeng-sys unsafe is expected and
+      # allowed; the gate asserts `unsafe` appears nowhere else.
+      - name: unsafe-gate (unsafe confined to crates/dbgeng-sys/)
+        shell: bash
+        run: |
+          ! grep -rnE '(^|[^[:alnum:]_])unsafe[[:space:]]*(\{|fn|impl|trait)' \
+            --include='*.rs' crates \
+            | grep -v 'crates/dbgeng-sys/' \
+            | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|//!|/\*|\*)' \
+            || (echo "UNSAFE-GATE VIOLATION: 'unsafe' found outside crates/dbgeng-sys/" && exit 1)
+          echo "unsafe-gate ok"
+
+      - name: cargo test --workspace (windbg-backend + dbgeng-sys unit suites)
+        run: cargo test --workspace
+
+      # ---- Live WinDbg integration (self-skips if the fixture is absent) ----
+      # DbgEng is OS-bundled, so the Normal/Attach/Pause/Crash/Dump/Error/differential groups
+      # RUN when the fixture built above; `analyze_crash` degrades gracefully when the runner
+      # lacks the full Debugging Tools for Windows. Single-threaded: DbgEng is process-global.
+      - name: integration-windbg (live DbgEng scenarios)
+        run: cargo test -p mcp-tools --features integration-windbg -- --test-threads=1
