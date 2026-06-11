@@ -408,110 +408,109 @@ async fn launch_event_pump_runs_before_backend_launch() {
     assert_eq!(session.exit_code(), Some(9));
 }
 
+/// A backend whose `launch`/`attach` never resolve (`pending()`), so a pre-cancelled request
+/// token deterministically wins the handler's `tokio::select!` — exercising the cancel arm
+/// (`cleanup_after_cancel`) without any timing race. Shared by the launch/attach cancellation
+/// tests below.
+struct HangBackend;
+#[async_trait::async_trait]
+impl DebuggerBackend for HangBackend {
+    async fn launch(&self, _s: debugger_core::LaunchSpec) -> Result<LaunchOutcome, BackendError> {
+        std::future::pending().await
+    }
+    async fn attach(&self, _s: debugger_core::AttachSpec) -> Result<AttachOutcome, BackendError> {
+        std::future::pending().await
+    }
+    async fn disconnect(&self, _t: bool) {}
+    async fn set_source_breakpoints(
+        &self,
+        _f: &str,
+        _b: &[debugger_core::SourceBp],
+    ) -> Result<Vec<debugger_core::BreakpointResult>, BackendError> {
+        Ok(Vec::new())
+    }
+    async fn set_function_breakpoints(
+        &self,
+        _b: &[debugger_core::FunctionBp],
+    ) -> Result<Vec<debugger_core::BreakpointResult>, BackendError> {
+        Ok(Vec::new())
+    }
+    async fn cont(&self, _t: i64) -> Result<debugger_core::StopOutcome, BackendError> {
+        unreachable!()
+    }
+    async fn step(
+        &self,
+        _k: debugger_core::StepKind,
+        _t: i64,
+        _g: Option<debugger_core::Granularity>,
+    ) -> Result<debugger_core::StopOutcome, BackendError> {
+        unreachable!()
+    }
+    async fn pause(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+    async fn threads(&self) -> Result<Vec<debugger_core::ThreadInfo>, BackendError> {
+        Ok(Vec::new())
+    }
+    async fn stack_trace(
+        &self,
+        _t: i64,
+        _s: i64,
+        _l: i64,
+    ) -> Result<(Vec<debugger_core::Frame>, i64), BackendError> {
+        Ok((Vec::new(), 0))
+    }
+    async fn scopes(&self, _f: i64) -> Result<Vec<debugger_core::Scope>, BackendError> {
+        Ok(Vec::new())
+    }
+    async fn variables(&self, _r: i64) -> Result<Vec<debugger_core::Variable>, BackendError> {
+        Ok(Vec::new())
+    }
+    async fn evaluate(
+        &self,
+        _e: &str,
+        _f: Option<i64>,
+        _m: debugger_core::EvalMode,
+    ) -> Result<debugger_core::EvalResult, BackendError> {
+        unreachable!()
+    }
+    async fn read_memory(
+        &self,
+        _a: &str,
+        _c: i64,
+    ) -> Result<debugger_core::MemoryRead, BackendError> {
+        unreachable!()
+    }
+    async fn disassemble(
+        &self,
+        _a: &str,
+        _c: i64,
+    ) -> Result<Vec<debugger_core::Instruction>, BackendError> {
+        unreachable!()
+    }
+    fn supports_command_repl_mode(&self) -> bool {
+        true
+    }
+}
+
+struct HangFactory;
+#[async_trait::async_trait]
+impl debugger_core::BackendFactory for HangFactory {
+    fn name(&self) -> &'static str {
+        "hang"
+    }
+    async fn connect(&self) -> Result<Connection, BackendError> {
+        let backend: Arc<dyn DebuggerBackend> = Arc::new(HangBackend);
+        Ok(Connection {
+            backend,
+            events: stream::empty().boxed(),
+        })
+    }
+}
+
 #[tokio::test]
 async fn launch_cancellation_returns_timeout_string() {
     // A backend whose launch never resolves; the cancelled token wins the select.
-    struct HangBackend;
-    #[async_trait::async_trait]
-    impl DebuggerBackend for HangBackend {
-        async fn launch(
-            &self,
-            _s: debugger_core::LaunchSpec,
-        ) -> Result<LaunchOutcome, BackendError> {
-            std::future::pending().await
-        }
-        async fn attach(
-            &self,
-            _s: debugger_core::AttachSpec,
-        ) -> Result<AttachOutcome, BackendError> {
-            std::future::pending().await
-        }
-        async fn disconnect(&self, _t: bool) {}
-        async fn set_source_breakpoints(
-            &self,
-            _f: &str,
-            _b: &[debugger_core::SourceBp],
-        ) -> Result<Vec<debugger_core::BreakpointResult>, BackendError> {
-            Ok(Vec::new())
-        }
-        async fn set_function_breakpoints(
-            &self,
-            _b: &[debugger_core::FunctionBp],
-        ) -> Result<Vec<debugger_core::BreakpointResult>, BackendError> {
-            Ok(Vec::new())
-        }
-        async fn cont(&self, _t: i64) -> Result<debugger_core::StopOutcome, BackendError> {
-            unreachable!()
-        }
-        async fn step(
-            &self,
-            _k: debugger_core::StepKind,
-            _t: i64,
-            _g: Option<debugger_core::Granularity>,
-        ) -> Result<debugger_core::StopOutcome, BackendError> {
-            unreachable!()
-        }
-        async fn pause(&self) -> Result<(), BackendError> {
-            Ok(())
-        }
-        async fn threads(&self) -> Result<Vec<debugger_core::ThreadInfo>, BackendError> {
-            Ok(Vec::new())
-        }
-        async fn stack_trace(
-            &self,
-            _t: i64,
-            _s: i64,
-            _l: i64,
-        ) -> Result<(Vec<debugger_core::Frame>, i64), BackendError> {
-            Ok((Vec::new(), 0))
-        }
-        async fn scopes(&self, _f: i64) -> Result<Vec<debugger_core::Scope>, BackendError> {
-            Ok(Vec::new())
-        }
-        async fn variables(&self, _r: i64) -> Result<Vec<debugger_core::Variable>, BackendError> {
-            Ok(Vec::new())
-        }
-        async fn evaluate(
-            &self,
-            _e: &str,
-            _f: Option<i64>,
-            _m: debugger_core::EvalMode,
-        ) -> Result<debugger_core::EvalResult, BackendError> {
-            unreachable!()
-        }
-        async fn read_memory(
-            &self,
-            _a: &str,
-            _c: i64,
-        ) -> Result<debugger_core::MemoryRead, BackendError> {
-            unreachable!()
-        }
-        async fn disassemble(
-            &self,
-            _a: &str,
-            _c: i64,
-        ) -> Result<Vec<debugger_core::Instruction>, BackendError> {
-            unreachable!()
-        }
-        fn supports_command_repl_mode(&self) -> bool {
-            true
-        }
-    }
-    struct HangFactory;
-    #[async_trait::async_trait]
-    impl debugger_core::BackendFactory for HangFactory {
-        fn name(&self) -> &'static str {
-            "hang"
-        }
-        async fn connect(&self) -> Result<Connection, BackendError> {
-            let backend: Arc<dyn DebuggerBackend> = Arc::new(HangBackend);
-            Ok(Connection {
-                backend,
-                events: stream::empty().boxed(),
-            })
-        }
-    }
-
     let session = Arc::new(mcp_session::SessionManager::new());
     let server = crate::ToolServer::new(
         Arc::clone(&session),
@@ -521,13 +520,67 @@ async fn launch_cancellation_returns_timeout_string() {
     ct.cancel();
     let a = args(&[("program", json!("/bin/p"))]);
     let out = server.handle_launch(&crate::Args::new(&a), &ct).await;
-    let msg = expect_error(&out);
-    assert!(
-        msg.contains("timed out waiting for stop on entry"),
-        "got {msg}"
+    // Exact-match the frozen production string (stop_on_entry defaults to true → the
+    // stop-on-entry cancel wording), consistent with the attach cancellation test.
+    assert_eq!(
+        expect_error(&out),
+        "timed out waiting for stop on entry: context canceled"
     );
-    // Cleanup reset the session.
+    // The cancel arm ran `cleanup_after_cancel` → the session reset to idle AND the backend
+    // slot was cleared (a leaked backend would block the next launch's idle guard / leave a
+    // dangling subprocess). Both halves of the cancel cleanup are asserted.
     assert_eq!(session.state(), State::Idle);
+    assert!(
+        server.current_backend().await.is_none(),
+        "cancelled launch must clear the connected backend"
+    );
+}
+
+#[tokio::test]
+async fn launch_cancellation_no_stop_on_entry_uses_launch_timeout_string() {
+    // With `stop_on_entry=false`, the cancel arm uses the whole-launch wording rather than the
+    // stop-on-entry wording (the two distinct Go messages share the one cancel path here).
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(Arc::new(HangFactory)),
+    );
+    let ct = token();
+    ct.cancel();
+    let a = args(&[
+        ("program", json!("/bin/p")),
+        ("stop_on_entry", json!(false)),
+    ]);
+    let out = server.handle_launch(&crate::Args::new(&a), &ct).await;
+    assert_eq!(expect_error(&out), "launch timed out: context canceled");
+    assert_eq!(session.state(), State::Idle);
+    assert!(server.current_backend().await.is_none());
+}
+
+#[tokio::test]
+async fn attach_cancellation_returns_timeout_and_resets_idle_clearing_backend() {
+    // Symmetric with the launch cancellation test: a connected backend whose `attach` never
+    // resolves, with the request token pre-cancelled so the `ct.cancelled()` arm wins the
+    // select. The handler must return the Go cancel string, reset the session to idle, and
+    // clear the connected backend (the `cleanup_after_cancel` path on the attach arm).
+    let session = Arc::new(mcp_session::SessionManager::new());
+    let server = crate::ToolServer::new(
+        Arc::clone(&session),
+        crate::tests::fake::single_factory_registry(Arc::new(HangFactory)),
+    );
+    let ct = token();
+    ct.cancel();
+    let a = args(&[("pid", json!(1234))]);
+    let out = server.handle_attach(&crate::Args::new(&a), &ct).await;
+    assert_eq!(
+        expect_error(&out),
+        "timed out waiting for stop on entry: context canceled"
+    );
+    assert_eq!(session.state(), State::Idle);
+    assert!(
+        server.current_backend().await.is_none(),
+        "cancelled attach must clear the connected backend"
+    );
 }
 
 // ---- attach ----

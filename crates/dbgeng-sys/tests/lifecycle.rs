@@ -151,10 +151,11 @@ fn detach_allows_a_fresh_session() {
     // released the engine's session/module state so a new `DebugCreate` + `launch` succeeds (a
     // leaked session would make the second launch fail). This is the reliable detach assertion.
     //
-    // The file-lock-specific check (that ACTIVE_DETACH leaves the target image writable for a
-    // rebuild, vs DetachProcesses' lingering lock) is intentionally NOT asserted here: it depends
-    // on the detached process exiting within a poll window, which is timing-racy from the loader
-    // break. That regression is scheduled for Phase 5 (rebuild-after-detach), per the plan.
+    // The file-lock-specific guarantee (that ACTIVE detach/terminate releases the target image
+    // lock so a rebuild can overwrite the exe, vs `DetachProcesses`' lingering lock) is asserted
+    // separately by `rebuild_after_detach_releases_the_image_lock` below: that test de-flakes the
+    // old timing race by launching a COPY of the fixture and detaching with terminate=true (no
+    // exit-timing poll), then asserting the copy is removable/replaceable.
     let mut engine2 = Engine::create().expect("create engine 2");
     let outcome = engine2.launch(&launch_req("normal")).expect("launch 2");
     assert!(
@@ -162,6 +163,148 @@ fn detach_allows_a_fresh_session() {
         "a second session should launch and stop after the first detached"
     );
     engine2.detach(false).expect("detach 2");
+}
+
+/// RAII guard owning a unique temp copy of the fixture exe (and its `.pdb`, if copied). Removes
+/// the file(s) on `Drop` so cleanup runs on every path — success, assertion failure, or panic.
+/// Construction pre-cleans any stale copy at the same path.
+struct TempExe {
+    exe: PathBuf,
+    pdb: Option<PathBuf>,
+}
+
+impl TempExe {
+    /// Copy `testdata/win/test_target.exe` (+ its `.pdb`) to a unique temp path keyed on `tag`,
+    /// the process id, and a high-resolution timestamp so concurrent/leftover runs cannot collide.
+    fn new(tag: &str) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let exe = std::env::temp_dir().join(format!(
+            "test_target_{}_{}_{}.exe",
+            tag,
+            std::process::id(),
+            stamp
+        ));
+        let pdb = exe.with_extension("pdb");
+
+        // Pre-clean any stale copy at these paths before writing the fresh ones.
+        let _ = std::fs::remove_file(&exe);
+        let _ = std::fs::remove_file(&pdb);
+
+        std::fs::copy(fixture(), &exe).expect("copy test_target.exe to temp");
+        // Copy the matching .pdb next to it when present, so a launch can resolve symbols.
+        let src_pdb = fixture().with_extension("pdb");
+        let pdb = if src_pdb.exists() {
+            std::fs::copy(&src_pdb, &pdb).expect("copy test_target.pdb to temp");
+            Some(pdb)
+        } else {
+            None
+        };
+
+        TempExe { exe, pdb }
+    }
+}
+
+impl Drop for TempExe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.exe);
+        if let Some(pdb) = &self.pdb {
+            let _ = std::fs::remove_file(pdb);
+        }
+    }
+}
+
+/// Rebuild-after-detach file-lock regression (Phase 5; deferred from Phase 2). Proves the
+/// file-lock-specific guarantee the plain `detach_allows_a_fresh_session` test does NOT: that
+/// `detach(true)` (`EndSession(DEBUG_END_ACTIVE_TERMINATE)`) releases the engine's module-file
+/// mapping on the target image, so a subsequent **build could overwrite the exe**. A plain
+/// `DetachProcesses` would leave that mapping (and thus a sharing lock) lingering — the bug this
+/// guards (engine.cpp:368-372, the ACTIVE_DETACH rationale).
+///
+/// De-flaked vs the old timing-racy approach: instead of polling for a detached process to exit
+/// within a window, we control lifetime by launching a unique **copy** of the fixture and using
+/// `detach(true)`, which KILLS the debuggee deterministically (no exit poll) AND releases the
+/// image mapping synchronously in `EndSession`. After detach + engine drop we assert the copied
+/// exe is now replaceable by REMOVING it (exactly "a rebuild could replace the exe"); if the
+/// engine held a lingering lock the remove would fail with a sharing violation. A short poll
+/// absorbs any async lock-release latency, but with terminate=true it should succeed immediately.
+///
+/// Behind the standard skip-if-fixture-absent + `LIVE` mutex; the `TempExe` RAII guard removes the
+/// copy on every path.
+#[test]
+fn rebuild_after_detach_releases_the_image_lock() {
+    if should_skip() {
+        return;
+    }
+    let _guard = LIVE.lock().unwrap_or_else(|p| p.into_inner());
+
+    // A unique copy of the fixture (+ its pdb), removed on every path by the RAII guard.
+    let copy = TempExe::new("rebuild");
+
+    // Launch the COPIED exe in normal mode → it stops at the loader break; the engine now holds a
+    // module-file mapping on `copy.exe`.
+    {
+        let mut engine = Engine::create().expect("create engine");
+        let req = LaunchReq {
+            program: copy.exe.to_string_lossy().into_owned(),
+            args: vec!["normal".to_string()],
+            cwd: None,
+        };
+        let outcome = engine.launch(&req).expect("launch copied fixture");
+        assert!(
+            matches!(outcome, StopOutcome::Stopped(_)),
+            "launch of the copied fixture should stop at the initial break, got {outcome:?}"
+        );
+
+        // ACTIVE detach/terminate: kills the debuggee AND releases the engine's module mapping
+        // (DEBUG_END_ACTIVE_TERMINATE). Drop the engine to release any remaining handles.
+        engine.detach(true).expect("detach(true)");
+        drop(engine);
+    }
+
+    // Sanity: the engine must release the image lock WITHOUT having deleted the file. If the copy
+    // were already gone here, the removability poll below would trivially "succeed" and the test
+    // would pass for the wrong reason. Asserting the file still exists rules that out.
+    assert!(
+        copy.exe.exists(),
+        "target exe must still exist after engine drop — the engine must release the image lock WITHOUT deleting the file"
+    );
+
+    // The image lock must now be released: a rebuild could overwrite the exe. We prove it by
+    // REMOVING the copied exe (the strongest form of "replaceable"). Poll briefly to absorb any
+    // async lock-release latency — but with terminate=true + EndSession's synchronous teardown it
+    // should succeed on the first try. A genuine lingering lock fails every attempt (sharing
+    // violation), which is a real regression we surface rather than weaken.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut attempts = 0_u32;
+    let mut removed = false;
+    let mut last_err: Option<std::io::Error> = None;
+    while std::time::Instant::now() < deadline {
+        attempts += 1;
+        match std::fs::remove_file(&copy.exe) {
+            Ok(()) => {
+                removed = true;
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    assert!(
+        removed,
+        "detach(true) must release the image lock so the exe is replaceable (a rebuild could \
+         overwrite it), but removing {} still failed after {attempts} attempt(s): {:?}",
+        copy.exe.display(),
+        last_err
+    );
+    eprintln!(
+        "rebuild_after_detach: image lock released; exe removable after {attempts} attempt(s)"
+    );
 }
 
 /// `open_dump` against a path that does not exist fails cleanly (DbgEng `OpenDumpFile` errors), and
