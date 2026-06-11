@@ -1,9 +1,9 @@
 ---
 title: "WinDbg Backend — debug-mcp"
 type: plan
-status: active
+status: complete
 created: 2026-06-03
-updated: 2026-06-09
+updated: 2026-06-11
 tags: [rust, windbg, dbgeng, com, backend, debugging, kernel, crash-dump, ffi, port, tokio]
 related: [Designs/WinDbgBackend, Designs/RustPort, Specs/RustPort]
 phases:
@@ -28,7 +28,7 @@ phases:
     depends_on: [3]
   - id: 5
     title: "Parity Hardening — cond-BP, cancel/interrupt, test_suite port, CI lane"
-    status: in-progress
+    status: complete
     doc: "05-Parity-Hardening.md"
     depends_on: [4]
 ---

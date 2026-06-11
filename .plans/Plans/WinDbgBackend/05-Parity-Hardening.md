@@ -3,9 +3,9 @@ title: "Parity Hardening — cond-BP, cancel/interrupt, test_suite port, CI lane
 type: phase
 plan: WinDbgBackend
 phase: 5
-status: in-progress
+status: complete
 created: 2026-06-03
-updated: 2026-06-09
+updated: 2026-06-11
 deliverable: "Behavioral parity with the C++ oracle closed out: engine-side conditional breakpoints, the R6 ASLR address-BP handling, the R2 orphaned-thread pump fix, cancellation/interrupt + Break recovery, backend-aware error strings, the ported Error test group + a differential Windows lane, and a CI Windows lane — with CLAUDE.md parity notes finalized."
 tasks:
   - id: "5.0"
@@ -35,7 +35,7 @@ tasks:
     depends_on: ["5.3"]
   - id: "5.5"
     title: "CI Windows lane + finalize docs / structural gates"
-    status: in-progress
+    status: complete
     verification: "CI builds the full workspace and runs `integration-windbg` on a Windows runner (or a documented self-hosted/manual gate per R7), with the `unsafe`-confinement grep gate, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --check`, and ThreadSanitizer over the engine thread; **Miri is explicitly excluded for `dbgeng-sys`** (COM FFI is not Miri-compatible — noted in CLAUDE.md) while it continues to run green over the neutral crates; the existing Linux/macOS lane is unchanged and green; CLAUDE.md's parity-notes list and architecture/crate table are finalized (the unsafe deviation, the `backend` arg, the four new tools, the get_all_stacks/address-BP deviations)."
     depends_on: ["5.4"]
 ---
