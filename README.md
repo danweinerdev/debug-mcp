@@ -1,16 +1,23 @@
 # debug-mcp
 
 An MCP (Model Context Protocol) server that gives AI agents interactive debugging
-capabilities. This is the Rust port of `lldb-debug-mcp`, built on the official Rust MCP
-SDK ([`rmcp`](https://crates.io/crates/rmcp)). It is **behaviorally feature-identical** to
-the Go version — the same 21 tools, parameters, defaults, session state machine, DAP
-handshake, response shapes, and error semantics — with three intentional, documented
-deviations (see [Deviations from the Go server](#deviations-from-the-go-server)).
+capabilities, built on the official Rust MCP SDK ([`rmcp`](https://crates.io/crates/rmcp)).
+It exposes native debugging through a **pluggable debugger backend**: the tool and session
+layers depend on a debugger-neutral `DebuggerBackend` trait, so each backend plugs in below
+the seam without touching the MCP tool layer.
 
-The motivation for the rewrite is a **pluggable debugger backend**: the tool and session
-layers depend on a debugger-neutral `DebuggerBackend` trait, so a future backend (e.g.
-WinDbg) can be added without touching the MCP tool layer. Today the only backend is
-`lldb-dap`, driven over the Debug Adapter Protocol (DAP) on stdio.
+Two backends ship, selected by platform:
+
+- **lldb** (macOS / Linux) — drives `lldb-dap` over the Debug Adapter Protocol (DAP) on stdio.
+- **WinDbg** (Windows) — drives the Windows debugger engine (DbgEng / COM) on a dedicated
+  in-process engine thread, adding crash-dump analysis, kernel debugging, and `!analyze -v`.
+
+It began as a Rust port of the Go `lldb-debug-mcp` and stays **behaviorally feature-identical**
+to it for the 21 core lldb tools — same parameters, defaults, session state machine, DAP
+handshake, response shapes, and error semantics — with three intentional, documented deviations
+(see [Deviations from the Go server](#deviations-from-the-go-server)). The WinDbg backend adds
+four capability-gated tools on top, so the surface is **21 tools on macOS/Linux and 25 on
+Windows**.
 
 > **Binary name `debug-mcp`, server name `debug`.** The published binary is `debug-mcp`
 > and the advertised MCP server name is `debug` (the Go version used `lldb-debug-mcp` /
@@ -22,28 +29,44 @@ WinDbg) can be added without touching the MCP tool layer. Today the only backend
 
 ```mermaid
 graph LR
-    Agent["AI Agent<br/>(Claude Code)"] -->|stdio / MCP (rmcp)| Server["Rust MCP Server<br/>(debug-mcp)"]
-    Server -->|stdio / DAP| LLDB["lldb-dap<br/>(LLVM)"]
-    LLDB -->|SB API| Target["Target<br/>Process"]
+    Agent["AI Agent<br/>(Claude Code)"] -->|"stdio / MCP (rmcp)"| Server["debug-mcp<br/>(MCP server)"]
+    Server -->|"DebuggerBackend trait (the seam)"| Reg{{"BackendRegistry"}}
+    Reg -->|"macOS / Linux"| Lldb["lldb-backend"]
+    Reg -->|"Windows"| Windbg["windbg-backend"]
+    Lldb -->|"stdio / DAP"| Dap["lldb-dap (LLVM)"]
+    Windbg -->|"COM / engine thread"| Eng["DbgEng (dbgeng-sys)"]
+    Dap --> Target["Target process"]
+    Eng --> TargetW["Target / crash dump / kernel"]
 ```
 
-The server is a Cargo workspace of six crates, split along the `DebuggerBackend` seam so
-the tool/session crates cannot reach DAP- or lldb-specific code:
+The server is a Cargo workspace of eight crates — six neutral/lldb crates plus two
+`cfg(windows)` WinDbg crates below the seam — split along the `DebuggerBackend` boundary so
+the tool/session crates cannot reach DAP-, lldb-, or DbgEng-specific code:
 
 | Crate | Role | Notes |
 |-------|------|-------|
-| `debugger-core` | contract | `DebuggerBackend` + `BackendFactory` traits, neutral types, `BackendEvent`, `BackendError`. Leaf crate — **no** `tokio`/`rmcp`/DAP dependency. |
+| `debugger-core` | contract | `DebuggerBackend` + `BackendFactory` traits, `BackendCapabilities`, neutral types, `BackendEvent`, `BackendError`. Leaf crate — **no** `tokio`/`rmcp`/DAP/DbgEng dependency. |
 | `dap-client` | generic DAP transport | Content-Length framing, sequence correlation, the pending-request map, the read loop, the stop waiter. |
-| `lldb-backend` | lldb backend | `LldbBackend` (the launch/attach handshake, lldb-dap arg shapes, repl-mode/backtick) + `LldbFactory` (detect → spawn → connect). Built on `dap-client`. |
-| `mcp-session` | session | `SessionManager`: state machine, breakpoint tracking, frame-map cache, output buffer. Depends only on `debugger-core`. |
-| `mcp-tools` | tool layer | the 21 handlers, `Args` accessor, response builders, `flatten_variables`, hex-dump/output formatters, the rmcp `ServerHandler`. Depends only on `debugger-core` + `mcp-session` (+ `rmcp`). |
-| `debug-mcp` | binary | `main`: wire the session + the `LldbFactory` into the `ToolServer`, serve over stdio via rmcp. |
+| `lldb-backend` | lldb backend (macOS/Linux) | `LldbBackend` (launch/attach handshake, lldb-dap arg shapes, repl-mode/backtick) + `LldbFactory` (detect → spawn → connect). Built on `dap-client`. |
+| `dbgeng-sys` *(`cfg(windows)`)* | confined COM/FFI | the **only** crate with `unsafe`: all DbgEng COM/FFI confined behind a safe, synchronous `Engine`, built on the `windows` crate. |
+| `windbg-backend` *(`cfg(windows)`)* | WinDbg backend (Windows) | `#![forbid(unsafe_code)]`: a dedicated MTA-COM engine thread + `WinDbgBackend`/`WinDbgFactory`; op→neutral translation. Built on `dbgeng-sys`. |
+| `mcp-session` | session | `SessionManager`: state machine (incl. the crash-dump `is_dump` flag), breakpoint tracking, frame-map cache, output buffer. Depends only on `debugger-core`. |
+| `mcp-tools` | tool layer | the tool handlers, `BackendRegistry` (the runtime backend switcher), `Args` accessor, response builders, `flatten_variables`, hex-dump/output formatters, the rmcp `ServerHandler`. Depends only on `debugger-core` + `mcp-session` (+ `rmcp`). |
+| `debug-mcp` | binary | `main`: build a `BackendRegistry`, register the platform's backend (`LldbFactory` under `cfg(not(windows))`, `WinDbgFactory` under `cfg(windows)`), serve over stdio via rmcp. |
 
 **Seam guarantee.** `mcp-tools` and `mcp-session` depend on `debugger-core` only — they
-cannot name a DAP or lldb type. Only the binary depends on a concrete backend crate, and
-only to obtain a `dyn BackendFactory`. Adding a backend = a new backend crate implementing
-the same two traits + one registration line in the binary, with zero changes above the
-seam. (The `seam` Make target enforces this.)
+cannot name a DAP, lldb, or DbgEng type. Only the binary depends on a concrete backend crate,
+and only to register a `dyn BackendFactory` into the `BackendRegistry`. Adding the WinDbg
+backend required **zero changes above the seam** — exactly the additive shape the design
+promised. (The `seam` Make target enforces the dependency boundary; the `unsafe-gate` target
+enforces that `unsafe` appears only under `crates/dbgeng-sys/`.)
+
+**Platform-exclusive backends.** lldb is the macOS/Linux backend; WinDbg is the Windows
+backend. The binary registers exactly one factory per OS (lldb-on-Windows is deferred), and
+each backend's platform-bound tests run only on that platform. The `BackendRegistry` switcher
+is retained so a second backend can be registered per-OS later as a one-line addition; today
+`launch`/`attach` honor an optional `backend` arg, then `DEBUG_BACKEND`, then the per-OS
+default (`windbg` on Windows, `lldb` elsewhere).
 
 ### Session state machine
 
@@ -65,10 +88,13 @@ stateDiagram-v2
 
 - Rust (stable) for building; a nightly toolchain + `rust-src` only for the optional
   ThreadSanitizer run.
-- `lldb-dap` (LLVM 18+) or `lldb-vscode` (older LLVM) at runtime.
-- A C compiler (`gcc`/`clang`) only for building the integration-test fixtures.
+- A debugger runtime for your platform (see below).
+- A C compiler only for building the integration-test fixtures
+  (`gcc`/`clang` on macOS/Linux; MSVC `cl` on Windows).
 
-### Installing lldb-dap
+### macOS / Linux — lldb-dap
+
+Needs `lldb-dap` (LLVM 18+) or `lldb-vscode` (older LLVM) at runtime.
 
 | Platform | Command |
 |----------|---------|
@@ -87,6 +113,19 @@ The server auto-detects the binary using this fallback chain (matching the Go ve
 
 Set `LLDB_DAP_PATH` if auto-detection doesn't find it. The variable is read lazily at the
 first `launch`/`attach`, never at startup.
+
+### Windows — WinDbg / DbgEng
+
+The debugger engine (`dbgeng.dll`) is **bundled with Windows** (in `System32`), so core
+debugging — launch, attach, breakpoints, stepping, inspection, memory, crash dumps — works
+out of the box with no extra install.
+
+The **Debugging Tools for Windows** (part of the Windows SDK / WDK) are required only for the
+extension-backed commands — `analyze_crash` (`!analyze -v`) and `run_command("!...")`. The
+backend discovers the extension path at runtime (registry `KitsRoot10` → `WindowsSdkDir` →
+the default install path) and loads `ext.dll`; if the full tools are not installed,
+`analyze_crash` degrades gracefully (it returns the engine's `No export analyze found` rather
+than failing). Symbols resolve via the standard `_NT_SYMBOL_PATH` / a `srv*` cache.
 
 ## Build
 
@@ -176,12 +215,19 @@ Example prompts:
 
 ## Tools reference
 
+The **21 core tools** below are available on every platform and are byte-identical to the Go
+server. On Windows, four additional **WinDbg-only tools** are advertised (25 total) — see
+[WinDbg-only tools](#windbg-only-tools-windows).
+
 ### Session management
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `launch` | Launch a program under the debugger | `program` (required), `args`, `cwd`, `env`, `stop_on_entry` |
-| `attach` | Attach to a running process | `pid` or `wait_for` |
+| `launch` | Launch a program under the debugger | `program` (required), `args`, `cwd`, `env`, `stop_on_entry`, `backend` |
+| `attach` | Attach to a running process | `pid` or `wait_for`, `backend` |
 | `disconnect` | End the debug session | `terminate` (default true) |
+
+> The optional `backend` arg (`"lldb"` / `"windbg"`) on `launch`/`attach` is additive — omit
+> it to use the per-OS default. `status` reports the active backend and the available backends.
 
 ### Breakpoints
 | Tool | Description | Parameters |
@@ -215,7 +261,20 @@ Example prompts:
 |------|-------------|------------|
 | `read_memory` | Read raw memory (hex dump) | `address` (required), `count` (required) |
 | `disassemble` | Disassemble at address or PC | `address`, `instruction_count` (default 20) |
-| `run_command` | Execute any LLDB command | `command` (required) |
+| `run_command` | Execute any backend command (LLDB command / WinDbg command incl. `!extensions`) | `command` (required) |
+
+### WinDbg-only tools (Windows)
+
+Advertised only when a WinDbg-capable backend is registered (so the surface is exactly 21 on
+macOS/Linux). On an active lldb session they return a clear `not supported by the lldb backend`
+tool-error.
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `open_crash_dump` | Open a crash/minidump for post-mortem analysis (a `stopped`, non-resumable session) | `dump_path` (required) |
+| `attach_kernel` | Attach to a kernel target over KDNET | `connection` (required, `net:port=,key=`) |
+| `analyze_crash` | Run `!analyze -v` and return the report | — |
+| `get_modules` | List loaded modules (name, base, size, symbol status) | — |
 
 ## Deviations from the Go server
 
@@ -254,38 +313,81 @@ Everything else is byte-for-byte behavior parity at the level of observable MCP 
 (field names, types, presence rules, values, and error strings). Object key order and
 whitespace may differ (structural JSON parity).
 
+### WinDbg backend notes
+
+These extend the frozen Go-parity surface; the 21 lldb tools stay byte-identical. Below the
+seam, the WinDbg backend differs from the lldb backend in a few documented ways (full list in
+`CLAUDE.md`):
+
+- **Additive surface.** The optional `backend` arg on `launch`/`attach`, the additive
+  `backend`/`available_backends` fields on `status`, and the four capability-gated tools above
+  are advertised only when a WinDbg-capable backend is registered (so non-Windows = exactly 21).
+- **Crash-dump sessions** are `stopped` with an `is_dump` flag; `continue`/`step_*` reject them
+  with `cannot continue a crash-dump session`.
+- **Address breakpoints.** A bare `0x<addr>` passed to `set_function_breakpoint` is rejected
+  (it would be ASLR-misplaced when re-flushed on relaunch); use `module!sym` (rebase-stable) or
+  `run_command("bp <addr>")`. Conditional breakpoints whose condition fails to evaluate
+  (out-of-scope/typo) are silently skipped (DbgEng parity).
+- **Output / evaluate.** Debuggee stdout is not surfaced through `read_output` (DbgEng output
+  callbacks carry engine output, not the child's `printf`); `evaluate` runs in the current
+  frame. `analyze_crash`/`!`-commands need the Debugging Tools installed (graceful degradation
+  otherwise).
+
 ## Development
 
-There are two gates, and `make all` is **not** full coverage on its own:
+The gates split into a hermetic lint/build gate, the live per-platform integration gates, and
+the supply-chain gates — `make all` is **not** full coverage on its own:
 
 - **`make all` — the hermetic gate.** Format check, build, `clippy -D warnings` (no
-  `#[allow]` — warnings are fixed at the source), unit tests, and the seam check. It needs
-  no `lldb-dap` and runs anywhere. Note it does **not** exercise the live runtime path: the
-  integration scenarios are behind the `integration` feature and compile as *zero tests*
-  under the default workspace test command, so a green `make all` does not prove launch /
-  debugging against real lldb-dap.
-- **`make integration` — the live lldb-dap gate.** Builds `debug-mcp`, then runs the ported
-  integration scenarios + the golden cross-check + the differential lane against real
-  lldb-dap. This is the gate that proves the actual product path.
+  `#[allow]` — warnings are fixed at the source), unit tests, the `seam` check, and the
+  `unsafe-gate` (asserts `unsafe` appears only under `crates/dbgeng-sys/`). It needs no
+  debugger and runs anywhere. Note it does **not** exercise the live runtime path: the
+  integration scenarios are behind feature flags and compile as *zero tests* under the
+  default workspace test command, so a green `make all` does not prove live debugging.
+- **`make integration` — the live lldb-dap gate (macOS/Linux).** Builds `debug-mcp`, then runs
+  the ported integration scenarios + the golden cross-check + the differential lane against
+  real lldb-dap.
+- **`make integration-windbg` — the live WinDbg gate (Windows).** Builds `debug-mcp`, then runs
+  the WinDbg integration suite (Normal / Attach / Pause / Crash / Dump / Error / shape groups)
+  against real DbgEng + the `testdata/win/test_target.exe` fixture.
+- **`make ready` — the pre-ship gate.** The full test suite plus the supply-chain gates:
+  `make audit` (cargo-audit — RustSec advisory/CVE scan) and `make deny` (cargo-deny — the
+  license allow-list, banned/duplicate crates, and source policy in `deny.toml`).
 
 ```bash
-# Hermetic gate: format, build, lint, unit tests, seam.
+# Hermetic gate: format, build, lint, unit tests, seam, unsafe-gate.
 make all
 # or individually:
-make fmt-check build clippy test seam
+make fmt-check build clippy test seam unsafe-gate
 
 # Unit tests only (hermetic; integration scenarios compile as zero tests here).
 cargo test --workspace
 
-# Live integration + differential-parity suite (Phase 6).
+# Live integration — macOS/Linux (lldb-dap) + differential-parity suite.
 # Requires lldb-dap + the compiled C fixtures. Each test SKIPS cleanly (logs + passes)
 # when lldb-dap or a fixture is absent. Single-threaded (the suites share lldb-dap and
 # the crash scenarios kill subprocesses by pid).
 make -C testdata                 # build the C fixtures once
 make integration
 
-# ThreadSanitizer over the dap-client concurrency tests (nightly + rust-src).
+# Live integration — Windows (WinDbg / DbgEng).
+# Build the fixture once from a VS x64 Native Tools prompt: testdata\win\build.bat
+make integration-windbg
+
+# Supply-chain gates (cargo-audit + cargo-deny).
+cargo install cargo-audit cargo-deny   # once
+make audit deny                        # or: make ready  (= test + audit + deny)
+
+# ThreadSanitizer over the dap-client concurrency tests (nightly + rust-src; Linux/macOS).
 make tsan
+```
+
+The release profile is fully optimized for shippable binaries — `opt-level = 3`, fat LTO,
+`codegen-units = 1`, and stripped symbols (`panic` stays `unwind`, which the WinDbg engine
+thread's `catch_unwind` teardown relies on):
+
+```bash
+cargo build --release -p debug-mcp   # the published binary: debug-mcp
 ```
 
 The differential-parity harness (`mcp-tools/tests/integration_differential.rs`) replays
