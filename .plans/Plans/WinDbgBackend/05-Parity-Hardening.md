@@ -30,12 +30,12 @@ tasks:
     depends_on: ["5.2"]
   - id: "5.4"
     title: "Port C++ Error group + differential parity Windows lane"
-    status: in-progress
+    status: complete
     verification: "The ported `test_suite.py` Error group passes (wrong-state rejections, bad/missing arguments, double launch, invalid breakpoint locations) with parity-exact guard strings; the differential harness runs the same neutral tool sequence against the windbg backend and, for shared behaviors (`backtrace`/`variables`/`threads`/`read_memory`), compares response JSON field-by-field against the lldb backend, catching neutral-surface drift."
     depends_on: ["5.3"]
   - id: "5.5"
     title: "CI Windows lane + finalize docs / structural gates"
-    status: pending
+    status: in-progress
     verification: "CI builds the full workspace and runs `integration-windbg` on a Windows runner (or a documented self-hosted/manual gate per R7), with the `unsafe`-confinement grep gate, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --check`, and ThreadSanitizer over the engine thread; **Miri is explicitly excluded for `dbgeng-sys`** (COM FFI is not Miri-compatible — noted in CLAUDE.md) while it continues to run green over the neutral crates; the existing Linux/macOS lane is unchanged and green; CLAUDE.md's parity-notes list and architecture/crate table are finalized (the unsafe deviation, the `backend` arg, the four new tools, the get_all_stacks/address-BP deviations)."
     depends_on: ["5.4"]
 ---
