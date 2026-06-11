@@ -142,15 +142,19 @@ async fn golden_response_shapes_over_stdio() {
                 cont.get("reason")
             );
 
-            // backtrace shape: frames[] with index/name/id, total_frames, thread_id.
+            // backtrace shape: frames[] with index/name/id, total_frames, thread_id. Typed
+            // assertions (matching the windbg shape lane) so a type regression is caught:
+            // total_frames/thread_id and per-frame index/id are integers, name is a string.
             let bt = require_json(&mcp_call(&mut mcp, "backtrace", json!({})));
             let frames = bt["frames"].as_array().expect("frames");
             assert!(!frames.is_empty());
-            assert!(bt.get("total_frames").is_some());
-            assert!(bt.get("thread_id").is_some());
+            assert!(bt.get("total_frames").and_then(Value::as_i64).is_some());
+            assert!(bt.get("thread_id").and_then(Value::as_i64).is_some());
             let f0 = &frames[0];
             assert!(
-                f0.get("index").is_some() && f0.get("name").is_some() && f0.get("id").is_some()
+                f0.get("index").and_then(Value::as_i64).is_some()
+                    && f0.get("name").and_then(Value::as_str).is_some()
+                    && f0.get("id").and_then(Value::as_i64).is_some()
             );
 
             // variables shape: variables[]/count/scope/truncated, with i and sum present.

@@ -995,3 +995,523 @@ async fn dump_generate_open_analyze_and_reject_execution() {
     assert_eq!(disc["status"], json!("disconnected"));
     assert_eq!(h.state(), State::Idle);
 }
+
+// --- ERROR group (live: port of C++ test_suite.py `test_errors`) ------------------------
+
+/// Port of the C++ plugin's `test_errors` (test/test_suite.py) onto the Rust tool surface +
+/// the EXACT Rust parity-frozen guard/validation strings (CLAUDE.md: "the guard strings are
+/// parity-exact"). The C++ oracle only asserts "this call fails"; the Rust port asserts the
+/// SPECIFIC error string each tool produces, so a guard-string regression is caught here
+/// rather than masked behind a bare `is_error`.
+///
+/// Five independent scenarios (each step is order-independent — the LIVE mutex serializes
+/// them, and a launched session is always disconnected before the next):
+///
+/// 1. **Wrong-state (no target / idle).** On a FRESH idle harness, the stopped-guarded
+///    inspection/execution tools (`backtrace`/`step_over`/`continue`/`threads`/`variables`/
+///    `get_locals`-analog) are rejected with the idle state-guard literal
+///    `"no debug session active. Use 'launch' or 'attach' first."` (`check_state` Idle arm,
+///    `mcp-session/src/manager.rs`). `pause` guards `Running`; from idle the SAME idle literal
+///    fires (the guard's Idle arm precedes the Running arm).
+/// 2. **Double launch.** After a successful `launch normal` (Stopped), a second `launch`
+///    without disconnecting hits the launch idle-guard. The current state is `stopped`, so the
+///    guard's fallthrough arm fires: `"invalid state: stopped, expected one of: idle"`.
+/// 3. **Invalid breakpoint location.** `set_function_breakpoint("nonexistent_xyz_func")` on a
+///    stopped session is NOT a tool error — both lldb and WinDbg model an unresolvable symbol
+///    as an UNVERIFIED (pending) breakpoint result (`verified:false`), distinct from the R6
+///    ASLR bare-address `rejected` path (which IS a tool error). This asserts the neutral-
+///    surface parity: an unresolvable symbol → a tracked, unverified breakpoint, not a hard
+///    error. (The C++ oracle expected a generic failure; the Rust/lldb parity model surfaces
+///    it as unverified — the documented deviation we assert rather than mask.)
+/// 4. **remove_breakpoint(99999).** A nonexistent breakpoint id is a TOOL ERROR — the handler
+///    looks up `breakpoint_info(id)`, finds nothing, and returns
+///    `"failed to remove breakpoint: breakpoint ID 99999 not found"` (`handle_remove_breakpoint`,
+///    `breakpoints.rs`). This matches the C++ `err_bad_bp_remove` (expects an error).
+/// 5. **Bad/missing required args.** `set_function_breakpoint` with no `name`, `read_memory`
+///    with no `address`, and `launch` with no `program` each surface the `Args::require_string`
+///    parity literal `missing required parameter: required argument "<key>" not found`.
+#[tokio::test]
+async fn error_group_wrong_state_bad_args_double_launch_invalid_bp() {
+    if should_skip_windbg("error_group_wrong_state_bad_args_double_launch_invalid_bp") {
+        return;
+    }
+    let _guard = live_guard().await;
+
+    // The parity-frozen guard/validation literals asserted below (read from
+    // `mcp-session/src/manager.rs` `check_state` + `mcp-tools/src/args.rs`/`breakpoints.rs`).
+    const IDLE_GUARD: &str = "no debug session active. Use 'launch' or 'attach' first.";
+    const DOUBLE_LAUNCH_GUARD: &str = "invalid state: stopped, expected one of: idle";
+
+    // --- 1. Wrong-state (no target / idle): every stopped-guarded tool returns the idle
+    // state-guard literal on a fresh, never-launched harness. ---
+    {
+        let h = Harness::new_windbg();
+        assert_eq!(h.state(), State::Idle);
+
+        // Each stopped-guarded inspection/execution tool → the idle state-guard literal.
+        // `variables` IS the Rust `get_locals` analog (the C++ `get_locals` tool); there is no
+        // separate `get_locals` tool name in the Rust 21-tool surface.
+        for tool in [
+            "backtrace",
+            "step_over",
+            "step_into",
+            "step_out",
+            "continue",
+            "threads",
+            "variables",
+        ] {
+            let out = h.call_default(tool, empty()).await;
+            let msg = expect_error(&format!("{tool}(no target / idle)"), &out);
+            assert_eq!(
+                msg, IDLE_GUARD,
+                "{tool} from idle must return the idle state-guard literal, got {msg:?}"
+            );
+            assert_eq!(h.state(), State::Idle, "{tool} from idle leaves state idle");
+        }
+
+        // `pause` guards Running; from idle the guard's Idle arm (which precedes the Running
+        // arm) fires the SAME idle literal — not a "process is running" message.
+        let paused = h.call_default("pause", empty()).await;
+        let pause_msg = expect_error("pause(no target / idle)", &paused);
+        assert_eq!(
+            pause_msg, IDLE_GUARD,
+            "pause from idle must return the idle state-guard literal (Idle arm precedes \
+             Running arm), got {pause_msg:?}"
+        );
+    }
+
+    // --- 2. Double launch: a second launch on a stopped session hits the launch idle-guard,
+    // whose fallthrough arm reports the current state. ---
+    {
+        let h = Harness::new_windbg();
+        let launch = h.launch_windbg(&windbg_fixture_path(), "normal").await;
+        assert_eq!(launch["status"], json!("launched"));
+        assert_eq!(h.state(), State::Stopped);
+
+        // A second launch WITHOUT disconnecting: the idle-guard rejects it (current = stopped).
+        let args_json = serde_json::to_string(&vec!["normal"]).expect("serialize args array");
+        let relaunch = h
+            .call_default(
+                "launch",
+                obj(&[
+                    ("program", Value::String(fixture())),
+                    ("args", Value::String(args_json)),
+                ]),
+            )
+            .await;
+        let relaunch_msg = expect_error("launch(double)", &relaunch);
+        assert_eq!(
+            relaunch_msg, DOUBLE_LAUNCH_GUARD,
+            "a double launch must return the not-idle state-guard literal, got {relaunch_msg:?}"
+        );
+        // The first session is unharmed (still stopped).
+        assert_eq!(h.state(), State::Stopped);
+
+        h.disconnect_cleanup().await;
+    }
+
+    // --- 3. Invalid breakpoint location: an unresolvable symbol is UNVERIFIED (not an
+    // error) — the neutral-surface parity (lldb/WinDbg model a pending symbol the same way).
+    // The R6 `rejected` path (ASLR bare address) is the ONLY set_function_breakpoint tool
+    // error; an ordinary unresolvable symbol is a tracked, unverified result. ---
+    {
+        let h = Harness::new_windbg();
+        let _ = h.launch_windbg(&windbg_fixture_path(), "normal").await;
+
+        let bad_bp = h
+            .call_default(
+                "set_function_breakpoint",
+                obj(&[("name", Value::String("nonexistent_xyz_func".into()))]),
+            )
+            .await;
+        // ASSERTED BEHAVIOR: a JSON result with `verified:false` (a tool result, NOT a tool
+        // error). If this ever surfaces as a tool error instead, that is a real neutral-surface
+        // change and the test would fail here (we do not weaken to accept either).
+        let bad_bp = expect_json_obj("set_function_breakpoint(nonexistent)", &bad_bp);
+        assert_eq!(
+            bad_bp["verified"],
+            json!(false),
+            "an unresolvable symbol must be an UNVERIFIED breakpoint result (not a tool error), \
+             got {bad_bp:?}"
+        );
+        assert_eq!(
+            bad_bp.get("function").and_then(Value::as_str),
+            Some("nonexistent_xyz_func"),
+            "the unverified result echoes the requested function name, got {bad_bp:?}"
+        );
+
+        // --- 4. remove_breakpoint(99999): a nonexistent id is a TOOL ERROR with the exact
+        // "ID not found" literal (handle_remove_breakpoint). ---
+        let removed = h
+            .call_default(
+                "remove_breakpoint",
+                obj(&[("breakpoint_id", Value::from(99_999))]),
+            )
+            .await;
+        let removed_msg = expect_error("remove_breakpoint(99999)", &removed);
+        assert_eq!(
+            removed_msg, "failed to remove breakpoint: breakpoint ID 99999 not found",
+            "removing a nonexistent breakpoint id must return the exact not-found literal, \
+             got {removed_msg:?}"
+        );
+
+        h.disconnect_cleanup().await;
+    }
+
+    // --- 5. Bad/missing required args: the `Args::require_string` parity literal for a couple
+    // of representative tools. These need no live target (the arg validation precedes the
+    // backend), but `launch`'s missing-program check follows its idle guard, so it runs on a
+    // fresh idle harness. ---
+    {
+        let h = Harness::new_windbg();
+
+        // set_function_breakpoint with no `name` (idle is allowed by the [Idle, Stopped] guard,
+        // so require_string fires and returns the missing-arg error).
+        let no_name = h.call_default("set_function_breakpoint", empty()).await;
+        let no_name_msg = expect_error("set_function_breakpoint(no name)", &no_name);
+        assert_eq!(
+            no_name_msg, "missing required parameter: required argument \"name\" not found",
+            "set_function_breakpoint without `name` must return the require_string literal, \
+             got {no_name_msg:?}"
+        );
+
+        // read_memory with no `address`: guarded `stopped`, so on a fresh idle harness it is the
+        // idle state guard that fires FIRST (the guard precedes arg validation). Assert that.
+        let no_addr_idle = h.call_default("read_memory", empty()).await;
+        let no_addr_idle_msg = expect_error("read_memory(no address, idle)", &no_addr_idle);
+        assert_eq!(
+            no_addr_idle_msg, IDLE_GUARD,
+            "read_memory from idle hits the stopped-guard before arg validation, got \
+             {no_addr_idle_msg:?}"
+        );
+
+        // launch with no `program`: the idle guard passes (state is idle), so require_string
+        // surfaces the missing-program literal.
+        let no_program = h.call_default("launch", empty()).await;
+        let no_program_msg = expect_error("launch(no program)", &no_program);
+        assert_eq!(
+            no_program_msg, "missing required parameter: required argument \"program\" not found",
+            "launch without `program` must return the require_string literal, got \
+             {no_program_msg:?}"
+        );
+        // launch's missing-program failure leaves the session idle (the connect never started).
+        assert_eq!(h.state(), State::Idle);
+    }
+
+    // read_memory's missing-`address` arg validation (on a STOPPED session, past the guard) is
+    // the require_string literal — assert it on a launched session so the arg path is reached.
+    {
+        let h = Harness::new_windbg();
+        let _ = h.launch_windbg(&windbg_fixture_path(), "normal").await;
+
+        let no_addr = h.call_default("read_memory", empty()).await;
+        let no_addr_msg = expect_error("read_memory(no address, stopped)", &no_addr);
+        assert_eq!(
+            no_addr_msg, "missing required parameter: required argument \"address\" not found",
+            "read_memory without `address` (past the stopped guard) must return the \
+             require_string literal, got {no_addr_msg:?}"
+        );
+
+        // read_memory WITH `address` but no `count` (on the same stopped session, past the
+        // guard): the handler validates `address` before `count` (memory.rs), so with address
+        // present the missing-`count` validation fires. This guards against `count` silently
+        // becoming optional — the require_int/require_positive_int missing-key literal is the
+        // same `missing required parameter: required argument "<key>" not found` shape.
+        let no_count = h
+            .call_default(
+                "read_memory",
+                obj(&[("address", Value::String("0x1234".into()))]),
+            )
+            .await;
+        let no_count_msg = expect_error("read_memory(address, no count, stopped)", &no_count);
+        assert_eq!(
+            no_count_msg, "missing required parameter: required argument \"count\" not found",
+            "read_memory with `address` but no `count` must return the missing-count \
+             require_int literal, got {no_count_msg:?}"
+        );
+
+        h.disconnect_cleanup().await;
+    }
+}
+
+// --- DIFFERENTIAL (golden shape) group ---------------------------------------------------
+
+/// Cross-backend neutral-surface conformance — the Windows analog of the lldb golden lane
+/// (`integration_differential.rs::golden_response_shapes_over_stdio`).
+///
+/// **Why not a true binary-vs-binary diff?** lldb (lldb-dap) is a macOS/Linux backend and
+/// WinDbg is a Windows backend; they are platform-exclusive and CANNOT co-run on one host, so
+/// a live cross-backend differential run is impossible. Instead this asserts that the WinDbg
+/// backend's responses for the SHARED neutral behaviors conform to the SAME neutral JSON field
+/// shapes the lldb golden lane documents — the keys + JSON types that the neutral
+/// `debugger-core` types (`Frame`/`Variable`→`FlatVariable`/`ThreadInfo`/`MemoryRead`) and the
+/// handler response builders serialize to. This catches neutral-surface drift (a WinDbg
+/// response missing/renaming a field the neutral contract requires) without needing lldb live.
+///
+/// **Approach taken: neutral-type-key conformance.** We assert each shared-behavior response
+/// carries the exact top-level + per-element key set (with the correct JSON types) that the
+/// lldb golden test asserts and the neutral serde types produce — NOT the same values
+/// (addresses/ids differ run-to-run and between backends; the SHAPE is the contract). The
+/// per-key references below cite the lldb golden assertions (`golden_response_shapes_over_stdio`)
+/// and the neutral serde definitions so the two lanes stay in lockstep.
+#[tokio::test]
+async fn differential_windbg_shared_behavior_shapes() {
+    if should_skip_windbg("differential_windbg_shared_behavior_shapes") {
+        return;
+    }
+    let _guard = live_guard().await;
+
+    let h = Harness::new_windbg();
+    let _ = h.launch_windbg(&windbg_fixture_path(), "normal").await;
+
+    // Reuse the `normal_session_breakpoint_workflow` setup: set a `compute` function bp, then
+    // continue to it so there is a real stopped frame with locals (sum/i/n).
+    let _ = h
+        .call_default(
+            "set_function_breakpoint",
+            obj(&[("name", Value::String("compute".into()))]),
+        )
+        .await;
+    let cont = h.continue_().await;
+    assert_eq!(
+        cont["status"],
+        json!("stopped"),
+        "continue must stop at the compute breakpoint, got {cont:?}"
+    );
+    assert_eq!(h.state(), State::Stopped);
+
+    // --- backtrace: `{frames:[...], total_frames, thread_id}`; each frame `{index, id, name,
+    // [file, line], [address]}`. The lldb golden lane asserts top-level total_frames/thread_id
+    // and per-frame index/name/id (the always-present neutral `Frame` keys). file/line/address
+    // are conditionally present (omitted when the source/IP is empty), so we assert their TYPE
+    // only when present, and require compute+main by name. ---
+    {
+        let bt = h.call_default("backtrace", empty()).await;
+        let bt = expect_json_obj("backtrace(shape)", &bt);
+
+        // Top-level neutral keys + types (golden: total_frames/thread_id present; here typed).
+        assert!(
+            bt.get("total_frames").and_then(Value::as_i64).is_some(),
+            "backtrace.total_frames must be an integer, got {:?}",
+            bt.get("total_frames")
+        );
+        assert!(
+            bt.get("thread_id").and_then(Value::as_i64).is_some(),
+            "backtrace.thread_id must be an integer, got {:?}",
+            bt.get("thread_id")
+        );
+        let frames = bt["frames"].as_array().expect("backtrace.frames array");
+        assert!(!frames.is_empty(), "backtrace.frames must be non-empty");
+
+        for (i, frame) in frames.iter().enumerate() {
+            let f = frame
+                .as_object()
+                .unwrap_or_else(|| panic!("frame[{i}] must be an object, got {frame:?}"));
+            // Always-present neutral Frame keys (golden asserts index/name/id present).
+            assert!(
+                f.get("index").and_then(Value::as_i64).is_some(),
+                "frame[{i}].index must be an integer, got {f:?}"
+            );
+            assert!(
+                f.get("id").and_then(Value::as_i64).is_some(),
+                "frame[{i}].id must be an integer, got {f:?}"
+            );
+            assert!(
+                f.get("name").and_then(Value::as_str).is_some(),
+                "frame[{i}].name must be a string, got {f:?}"
+            );
+            // Conditional keys: when present they carry the neutral type (file→string,
+            // line→integer, address→string). Absence is allowed (omitted when empty).
+            if let Some(file) = f.get("file") {
+                assert!(
+                    file.is_string(),
+                    "frame[{i}].file must be a string, got {file:?}"
+                );
+                assert!(
+                    f.get("line").and_then(Value::as_i64).is_some(),
+                    "frame[{i}] with a file must carry an integer line, got {f:?}"
+                );
+            }
+            if let Some(addr) = f.get("address") {
+                assert!(
+                    addr.is_string(),
+                    "frame[{i}].address must be a string, got {addr:?}"
+                );
+            }
+        }
+
+        // The shared-behavior content guarantee: compute + main are on the stack by name.
+        let frame_names = names(frames);
+        assert!(
+            frame_names.iter().any(|n| n.contains("compute")),
+            "backtrace must contain compute, got {frame_names:?}"
+        );
+        assert!(
+            frame_names.iter().any(|n| n.contains("main")),
+            "backtrace must contain main, got {frame_names:?}"
+        );
+    }
+
+    // --- variables: `{variables:[...], count, scope, truncated}`; each entry is the neutral
+    // `FlatVariable` shape — `name`/`value` always (strings), `type` when non-empty (string),
+    // `has_children` when true (bool), `children_count` when non-zero (integer). The lldb
+    // golden lane asserts count/scope=="local"/truncated present + per-entry `name`. ---
+    {
+        let vars = h.call_default("variables", empty()).await;
+        let vars = expect_json_obj("variables(shape)", &vars);
+
+        // Top-level neutral keys + types (golden: count/scope/truncated present).
+        assert!(
+            vars.get("count").and_then(Value::as_i64).is_some(),
+            "variables.count must be an integer, got {:?}",
+            vars.get("count")
+        );
+        assert_eq!(
+            vars["scope"],
+            json!("local"),
+            "variables.scope defaults to local, got {:?}",
+            vars.get("scope")
+        );
+        assert!(
+            vars.get("truncated").and_then(Value::as_bool).is_some(),
+            "variables.truncated must be a bool, got {:?}",
+            vars.get("truncated")
+        );
+
+        let entries = vars["variables"].as_array().expect("variables array");
+        for (i, v) in entries.iter().enumerate() {
+            let o = v
+                .as_object()
+                .unwrap_or_else(|| panic!("variable[{i}] must be an object, got {v:?}"));
+            // Always-present FlatVariable keys.
+            assert!(
+                o.get("name").and_then(Value::as_str).is_some(),
+                "variable[{i}].name must be a string, got {o:?}"
+            );
+            assert!(
+                o.get("value").and_then(Value::as_str).is_some(),
+                "variable[{i}].value must be a string, got {o:?}"
+            );
+            // Conditional FlatVariable keys carry their neutral type when present.
+            if let Some(ty) = o.get("type") {
+                assert!(
+                    ty.is_string(),
+                    "variable[{i}].type must be a string, got {ty:?}"
+                );
+            }
+            if let Some(hc) = o.get("has_children") {
+                assert!(
+                    hc.is_boolean(),
+                    "variable[{i}].has_children must be a bool, got {hc:?}"
+                );
+            }
+            if let Some(cc) = o.get("children_count") {
+                assert!(
+                    cc.as_i64().is_some(),
+                    "variable[{i}].children_count must be an integer, got {cc:?}"
+                );
+            }
+        }
+
+        // The shared-behavior content guarantee: compute's local `n` is present (matches
+        // `normal_session_breakpoint_workflow`).
+        let var_names = names(entries);
+        assert!(
+            var_names.contains(&"n"),
+            "variables must include compute's local `n`, got {var_names:?}"
+        );
+    }
+
+    // --- threads: `{threads:[...], count}`; each thread is the neutral `ThreadInfo` shape —
+    // `{id, name}` (the marker keys `is_stopped`/`is_current` are additive and present only on
+    // the stopped thread). The lldb golden lane drives threads via the normal session; here we
+    // assert the neutral ThreadInfo key/type contract. ---
+    {
+        let threads = h.call_default("threads", empty()).await;
+        let threads = expect_json_obj("threads(shape)", &threads);
+
+        assert!(
+            threads.get("count").and_then(Value::as_i64).is_some(),
+            "threads.count must be an integer, got {:?}",
+            threads.get("count")
+        );
+        let entries = threads["threads"].as_array().expect("threads array");
+        assert!(
+            !entries.is_empty(),
+            "threads must report at least one thread"
+        );
+        for (i, t) in entries.iter().enumerate() {
+            let o = t
+                .as_object()
+                .unwrap_or_else(|| panic!("thread[{i}] must be an object, got {t:?}"));
+            // Neutral ThreadInfo keys.
+            assert!(
+                o.get("id").and_then(Value::as_i64).is_some(),
+                "thread[{i}].id must be an integer, got {o:?}"
+            );
+            assert!(
+                o.get("name").and_then(Value::as_str).is_some(),
+                "thread[{i}].name must be a string, got {o:?}"
+            );
+            // Additive stopped-thread markers carry bool type when present.
+            for marker in ["is_stopped", "is_current"] {
+                if let Some(m) = o.get(marker) {
+                    assert!(
+                        m.is_boolean(),
+                        "thread[{i}].{marker} must be a bool, got {m:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- read_memory: `{address, bytes_read, [hex_dump]}` — the neutral `MemoryRead`-derived
+    // handler shape. `address` (string, the backend's echoed address) and `bytes_read`
+    // (integer) are always present; `hex_dump` (string) is present whenever bytes were read
+    // (omitted only on an empty read). Read at a valid frame IP so bytes_read > 0 and the
+    // hex_dump key is present, then assert the key/type contract. ---
+    {
+        // Resolve a valid address from the top frame's instruction pointer.
+        let bt = h.call_default("backtrace", empty()).await;
+        let bt = expect_json_obj("backtrace(for read_memory)", &bt);
+        let frames = bt["frames"].as_array().expect("frames");
+        let ip = frames
+            .iter()
+            .find_map(|f| f.get("address").and_then(Value::as_str))
+            .expect("a frame with an instruction-pointer address for read_memory");
+
+        let mem = h
+            .call_default(
+                "read_memory",
+                obj(&[
+                    ("address", Value::String(ip.to_string())),
+                    ("count", Value::from(16)),
+                ]),
+            )
+            .await;
+        let mem = expect_json_obj("read_memory(shape)", &mem);
+
+        // Neutral MemoryRead-derived keys + types.
+        assert!(
+            mem.get("address").and_then(Value::as_str).is_some(),
+            "read_memory.address must be a string, got {:?}",
+            mem.get("address")
+        );
+        let bytes_read = mem
+            .get("bytes_read")
+            .and_then(Value::as_i64)
+            .expect("read_memory.bytes_read must be an integer");
+        assert!(
+            bytes_read > 0,
+            "reading 16 bytes at a valid IP must read > 0 bytes, got {bytes_read}"
+        );
+        // hex_dump is present (string) whenever bytes were read.
+        assert!(
+            mem.get("hex_dump").and_then(Value::as_str).is_some(),
+            "read_memory with bytes_read > 0 must carry a string hex_dump, got {:?}",
+            mem.get("hex_dump")
+        );
+    }
+
+    h.disconnect_cleanup().await;
+}
