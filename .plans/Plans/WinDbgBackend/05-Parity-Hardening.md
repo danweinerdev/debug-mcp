@@ -25,12 +25,12 @@ tasks:
     depends_on: ["5.1"]
   - id: "5.3"
     title: "Cancellation / interrupt + Break recovery + backend-aware error strings"
-    status: in-progress
+    status: complete
     verification: "A `continue` that times out returns 'still running' and a subsequent `pause` regains context via the C++ `Break()` recovery (R3); a cancelled `launch`/`attach` resets the session to idle and drops the backend; a rebuild-after-detach test is **re-run in the Phase-5 regression sweep** to confirm no module file lock is left (the task 2.3 criterion held end-to-end); windbg connect-error strings (`Debugging Tools for Windows not found` / `failed to initialize DbgEng`) surface for the windbg factory while lldb's strings are unchanged; `BackendError::Unsupported` maps to the exact `\"<tool> is not supported by the <backend> backend\"` text."
     depends_on: ["5.2"]
   - id: "5.4"
     title: "Port C++ Error group + differential parity Windows lane"
-    status: pending
+    status: in-progress
     verification: "The ported `test_suite.py` Error group passes (wrong-state rejections, bad/missing arguments, double launch, invalid breakpoint locations) with parity-exact guard strings; the differential harness runs the same neutral tool sequence against the windbg backend and, for shared behaviors (`backtrace`/`variables`/`threads`/`read_memory`), compares response JSON field-by-field against the lldb backend, catching neutral-surface drift."
     depends_on: ["5.3"]
   - id: "5.5"
