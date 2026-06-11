@@ -46,3 +46,14 @@ windbg-backend = { path = "crates/windbg-backend" }
 dbgeng-sys = { path = "crates/dbgeng-sys" }
 mcp-session = { path = "crates/mcp-session" }
 mcp-tools = { path = "crates/mcp-tools" }
+
+# Shippable release profile: fully optimized, whole-program LTO. Applied from the workspace
+# root so `cargo build --release -p debug-mcp` (the published binary) picks it up.
+[profile.release]
+opt-level = 3        # maximum optimization
+lto = "fat"          # full cross-crate (whole-program) link-time optimization
+codegen-units = 1    # one codegen unit = best optimization (no parallel-codegen splitting)
+strip = "symbols"    # strip symbols + debuginfo for a smaller shipped binary
+# panic stays the default "unwind" — NOT "abort": the windbg-backend engine thread relies on
+# `std::panic::catch_unwind` to turn an engine-thread panic into a `BackendEvent::Terminated`
+# (the R2 / task-3.1 design); `panic = "abort"` would defeat that (and break `cargo test`).

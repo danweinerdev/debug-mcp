@@ -4,7 +4,7 @@
 MANIFEST := $(CURDIR)/Cargo.toml
 CARGO := cargo
 
-.PHONY: all build clippy fmt fmt-check test integration integration-windbg tsan check seam unsafe-gate
+.PHONY: all build clippy fmt fmt-check test integration integration-windbg tsan check seam unsafe-gate audit deny ready
 
 # The full gate, in the order the phase verification runs it.
 all: fmt-check build clippy test seam unsafe-gate
@@ -78,3 +78,23 @@ unsafe-gate:
 		| grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|//!|/\*|\*)' \
 		|| (echo "UNSAFE-GATE VIOLATION: 'unsafe' found outside crates/dbgeng-sys/" && exit 1)
 	@echo "unsafe-gate ok"
+
+# Security-advisory / CVE scan of the locked dependency tree against the RustSec advisory
+# database (cargo-audit). The authoritative vulnerability scanner for the `ready` gate.
+# Install once with `cargo install cargo-audit`.
+audit:
+	$(CARGO) audit --file $(CURDIR)/Cargo.lock
+
+# Dependency-policy gate (cargo-deny): the license allow-list (deny.toml), banned/duplicate
+# crates, and source registries. Security advisories are owned by the `audit` target above
+# (cargo-audit is the authoritative scanner and needs no git/network reachability that
+# cargo-deny's advisory-DB fetch requires), so this runs the offline policy checks only — they
+# enforce reliably in any environment. Run `make audit deny` (or `make ready`) for full
+# supply-chain coverage. Install once with `cargo install cargo-deny`.
+deny:
+	$(CARGO) deny --manifest-path $(MANIFEST) check bans licenses sources
+
+# Pre-ship readiness gate: the full test suite plus the supply-chain gates (audit + deny).
+# Run before cutting a release or shipping a binary. (For the lint/format/seam/unsafe gates,
+# run `make all`; `make ready` focuses on tests + dependency health.)
+ready: test audit deny
