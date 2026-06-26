@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "debug-mcp",
+  "owner": {
+    "name": "Daniel Weiner"
+  },
+  "metadata": {
+    "description": "Plugins shipped with the debug-mcp repository."
+  },
+  "plugins": [
+    {
+      "name": "debug-mcp",
+      "source": "./plugin",
+      "description": "Steers Claude Code toward the debug MCP server for interactive native debugging: a hook that nudges away from print-debugging toward live breakpoints/inspection, plus scenario skills for the debug tool surface (launch/attach, breakpoints, stepping, stack/variable inspection, expression evaluation, memory/disassembly, raw LLDB)."
+    }
+  ]
+}

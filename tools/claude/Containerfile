@@ -1,0 +1,245 @@
+# Containerfile — Fedora-based Rust dev container for debug-mcp with Claude Code.
+#
+# Build context is the REPO ROOT (not this directory): the builder stage compiles
+# the debug-mcp MCP server straight from the checked-out workspace, so the
+# baked-in server always matches the tree you launch from. The sidecar config
+# files COPYed below are addressed by their repo-relative path (tools/claude/*).
+# claude-container.sh sets the context to the repo root for exactly this reason.
+#
+# Two-stage build:
+#   builder - everything that needs a Rust compiler: the debug-mcp server, built
+#             from the local workspace source. All build artifacts stay in this
+#             throwaway stage.
+#   final   - the actual dev image; it COPYs only the resulting binary out of the
+#             builder, so none of the build outputs land in the shipped layers.
+#
+# Toolchain layout (final image):
+#   /opt/rust/rustup  - RUSTUP_HOME, baked into the image (toolchain bits)
+#   /opt/rust/cargo   - rustup-installed proxies (cargo/rustc/rustup), in PATH
+#   /opt/mcp/bin      - the baked-in debug-mcp server binary, on PATH
+#   /cache/cargo      - CARGO_HOME at runtime (registry, git, installed bins)  <- volume
+#   /cache/target     - CARGO_TARGET_DIR at runtime (build outputs)             <- volume
+#
+# The /cache/* paths are populated by ./claude-container.sh from ./.cache on
+# the host, so cargo state and build outputs survive across container runs.
+
+# ---------------------------------------------------------------------------
+# Stage 1: builder — compile the debug-mcp server from the local workspace.
+# ---------------------------------------------------------------------------
+FROM docker.io/library/fedora:44 AS builder
+
+# Enough to compile the workspace: a C/C++ toolchain (some transitive crates
+# build native bits through the `cc` crate, which shells out to a host C
+# compiler), plus git/curl/ca-certificates for the rustup-init download.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        ca-certificates curl git \
+        gcc gcc-c++ make cmake pkgconf-pkg-config \
+        openssl-devel zlib-devel \
+        rustup \
+    && dnf clean all
+
+# The workspace pins rust-version 1.90 in Cargo.toml; install the stable channel
+# up front (with rustfmt + clippy) so the release build doesn't trigger a
+# surprise toolchain download.
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    PATH=/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN set -eux; \
+    mkdir -p /opt/rust/rustup /opt/rust/cargo; \
+    rustup-init -y --no-modify-path \
+        --default-toolchain 1.90.0 --profile minimal \
+        --component rustfmt --component clippy
+
+# Build the debug-mcp server from the local workspace. The build context is the
+# repo root (see header); .containerignore keeps target/, .git, the local caches,
+# and the compiled testdata fixtures out so this COPY stays lean. The fixtures
+# are C test binaries built on demand by `make -C testdata`, not build inputs, so
+# their absence does not affect the release build.
+COPY . /tmp/debug-mcp
+RUN set -eux; \
+    cd /tmp/debug-mcp; \
+    cargo build --release -p debug-mcp; \
+    install -Dm755 target/release/debug-mcp /opt/build/bin/debug-mcp
+
+# ---------------------------------------------------------------------------
+# Stage 2: final — the dev image.
+# ---------------------------------------------------------------------------
+FROM docker.io/library/fedora:44
+
+ARG USER_UID=1000
+ARG USER_GID=1000
+ARG USERNAME=dev
+
+# System packages: build deps, debuggers, the sanitizer runtimes, common dev
+# utilities, rustup (provides rustup-init), shadow-utils for user creation.
+# Claude Code is a native standalone binary installed per-user below, so no
+# Node.js/npm is needed; curl + jq cover its download + checksum step.
+#
+# lldb is the load-bearing runtime dependency: the Fedora `lldb` package ships
+# `lldb-dap`, the Debug Adapter Protocol server that debug-mcp's lldb backend
+# detects on PATH and drives. clang/lld/llvm + libtsan back `make tsan` (the
+# nightly -Zbuild-std ThreadSanitizer run over dap-client), and
+# gdb/valgrind/strace round out the debugging kit. gcc/gcc-c++/make build the
+# C fixtures under testdata/ on demand (`make -C testdata`) for the live
+# integration suite.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        ca-certificates curl wget git gnupg2 \
+        gcc gcc-c++ make cmake pkgconf-pkg-config \
+        gdb lldb valgrind strace ltrace perf \
+        clang lld llvm libasan libasan-static libtsan libtsan-static \
+        python3 python3-pip \
+        less vim nano ripgrep fd-find jq \
+        openssl-devel zlib-devel \
+        procps-ng file unzip xz tar diffutils \
+        shadow-utils \
+        rustup \
+    && dnf clean all
+
+# Create a dev user whose UID/GID match the host caller so bind-mounted files
+# keep correct ownership under --userns=keep-id. No sudo is installed or
+# configured: the container runs entirely as this unprivileged user, all
+# writable paths (/cache/*) are user-owned, and the baked toolchain at
+# /opt/rust is world-readable — `make test` needs no privilege escalation.
+RUN set -eux; \
+    if ! getent group "${USER_GID}" >/dev/null; then \
+        groupadd --gid "${USER_GID}" "${USERNAME}"; \
+    fi; \
+    useradd --uid "${USER_UID}" --gid "${USER_GID}" \
+        --create-home --shell /bin/bash "${USERNAME}"
+
+# Install the Rust toolchains into a fixed image path. CARGO_HOME is set only
+# for these build steps so rustup writes its proxies under /opt/rust/cargo; at
+# runtime CARGO_HOME is redirected to the bind-mounted volume below.
+#
+# Two toolchains are installed:
+#   stable (1.90.0) - default; drives the normal build/test/clippy/fmt flow
+#                     (`make build`/`test`/`clippy`/`fmt-check`) plus the live
+#                     integration suite (`make integration`). Installed with the
+#                     `minimal` profile plus only the components used here.
+#   nightly         - drives the ThreadSanitizer run (`make tsan` uses
+#                     `cargo +nightly` with `-Zbuild-std`). `rust-src` is
+#                     mandatory for `-Zbuild-std` (TSan ships no prebuilt std);
+#                     `llvm-tools-preview` provides the sanitizer/symbolization
+#                     tooling. Installed as bare `nightly` so `cargo +nightly`
+#                     resolves without a pinned date.
+ENV RUSTUP_HOME=/opt/rust/rustup
+RUN set -eux; \
+    mkdir -p /opt/rust/rustup /opt/rust/cargo; \
+    CARGO_HOME=/opt/rust/cargo rustup-init -y --no-modify-path \
+        --default-toolchain 1.90.0 --profile minimal \
+        --component rust-src \
+        --component clippy --component rustfmt --component llvm-tools-preview; \
+    CARGO_HOME=/opt/rust/cargo /opt/rust/cargo/bin/rustup toolchain install nightly \
+        --profile minimal \
+        --component rust-src --component llvm-tools-preview; \
+    chmod -R a+rX /opt/rust
+
+# The debug-mcp server, built in the `builder` stage from the local workspace
+# and copied into its own baked-in PATH dir. This is the project's `debug` MCP
+# server; it's wired for Claude Code via /etc/claude-code/managed-mcp.json below.
+RUN mkdir -p /opt/mcp/bin
+COPY --from=builder /opt/build/bin/debug-mcp /opt/mcp/bin/debug-mcp
+
+# Make every copied binary world-readable/executable for the unprivileged `dev`
+# user (the COPY'd file is root-owned; the baked toolchain is already a+rX).
+RUN chmod -R a+rX /opt/rust /opt/mcp
+
+# Runtime cache layout: registry, git, installed crate bins under /cache/cargo;
+# build outputs under /cache/target. PATH puts /cache/cargo/bin first so
+# user-installed cargo crates win over baked-in ones; /opt/mcp/bin carries the
+# baked-in MCP server binary.
+ENV CARGO_HOME=/cache/cargo \
+    CARGO_TARGET_DIR=/cache/target \
+    PATH=/cache/cargo/bin:/opt/rust/cargo/bin:/opt/mcp/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Claude Code — installed per-user as a native standalone binary (no Node.js
+# at runtime). This inlines the official install.sh flow rather than piping it
+# into a shell: it resolves a version, fetches that release's manifest, and
+# verifies the downloaded binary against the manifest's published SHA256 before
+# trusting it. Override the version at build time with
+# `--build-arg CLAUDE_CODE_VERSION=2.1.145` (or `stable`); the default tracks
+# the latest release.
+# Also pre-create ~/.ssh/ with 0700 so a bind-mounted config file at runtime
+# doesn't trigger podman to auto-create the parent as root (which would make
+# ssh reject the config with "Bad owner or permissions").
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+ARG CLAUDE_CODE_VERSION=latest
+RUN set -eux; \
+    base_url="https://downloads.claude.ai/claude-code-releases"; \
+    case "$(uname -m)" in \
+        x86_64|amd64) arch="x64" ;; \
+        aarch64|arm64) arch="arm64" ;; \
+        *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    platform="linux-${arch}"; \
+    case "${CLAUDE_CODE_VERSION}" in \
+        latest|stable) version="$(curl -fsSL "${base_url}/${CLAUDE_CODE_VERSION}")" ;; \
+        *)             version="${CLAUDE_CODE_VERSION}" ;; \
+    esac; \
+    case "${version}" in \
+        [0-9]*.[0-9]*.[0-9]*) ;; \
+        *) echo "Resolved an invalid Claude Code version: '${version}'" >&2; exit 1 ;; \
+    esac; \
+    checksum="$(curl -fsSL "${base_url}/${version}/manifest.json" \
+        | jq -r ".platforms[\"${platform}\"].checksum // empty")"; \
+    [ "${#checksum}" -eq 64 ] \
+        || { echo "No SHA256 for ${platform} in the ${version} manifest" >&2; exit 1; }; \
+    mkdir -p /home/${USERNAME}/.local/bin; \
+    curl -fsSL -o /home/${USERNAME}/.local/bin/claude \
+        "${base_url}/${version}/${platform}/claude"; \
+    echo "${checksum}  /home/${USERNAME}/.local/bin/claude" | sha256sum -c -; \
+    chmod 0755 /home/${USERNAME}/.local/bin/claude; \
+    /home/${USERNAME}/.local/bin/claude --version; \
+    mkdir -m 700 -p /home/${USERNAME}/.ssh
+ENV PATH=/home/${USERNAME}/.local/bin:/cache/cargo/bin:/opt/rust/cargo/bin:/opt/mcp/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# The debug-mcp Claude Code plugin, baked into the image at a fixed path rather
+# than loaded from the bind-mounted /src. Copying it in (instead of pointing at
+# /src) means the plugin is always present and version-locked to the image, even
+# if the repo isn't mounted or a different tree is checked out. The repo-root
+# relative layout is preserved so the marketplace manifest's per-plugin
+# `source: "./plugin"` still resolves for anyone who installs it interactively:
+#   /opt/debug-mcp-plugin/.claude-plugin/marketplace.json  (the marketplace)
+#   /opt/debug-mcp-plugin/plugin/                          (the plugin itself)
+#
+# How it's enabled: the launcher (and this image's CMD) pass
+# `--plugin-dir /opt/debug-mcp-plugin/plugin`, which LOADS the plugin's hooks and
+# skills for the session with no install step and no writes under the
+# bind-mounted host ~/.claude. (Managed-settings `enabledPlugins` /
+# `extraKnownMarketplaces` were tried first but only DECLARE intent — they do not
+# auto-install a directory-sourced plugin headlessly, so the cache stays empty
+# and nothing loads. `--plugin-dir` is the mechanism that actually activates it.)
+# The baked marketplace is kept so `claude plugin install debug-mcp@debug-mcp`
+# also works interactively.
+USER root
+COPY .claude-plugin /opt/debug-mcp-plugin/.claude-plugin
+COPY plugin /opt/debug-mcp-plugin/plugin
+RUN chmod -R a+rX /opt/debug-mcp-plugin \
+    && find /opt/debug-mcp-plugin/plugin/scripts -type f -name '*.sh' -exec chmod 0755 {} +
+
+# System-level Claude Code policy: a read-only Bash allowlist that runs without
+# per-command permission prompts. Edit tools/claude/managed-settings.json in the
+# repo and rebuild to change it. This system file is read before and takes
+# precedence over user/project settings and is NOT shadowed by the bind-mounted
+# host ~/.claude, so the host's own Claude is unaffected.
+COPY tools/claude/managed-settings.json /etc/claude-code/managed-settings.json
+RUN chmod 0644 /etc/claude-code/managed-settings.json
+
+# System-level MCP server registry: wires the baked-in debug-mcp server
+# (/opt/mcp/bin/debug-mcp) for the in-container Claude. Read from a system path,
+# so the bind-mounted host ~/.claude.json cannot shadow it, and auto-loaded
+# without an approval prompt. Note: managed-mcp.json is *exclusive* — when
+# present, Claude Code in this container loads ONLY these servers (the user
+# cannot add others in-container). That is the intent for this sandbox; the
+# host's Claude, which uses its own host-path config, is entirely unaffected.
+COPY tools/claude/managed-mcp.json /etc/claude-code/managed-mcp.json
+RUN chmod 0644 /etc/claude-code/managed-mcp.json
+USER ${USERNAME}
+
+WORKDIR /src
+# Default command activates the baked-in debug-mcp plugin (hooks + skills) via
+# --plugin-dir. The launcher (claude-container.sh) passes the same flag in its
+# DM_DEFAULT_CMD, so plain `./claude-container.sh` gets it too; this CMD covers a
+# bare `podman run <image>`.
+CMD ["claude", "--plugin-dir", "/opt/debug-mcp-plugin/plugin"]

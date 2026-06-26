@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "debug-mcp",
+  "version": "0.1.0",
+  "description": "Steers Claude Code toward the debug MCP server for interactive native debugging instead of print-debugging or one-shot CLI runs: a hook that nudges toward live breakpoints/inspection when a run or edit looks like it's chasing a crash or wrong value, plus scenario skills covering the debug tool surface (launch/attach, breakpoints, stepping, stack & variable inspection, expression evaluation, memory/disassembly, raw LLDB).",
+  "author": {
+    "name": "Daniel Weiner"
+  },
+  "keywords": [
+    "debug",
+    "mcp",
+    "lldb",
+    "lldb-dap",
+    "debugger",
+    "native-debugging",
+    "breakpoints"
+  ]
+}

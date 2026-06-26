@@ -1,2 +1,9 @@
 # Rust build output (CARGO_TARGET_DIR may relocate this elsewhere)
 /target
+
+# Host-side dev-container cache populated by claude-container.sh (CARGO_HOME +
+# CARGO_TARGET_DIR bind-mounted into the container at /cache/*).
+/.cache
+
+# Editor / IDE state.
+/.vscode

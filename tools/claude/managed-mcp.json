@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "debug": {
+      "type": "stdio",
+      "command": "/opt/mcp/bin/debug-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
