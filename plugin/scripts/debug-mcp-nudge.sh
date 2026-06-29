@@ -28,6 +28,41 @@ set -euo pipefail
 # Fail-open helper: emit nothing, let the tool proceed untouched.
 pass_through() { exit 0; }
 
+# Resolve the per-user, per-project state dir holding the nudge throttle stamps.
+#
+# Rooted at a user-level XDG state dir ($XDG_STATE_HOME, else ~/.local/state),
+# falling back to $TMPDIR/tmp when no usable HOME is set — so we NEVER write into
+# the project tree. Earlier versions rooted directly at $CLAUDE_PROJECT_DIR,
+# which littered the working tree with a `.debug-mcp-plugin/` dir (and, when the
+# project was a bind-mounted container workdir, leaked those files onto the
+# host). $CLAUDE_PROJECT_DIR is still honoured, but ONLY to namespace the state
+# per project (basename + a hash of the full path), preserving the original
+# per-project throttling without the pollution.
+#
+# Keep this function byte-identical to the copy in debug-mcp-session-reset.sh so
+# both hooks resolve the same directory.
+debug_mcp_state_dir() {
+  local base proj ns
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    base="${XDG_STATE_HOME}/debug-mcp-plugin"
+  elif [[ -n "${HOME:-}" ]]; then
+    base="${HOME}/.local/state/debug-mcp-plugin"
+  else
+    base="${TMPDIR:-/tmp}/debug-mcp-plugin"
+  fi
+  proj="${CLAUDE_PROJECT_DIR:-}"
+  if [[ -n "${proj}" ]]; then
+    # basename for readability + a cksum of the full path for collision safety.
+    local h
+    h="$(printf '%s' "${proj}" | cksum 2>/dev/null | cut -d' ' -f1)"
+    ns="$(basename "${proj}")-${h:-0}"
+  else
+    ns="no-project"
+  fi
+  # Sanitise the namespace to a safe single path component.
+  printf '%s/nudge/%s' "${base}" "${ns//[^A-Za-z0-9_.-]/_}"
+}
+
 # jq is required to parse the event and build valid JSON output. If it's
 # missing, silently pass through rather than risk malformed stdout.
 command -v jq >/dev/null 2>&1 || pass_through
@@ -91,8 +126,15 @@ fi
 
 # --- Throttle: one nudge per (session, kind) per cooldown window. -----------
 NUDGE_COOLDOWN_SECONDS="${DEBUG_MCP_NUDGE_COOLDOWN:-900}"
-state_root="${CLAUDE_PROJECT_DIR:-${TMPDIR:-/tmp}}"
-state_dir="${state_root}/.debug-mcp-plugin/nudge"
+# State dir for the throttle stamps. Rooted at a user-level XDG state dir,
+# namespaced PER PROJECT so distinct projects still throttle independently —
+# but never written INTO the project tree. (It used to root at
+# $CLAUDE_PROJECT_DIR directly, which dropped scratch files like
+# `.debug-mcp-plugin/` into the working tree; when the project is a
+# bind-mounted container workdir those even leaked onto the host.)
+# $CLAUDE_PROJECT_DIR is now used only to derive the namespace, not to write to.
+# Keep this block IDENTICAL to the one in debug-mcp-session-reset.sh.
+state_dir="$(debug_mcp_state_dir)"
 mkdir -p "${state_dir}" 2>/dev/null || state_dir="${TMPDIR:-/tmp}"
 stamp="${state_dir}/${session//[^A-Za-z0-9_-]/_}.${kind}"
 
