@@ -15,13 +15,13 @@
 use std::sync::Arc;
 
 use debugger_core::{AttachOutcome, BackendError, DumpOutcome};
-use mcp_session::{spawn_event_pump, State};
+use mcp_session::{State, spawn_event_pump};
 use tokio_util::sync::CancellationToken;
 
+use crate::Args;
 use crate::handlers::lifecycle::connect_error;
 use crate::response::{RespBuilder, ToolOutcome};
 use crate::server::ToolServer;
-use crate::Args;
 
 /// The hardcoded backend name the two crash/kernel connect-point tools force-select. These
 /// verbs are WinDbg-only, so they never honor a `backend` arg.

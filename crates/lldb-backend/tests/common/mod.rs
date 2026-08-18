@@ -9,10 +9,10 @@
 
 use std::sync::Arc;
 
-use dap_client::{write_message, Client, ReadLoop, Response, StoppedBody, StoppedEvent};
+use dap_client::{Client, ReadLoop, Response, StoppedBody, StoppedEvent, write_message};
 use lldb_backend::{LldbBackend, StderrBuffer};
 use serde_json::Value;
-use tokio::io::{duplex, BufReader, DuplexStream};
+use tokio::io::{BufReader, DuplexStream, duplex};
 
 /// The backend under test plus the scripted peer. The two are returned as separate
 /// values from [`Harness::new`] so a blocking method (`backend.launch(...)`) and the

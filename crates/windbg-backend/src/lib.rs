@@ -37,4 +37,4 @@ pub use backend::WinDbgBackend;
 pub use engine_ops::EngineOps;
 pub use error::EngineError;
 pub use factory::WinDbgFactory;
-pub use thread::{spawn_engine_thread, EngineCmd};
+pub use thread::{EngineCmd, spawn_engine_thread};

@@ -34,7 +34,7 @@ mod process;
 #[cfg(test)]
 mod tests;
 
-pub use callbacks::{exception_breaks, OutputKind, OutputSink};
+pub use callbacks::{OutputKind, OutputSink, exception_breaks};
 pub use com::ComApartment;
 pub use engine::{BpLoc, Engine, InterruptHandle, LaunchReq};
 pub use error::EngineError;

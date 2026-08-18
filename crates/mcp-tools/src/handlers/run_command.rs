@@ -7,10 +7,10 @@
 use debugger_core::EvalMode;
 use mcp_session::State;
 
+use crate::Args;
 use crate::errors;
 use crate::response::{RespBuilder, ToolOutcome};
 use crate::server::ToolServer;
-use crate::Args;
 
 impl ToolServer {
     /// `run_command` (Spec FR-14). Sends the command via `EvalMode::Repl`; discards the

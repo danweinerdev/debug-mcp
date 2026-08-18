@@ -417,7 +417,7 @@ fn live_dump_round_trip_open_analyze_modules_guard() {
             other => {
                 return Err(format!(
                     "ensure_runnable on a dump should be the frozen literal, got {other:?}"
-                ))
+                ));
             }
         }
         // `go` is likewise refused with the same literal (reaches ensure_runnable first).

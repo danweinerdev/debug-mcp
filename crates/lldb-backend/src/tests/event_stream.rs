@@ -3,10 +3,10 @@
 //! `Terminated{code}`. Needs the crate-internal `factory::build_event_stream`, so it
 //! lives here rather than in `tests/`.
 
-use dap_client::{write_message, Client, ReadLoop};
+use dap_client::{Client, ReadLoop, write_message};
 use debugger_core::BackendEvent;
 use futures::StreamExt;
-use tokio::io::{duplex, BufReader, DuplexStream};
+use tokio::io::{BufReader, DuplexStream, duplex};
 
 use crate::factory::build_event_stream;
 

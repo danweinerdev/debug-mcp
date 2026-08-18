@@ -2,9 +2,9 @@
 //! (`TestHandle*StateGuardRejects*`). Each disallowed state must yield an error outcome.
 
 use mcp_session::State;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::tests::handlers::support::{args, expect_error, token, Harness};
+use crate::tests::handlers::support::{Harness, args, expect_error, token};
 
 const ALL: [State; 5] = [
     State::Idle,

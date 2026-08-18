@@ -35,7 +35,7 @@ use tokio::io::AsyncWrite;
 use tokio::process::Child;
 use tokio::sync::Mutex;
 
-use crate::args::{attach_args_to_value, launch_args_to_value, LldbAttachArgs, LldbLaunchArgs};
+use crate::args::{LldbAttachArgs, LldbLaunchArgs, attach_args_to_value, launch_args_to_value};
 use crate::subprocess::StderrBuffer;
 use crate::{body, requests};
 

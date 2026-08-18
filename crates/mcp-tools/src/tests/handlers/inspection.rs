@@ -8,7 +8,7 @@ use mcp_session::State;
 use serde_json::json;
 
 use crate::tests::fake::Call;
-use crate::tests::handlers::support::{args, expect_error, expect_json, Harness};
+use crate::tests::handlers::support::{Harness, args, expect_error, expect_json};
 
 fn frame(
     index: i64,
@@ -194,10 +194,11 @@ async fn backtrace_formats_frames_and_stores_mapping() {
     assert_eq!(h.session.frame_mapping().get(&0), Some(&100));
     assert_eq!(h.session.frame_mapping().get(&1), Some(&101));
     // levels default 20.
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::StackTrace { levels: 20, .. })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::StackTrace { levels: 20, .. }))
+    );
 }
 
 #[tokio::test]
@@ -206,10 +207,11 @@ async fn backtrace_levels_override_only_when_positive() {
     h.state.lock().unwrap().stack_trace_result = Some(Ok((Vec::new(), 0)));
     let a = args(&[("levels", json!(5))]);
     let _ = h.server.handle_backtrace(&crate::Args::new(&a)).await;
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::StackTrace { levels: 5, .. })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::StackTrace { levels: 5, .. }))
+    );
 }
 
 #[tokio::test]
@@ -220,10 +222,11 @@ async fn backtrace_rejects_non_positive_explicit_thread_id() {
     let a = args(&[("thread_id", json!(0))]);
     let out = h.server.handle_backtrace(&crate::Args::new(&a)).await;
     assert_eq!(expect_error(&out), "'thread_id' must be a positive integer");
-    assert!(!h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::StackTrace { .. })));
+    assert!(
+        !h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::StackTrace { .. }))
+    );
 }
 
 // ---- threads ----
@@ -312,10 +315,11 @@ async fn variables_resolves_frame_scope_and_flattens() {
     assert_eq!(vars[0]["name"], json!("i"));
     assert_eq!(vars[1]["name"], json!("sum"));
     // scopes used frame id 100.
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::Scopes { frame_id: 100 })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::Scopes { frame_id: 100 }))
+    );
 }
 
 #[tokio::test]
@@ -363,10 +367,11 @@ async fn variables_implicit_frame_resolution_uses_levels_20() {
     h.state.lock().unwrap().variables_result = Some(Ok(Vec::new()));
     let empty = args(&[]);
     let _ = h.server.handle_variables(&crate::Args::new(&empty)).await;
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::StackTrace { levels: 20, .. })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::StackTrace { levels: 20, .. }))
+    );
 }
 
 #[tokio::test]

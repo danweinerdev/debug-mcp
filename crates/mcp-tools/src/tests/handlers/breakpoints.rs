@@ -6,7 +6,7 @@ use mcp_session::{BreakpointInfo, State};
 use serde_json::json;
 
 use crate::tests::fake::Call;
-use crate::tests::handlers::support::{args, expect_error, expect_json, Harness};
+use crate::tests::handlers::support::{Harness, args, expect_error, expect_json};
 
 #[tokio::test]
 async fn set_breakpoint_pending_mode() {
@@ -53,10 +53,11 @@ async fn set_breakpoint_rejects_non_positive_line() {
         let out = h.server.handle_set_breakpoint(&crate::Args::new(&a)).await;
         assert_eq!(expect_error(&out), "'line' must be a positive integer");
     }
-    assert!(!h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::SetSourceBreakpoints { .. })));
+    assert!(
+        !h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::SetSourceBreakpoints { .. }))
+    );
 }
 
 #[tokio::test]
@@ -104,10 +105,11 @@ async fn set_breakpoint_stopped_selects_exact_line_match() {
     assert_eq!(v["file"], json!("/loop.c"));
     assert_eq!(v["line"], json!(9));
     assert_eq!(v["message"], json!("pending"));
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::SetSourceBreakpoints { file, .. } if file == "/loop.c")));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::SetSourceBreakpoints { file, .. } if file == "/loop.c"))
+    );
 }
 
 #[tokio::test]
@@ -372,10 +374,11 @@ async fn remove_source_breakpoint_resends_remaining() {
     let v = expect_json(&out);
     assert_eq!(v["removed"], json!(true));
     assert_eq!(v["breakpoint_id"], json!(10));
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::SetSourceBreakpoints { file, .. } if file == "/f.c")));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::SetSourceBreakpoints { file, .. } if file == "/f.c"))
+    );
 }
 
 #[tokio::test]
@@ -397,10 +400,11 @@ async fn remove_function_breakpoint_resends_function_list() {
         .handle_remove_breakpoint(&crate::Args::new(&a))
         .await;
     assert!(!out.is_error());
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::SetFunctionBreakpoints { .. })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::SetFunctionBreakpoints { .. }))
+    );
 }
 
 #[tokio::test]

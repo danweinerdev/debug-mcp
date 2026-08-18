@@ -5,7 +5,7 @@ use mcp_session::State;
 use serde_json::json;
 
 use crate::tests::fake::Call;
-use crate::tests::handlers::support::{args, expect_error, expect_json, Harness};
+use crate::tests::handlers::support::{Harness, args, expect_error, expect_json};
 
 // ---- read_memory ----
 
@@ -36,10 +36,11 @@ async fn read_memory_rejects_non_positive_count() {
         assert_eq!(expect_error(&out), "'count' must be a positive integer");
     }
     // No ReadMemory call was made.
-    assert!(!h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::ReadMemory { .. })));
+    assert!(
+        !h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::ReadMemory { .. }))
+    );
 }
 
 #[tokio::test]
@@ -79,10 +80,11 @@ async fn read_memory_normalizes_address_and_formats_hex_dump() {
     assert!(dump.starts_with("0x00001000: 48 65 6c 6c 6f"));
     assert!(dump.contains("|Hello"));
     // The backend received the normalized 0x1000.
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::ReadMemory { address, .. } if address == "0x1000")));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::ReadMemory { address, .. } if address == "0x1000"))
+    );
 }
 
 #[tokio::test]
@@ -109,10 +111,11 @@ async fn disassemble_default_count_is_20() {
     let a = args(&[("address", json!("0xdead"))]);
     let _ = h.server.handle_disassemble(&crate::Args::new(&a)).await;
     // Spec OQ-1 — default is 20 (not Go's code value of 10).
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::Disassemble { count: 20, .. })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::Disassemble { count: 20, .. }))
+    );
 }
 
 #[tokio::test]
@@ -124,10 +127,11 @@ async fn disassemble_explicit_count_overrides() {
         ("instruction_count", json!(3)),
     ]);
     let _ = h.server.handle_disassemble(&crate::Args::new(&a)).await;
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::Disassemble { count: 3, .. })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::Disassemble { count: 3, .. }))
+    );
 }
 
 #[tokio::test]
@@ -181,10 +185,11 @@ async fn disassemble_current_pc_path_marks_is_current_pc() {
     assert!(insts[1].get("file").is_none());
     assert!(insts[1].get("is_current_pc").is_none());
     // stackTrace levels=1 for the current-PC path.
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::StackTrace { levels: 1, .. })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::StackTrace { levels: 1, .. }))
+    );
 }
 
 #[tokio::test]

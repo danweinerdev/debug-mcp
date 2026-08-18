@@ -15,7 +15,7 @@
 //! six interfaces in field order with no hand-written cleanup.
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,35 +26,36 @@ use debugger_core::{
     BreakpointResult, DumpOutcome, EvalResult, Frame, Instruction, MemoryRead, ModuleInfo,
     StepKind, StopInfo, StopOutcome, ThreadInfo, Variable,
 };
-use windows::core::{s, Interface, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
+    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME,
     SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
 };
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    DebugCreate, IDebugBreakpoint, IDebugClient5, IDebugControl, IDebugControl4, IDebugDataSpaces4,
-    IDebugEventCallbacks, IDebugOutputCallbacks, IDebugRegisters2, IDebugSymbols3,
-    IDebugSystemObjects4, DEBUG_ANY_ID, DEBUG_ATTACH_DEFAULT, DEBUG_ATTACH_KERNEL_CONNECTION,
-    DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED, DEBUG_CREATE_PROCESS_OPTIONS,
-    DEBUG_END_ACTIVE_DETACH, DEBUG_END_ACTIVE_TERMINATE, DEBUG_END_PASSIVE,
-    DEBUG_ENGOPT_INITIAL_BREAK, DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_DEFAULT,
-    DEBUG_EXECUTE_NOT_LOGGED, DEBUG_INTERRUPT_ACTIVE, DEBUG_LAST_EVENT_INFO_BREAKPOINT,
-    DEBUG_MODNAME_MODULE, DEBUG_MODULE_PARAMETERS, DEBUG_OUTCTL_IGNORE, DEBUG_OUTCTL_THIS_CLIENT,
+    DEBUG_ANY_ID, DEBUG_ATTACH_DEFAULT, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_BREAKPOINT_CODE,
+    DEBUG_BREAKPOINT_ENABLED, DEBUG_CREATE_PROCESS_OPTIONS, DEBUG_END_ACTIVE_DETACH,
+    DEBUG_END_ACTIVE_TERMINATE, DEBUG_END_PASSIVE, DEBUG_ENGOPT_INITIAL_BREAK,
+    DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_DEFAULT, DEBUG_EXECUTE_NOT_LOGGED,
+    DEBUG_INTERRUPT_ACTIVE, DEBUG_LAST_EVENT_INFO_BREAKPOINT, DEBUG_MODNAME_MODULE,
+    DEBUG_MODULE_PARAMETERS, DEBUG_OUTCTL_IGNORE, DEBUG_OUTCTL_THIS_CLIENT,
     DEBUG_SCOPE_GROUP_LOCALS, DEBUG_STACK_FRAME, DEBUG_STATUS_BREAK, DEBUG_STATUS_GO,
     DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_NO_DEBUGGEE,
     DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO, DEBUG_STATUS_STEP_OVER,
     DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
     DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_INT64,
+    DebugCreate, IDebugBreakpoint, IDebugClient5, IDebugControl, IDebugControl4, IDebugDataSpaces4,
+    IDebugEventCallbacks, IDebugOutputCallbacks, IDebugRegisters2, IDebugSymbols3,
+    IDebugSystemObjects4,
 };
 use windows::Win32::System::Diagnostics::Debug::SYMOPT_NO_IMAGE_SEARCH;
 use windows::Win32::System::Registry::{
-    RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY,
-    RRF_SUBKEY_WOW6464KEY,
+    HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY,
+    RRF_SUBKEY_WOW6464KEY, RegGetValueW,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW, DEBUG_ONLY_THIS_PROCESS, INFINITE,
+    CREATE_NO_WINDOW, DEBUG_ONLY_THIS_PROCESS, GetCurrentProcess, INFINITE, OpenProcessToken,
 };
+use windows::core::{Interface, PCSTR, PCWSTR, s};
 
 use crate::callbacks::{self, CallbackState, OutputSink};
 use crate::error::EngineError;
@@ -394,10 +395,10 @@ impl Engine {
             )
         };
         let output = self.take_output();
-        if let Err(e) = hr {
-            if output.is_empty() {
-                return Err(EngineError::op("Execute", e));
-            }
+        if let Err(e) = hr
+            && output.is_empty()
+        {
+            return Err(EngineError::op("Execute", e));
         }
         Ok(output)
     }
@@ -1079,7 +1080,7 @@ impl Engine {
             WaitResult::TimedOut => {
                 return Err(EngineError::engine(
                     "launch: timed out waiting for the initial breakpoint",
-                ))
+                ));
             }
         };
 
@@ -1378,7 +1379,7 @@ impl Engine {
             // event); the session is still a valid stopped dump — leave `stop` unset.
             WaitResult::Event(_) => None,
             WaitResult::TimedOut => {
-                return Err(EngineError::engine("open_dump: timed out loading dump"))
+                return Err(EngineError::engine("open_dump: timed out loading dump"));
             }
         };
 
@@ -2094,13 +2095,13 @@ pub(crate) fn discover_debuggers_root_with(
         }
     }
     // 2. WindowsSdkDir env var.
-    if let Some(sdk) = env_sdk_dir {
-        if !sdk.is_empty() {
-            push_unique(
-                PathBuf::from(sdk).join("Debuggers").join("x64"),
-                &mut candidates,
-            );
-        }
+    if let Some(sdk) = env_sdk_dir
+        && !sdk.is_empty()
+    {
+        push_unique(
+            PathBuf::from(sdk).join("Debuggers").join("x64"),
+            &mut candidates,
+        );
     }
     // 3. The former hardcoded default, as a last resort.
     push_unique(

@@ -8,7 +8,7 @@
 
 use dap_client::Request;
 use debugger_core::{FunctionBp, SourceBp};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The `initialize` request (Spec FR-4.4.8). `clientID` stays `"lldb-debug-mcp"` —
 /// below the seam, lldb-dap-facing (Spec FR-1.1).

@@ -34,6 +34,6 @@ pub use error::WireError;
 pub use read_loop::{OutputChunk, ReadLoop, ReadLoopChannels};
 pub use stop_waiter::StopWaiter;
 pub use wire::{
-    read_message, write_message, DapMessage, Envelope, Event, ExitedBody, ExitedEvent, OutputBody,
-    OutputEvent, Request, Response, StoppedBody, StoppedEvent,
+    DapMessage, Envelope, Event, ExitedBody, ExitedEvent, OutputBody, OutputEvent, Request,
+    Response, StoppedBody, StoppedEvent, read_message, write_message,
 };

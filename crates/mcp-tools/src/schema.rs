@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use debugger_core::BackendCapabilities;
 use rmcp::model::{JsonObject, Tool};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// The `backend` property shared by `launch`/`attach` (and the capability-gated
 /// `open_crash_dump`/`attach_kernel`): an optional string enum selecting the debugger

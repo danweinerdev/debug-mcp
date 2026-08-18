@@ -1,6 +1,6 @@
 //! `Args` accessor parity (Spec FR-3, Go `launch.go` / mcp-go semantics).
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::Args;
 
@@ -159,10 +159,11 @@ fn require_positive_int_missing_keeps_required_prefix() {
     // A missing/non-number value keeps the standard `missing required parameter:` error.
     let m = args_from(json!({}));
     let args = Args::new(&m);
-    assert!(args
-        .require_positive_int("count")
-        .unwrap_err()
-        .starts_with("missing required parameter:"));
+    assert!(
+        args.require_positive_int("count")
+            .unwrap_err()
+            .starts_with("missing required parameter:")
+    );
 }
 
 #[test]

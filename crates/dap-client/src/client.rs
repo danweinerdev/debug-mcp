@@ -21,11 +21,11 @@ use std::sync::{Arc, Mutex};
 
 use debugger_core::BackendError;
 use tokio::io::AsyncWrite;
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::error::WireError;
 use crate::stop_waiter::StopWaiter;
-use crate::wire::{write_message, DapMessage, Request};
+use crate::wire::{DapMessage, Request, write_message};
 
 /// The result delivered to a pending waiter: the correlated response, or a transport
 /// error (write failure rollback never reaches the channel; EOF delivers
@@ -92,14 +92,15 @@ impl<W> Shared<W> {
     /// no-op (returns `false`, logged by the read loop), never panics (Go
     /// `dispatchResponse`).
     pub fn dispatch_response(&self, seq: i64, message: DapMessage) -> bool {
-        if let Some(tx) = self.remove_pending(seq) {
-            // A dropped receiver (caller's future cancelled between dispatch and the
-            // AbortGuard winning the lock) makes this `Err`; discard it — the entry is
-            // already gone from the caller's perspective.
-            let _ = tx.send(Ok(message));
-            true
-        } else {
-            false
+        match self.remove_pending(seq) {
+            Some(tx) => {
+                // A dropped receiver (caller's future cancelled between dispatch and the
+                // AbortGuard winning the lock) makes this `Err`; discard it — the entry is
+                // already gone from the caller's perspective.
+                let _ = tx.send(Ok(message));
+                true
+            }
+            None => false,
         }
     }
 

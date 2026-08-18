@@ -22,7 +22,7 @@ fn factory_name_is_lldb() {
 #[cfg(feature = "live")]
 mod live {
     use debugger_core::{BackendFactory, LaunchOutcome, LaunchSpec};
-    use lldb_backend::{find_lldb_dap, LldbFactory};
+    use lldb_backend::{LldbFactory, find_lldb_dap};
 
     /// Resolve the `testdata/simple` fixture path relative to the repo. Returns `None`
     /// (⇒ skip) if it has not been built. The crate is at `<repo>/rust/crates/lldb-backend`;

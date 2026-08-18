@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use debugger_core::{BackendError, Variable};
 
-use crate::{flatten_variables, FlatVariable, VariableFetcher};
+use crate::{FlatVariable, VariableFetcher, flatten_variables};
 
 /// A `Variable` builder defaulting the rarely-set fields, matching the Go test's
 /// `godap.Variable{...}` literals.

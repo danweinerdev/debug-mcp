@@ -32,9 +32,9 @@ mod requests;
 mod subprocess;
 
 pub use backend::LldbBackend;
-pub use detect::{find_lldb_dap, Detected};
+pub use detect::{Detected, find_lldb_dap};
 pub use factory::LldbFactory;
-pub use subprocess::{spawn, StderrBuffer, Subprocess};
+pub use subprocess::{StderrBuffer, Subprocess, spawn};
 
 #[cfg(test)]
 mod tests;

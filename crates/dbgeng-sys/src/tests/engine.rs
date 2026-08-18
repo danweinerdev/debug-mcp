@@ -12,11 +12,11 @@ use debugger_core::ModuleInfo;
 
 use std::path::Path;
 
+use crate::InterruptHandle;
 use crate::engine::{
     condition_expr, discover_debuggers_root_with, extension_dirs, select_existing_root,
     symbol_status, truncate_output,
 };
-use crate::InterruptHandle;
 
 /// Compile-time proof that `InterruptHandle` is `Send`. It is the only piece of this crate that is
 /// moved to another thread (the off-thread interrupter); were it accidentally made `!Send` (e.g.

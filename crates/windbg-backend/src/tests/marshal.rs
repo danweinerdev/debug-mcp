@@ -9,8 +9,8 @@
 //! verbs are now all overridden to marshal onto the engine thread (see `tests/extras.rs` for their
 //! marshal/mapping coverage); none inherits the trait's default `Unsupported` body any longer.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use debugger_core::{DebuggerBackend, ThreadInfo};
 

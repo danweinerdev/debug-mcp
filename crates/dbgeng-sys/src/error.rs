@@ -7,8 +7,8 @@
 //! `debugger_core::BackendError` happens upstream in `windbg-backend` (Phase 3); this crate only
 //! ever returns `EngineError`.
 
-use windows::core::HRESULT;
 use windows::Win32::Foundation::E_FAIL;
+use windows::core::HRESULT;
 
 /// A `dbgeng-sys` failure. Either a COM call returned a failing `HRESULT` ([`EngineError::Com`]),
 /// or the engine itself refused/aborted with a free-form reason ([`EngineError::Engine`] — e.g.

@@ -8,11 +8,11 @@
 use mcp_session::State;
 use serde_json::{Map, Value};
 
+use crate::Args;
 use crate::errors;
 use crate::format::format_hex_dump;
 use crate::response::{RespBuilder, ToolOutcome};
 use crate::server::ToolServer;
-use crate::Args;
 
 /// The default disassemble instruction count (Spec OQ-1 — 20, the documented intent; Go's
 /// code value of 10 is treated as a latent bug).
@@ -92,10 +92,10 @@ impl ToolServer {
 
         // instruction_count default 20, overridden only when present and > 0.
         let mut instruction_count = DEFAULT_DISASSEMBLE_COUNT;
-        if let Some(ic) = args.get_f64("instruction_count") {
-            if ic > 0.0 {
-                instruction_count = ic as i64;
-            }
+        if let Some(ic) = args.get_f64("instruction_count")
+            && ic > 0.0
+        {
+            instruction_count = ic as i64;
         }
 
         let backend = match self.current_backend().await {
@@ -125,7 +125,9 @@ impl ToolServer {
                     current_pc = ip;
                 }
                 None => {
-                    return ToolOutcome::error("no instruction pointer available for current frame")
+                    return ToolOutcome::error(
+                        "no instruction pointer available for current frame",
+                    );
                 }
             }
         }
@@ -156,11 +158,11 @@ impl ToolServer {
                 if !inst.symbol.is_empty() {
                     entry.insert("symbol".to_string(), Value::from(inst.symbol.clone()));
                 }
-                if let Some(path) = &inst.source_path {
-                    if !path.is_empty() {
-                        entry.insert("file".to_string(), Value::from(path.clone()));
-                        entry.insert("line".to_string(), Value::from(inst.line));
-                    }
+                if let Some(path) = &inst.source_path
+                    && !path.is_empty()
+                {
+                    entry.insert("file".to_string(), Value::from(path.clone()));
+                    entry.insert("line".to_string(), Value::from(inst.line));
                 }
                 if !current_pc.is_empty() && inst.address == current_pc {
                     entry.insert("is_current_pc".to_string(), Value::from(true));

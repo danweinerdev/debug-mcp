@@ -15,10 +15,10 @@ use debugger_core::{FunctionBp, SourceBp};
 use mcp_session::{BreakpointInfo, State};
 use serde_json::{Map, Value};
 
+use crate::Args;
 use crate::errors;
 use crate::response::{RespBuilder, ToolOutcome};
 use crate::server::ToolServer;
-use crate::Args;
 
 impl ToolServer {
     /// `set_breakpoint` (Spec FR-7.1). Guard idle|stopped. Idle → buffer pending; stopped →
@@ -157,7 +157,7 @@ impl ToolServer {
             None => {
                 return ToolOutcome::error(
                     errors::SET_FUNCTION_BREAKPOINTS.request_failed.to_string(),
-                )
+                );
             }
         };
         let mut bps = self.session.all_function_breakpoints();
@@ -180,10 +180,10 @@ impl ToolServer {
         // This gate is BACKEND-NEUTRAL: it reads only `rejected`, with no address/`0x` detection
         // here. lldb results are always `rejected:false` ⇒ zero behavior change for lldb (incl.
         // its pending-symbol unverified BPs, which stay tracked).
-        if let Some(bp) = results.last() {
-            if bp.rejected {
-                return ToolOutcome::error(bp.message.clone());
-            }
+        if let Some(bp) = results.last()
+            && bp.rejected
+        {
+            return ToolOutcome::error(bp.message.clone());
         }
 
         // DAP succeeded — commit the session mutation. The new breakpoint is the last in
@@ -246,7 +246,7 @@ impl ToolServer {
             None => {
                 return ToolOutcome::error(format!(
                     "failed to remove breakpoint: breakpoint ID {id} not found"
-                ))
+                ));
             }
         };
         let was_function = info.ty == "function";

@@ -2,8 +2,8 @@
 //! its `Display` carries the context label and the `HRESULT`. Needs no live engine.
 
 use crate::EngineError;
-use windows::core::{Error, HRESULT};
 use windows::Win32::Foundation::E_NOINTERFACE;
+use windows::core::{Error, HRESULT};
 
 #[test]
 fn display_includes_context_and_hresult() {

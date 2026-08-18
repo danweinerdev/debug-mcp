@@ -12,7 +12,7 @@ use mcp_session::State;
 use serde_json::json;
 
 use crate::tests::fake::Call;
-use crate::tests::handlers::support::{args, expect_error, expect_json, token, Harness};
+use crate::tests::handlers::support::{Harness, args, expect_error, expect_json, token};
 
 // ---- open_crash_dump (connect point) ----
 

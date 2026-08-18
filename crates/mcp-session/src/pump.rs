@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use debugger_core::BackendEvent;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use tokio::task::JoinHandle;
 
 use crate::manager::SessionManager;

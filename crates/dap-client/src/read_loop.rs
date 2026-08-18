@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::client::Shared;
 use crate::error::WireError;
-use crate::wire::{read_message, DapMessage, Event};
+use crate::wire::{DapMessage, Event, read_message};
 
 /// One captured program-output chunk forwarded to the backend's output sink
 /// (Spec FR-12). Neutral `(category, text)` — no buffering here.

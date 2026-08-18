@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use dbgeng_sys::{find_process_by_name, BpLoc, InterruptHandle, LaunchReq};
+use dbgeng_sys::{BpLoc, InterruptHandle, LaunchReq, find_process_by_name};
 use debugger_core::{
     AttachOutcome, AttachSpec, BackendError, BreakpointResult, DebuggerBackend, DumpOutcome,
     EvalMode, EvalResult, Frame, FunctionBp, Granularity, Instruction, LaunchOutcome, LaunchSpec,
@@ -311,8 +311,7 @@ pub(crate) fn map_engine_err(err: EngineError) -> BackendError {
 /// The guidance message returned for a bare-address function-breakpoint name (R6). Surfaced as the
 /// `message` of an unverified [`BreakpointResult`] (kept in one place so the unit test asserts the
 /// exact text the handler relays to the agent).
-pub(crate) const ADDRESS_BP_GUIDANCE: &str =
-    "address breakpoints are not ASLR-stable when set via \
+pub(crate) const ADDRESS_BP_GUIDANCE: &str = "address breakpoints are not ASLR-stable when set via \
 set_function_breakpoint under WinDbg (they would be misplaced on relaunch); use \
 run_command(\"bp <addr>\") for an address breakpoint instead";
 
@@ -425,16 +424,15 @@ impl DebuggerBackend for WinDbgBackend {
                             reply,
                         })
                         .await;
-                    if let Ok(result) = result {
-                        if result.verified {
-                            let mut table =
-                                self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
-                            table
-                                .source
-                                .entry(file.clone())
-                                .or_default()
-                                .insert(line, result);
-                        }
+                    if let Ok(result) = result
+                        && result.verified
+                    {
+                        let mut table = self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
+                        table
+                            .source
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(line, result);
                     }
                 }
             }
@@ -455,11 +453,11 @@ impl DebuggerBackend for WinDbgBackend {
                         reply,
                     })
                     .await;
-                if let Ok(result) = result {
-                    if result.verified {
-                        let mut table = self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
-                        table.function.insert(bp.name.clone(), result);
-                    }
+                if let Ok(result) = result
+                    && result.verified
+                {
+                    let mut table = self.breakpoints.lock().unwrap_or_else(|p| p.into_inner());
+                    table.function.insert(bp.name.clone(), result);
                 }
             }
         }
@@ -492,7 +490,7 @@ impl DebuggerBackend for WinDbgBackend {
                 None => {
                     return Err(BackendError::Dap {
                         message: "attach: neither pid nor wait_for was supplied".to_string(),
-                    })
+                    });
                 }
             },
         };

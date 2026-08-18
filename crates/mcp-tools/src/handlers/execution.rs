@@ -16,11 +16,11 @@ use mcp_session::State;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::Args;
 use crate::errors::{self, OpError};
 use crate::format::format_output_entries;
 use crate::response::{RespBuilder, ToolOutcome};
 use crate::server::ToolServer;
-use crate::Args;
 
 /// What kind of resume a handler is performing — selects the backend call, the
 /// granularity handling, and the error/timeout wording.

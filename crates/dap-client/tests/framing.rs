@@ -8,8 +8,8 @@
 use std::io::Cursor;
 
 use dap_client::{
-    read_message, write_message, DapMessage, ExitedEvent, OutputEvent, Request, Response,
-    StoppedEvent,
+    DapMessage, ExitedEvent, OutputEvent, Request, Response, StoppedEvent, read_message,
+    write_message,
 };
 use serde_json::json;
 use tokio::io::BufReader;

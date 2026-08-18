@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use debugger_core::{AttachOutcome, AttachSpec, BackendError, LaunchOutcome, LaunchSpec};
-use mcp_session::{spawn_event_pump, State};
+use mcp_session::{State, spawn_event_pump};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use crate::Args;
 use crate::response::{RespBuilder, ToolOutcome};
 use crate::server::ToolServer;
-use crate::Args;
 
 impl ToolServer {
     /// `launch` (Spec FR-4). Guard idle → parse → flush pending breakpoints into the

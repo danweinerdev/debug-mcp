@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::backend::WinDbgBackend;
 use crate::engine_ops::EngineOps;
 use crate::error::EngineError;
-use crate::thread::{spawn_engine_thread, EngineCmd};
+use crate::thread::{EngineCmd, spawn_engine_thread};
 
 /// The command-channel buffer for the engine thread. The backend awaits each reply before the
 /// next caller proceeds, so a small buffer never backs up; a handful of slots absorbs any
@@ -88,12 +88,12 @@ impl BackendFactory for WinDbgFactory {
             Ok(Err(e)) => {
                 return Err(BackendError::Detect(format!(
                     "failed to initialize DbgEng: {e}"
-                )))
+                )));
             }
             Err(_) => {
                 return Err(BackendError::Spawn(
                     "failed to initialize DbgEng: engine thread exited before readiness".into(),
-                ))
+                ));
             }
         };
 

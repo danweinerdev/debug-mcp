@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 
 use mcp_session::OutputEntry;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Format raw bytes as a hex dump with 16 bytes per row (Spec FR-13.1, Go
 /// `formatHexDump`). Empty input yields an empty string; rows are joined by `\n`

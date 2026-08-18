@@ -6,8 +6,8 @@
 //! The peer half lets a test read the requests the client wrote and inject scripted
 //! responses/events, making every ordering deterministic.
 
-use dap_client::{read_message, write_message, Client, DapMessage, ReadLoop, ReadLoopChannels};
-use tokio::io::{duplex, BufReader, DuplexStream};
+use dap_client::{Client, DapMessage, ReadLoop, ReadLoopChannels, read_message, write_message};
+use tokio::io::{BufReader, DuplexStream, duplex};
 
 /// One end of a scripted DAP peer wired to a [`Client`] + its read loop.
 pub struct Harness {

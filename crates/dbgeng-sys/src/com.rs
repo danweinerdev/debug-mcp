@@ -14,7 +14,7 @@
 use std::marker::PhantomData;
 
 use windows::Win32::Foundation::{S_FALSE, S_OK};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
 use crate::error::EngineError;
 

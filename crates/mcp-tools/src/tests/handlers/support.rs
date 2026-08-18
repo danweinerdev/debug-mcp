@@ -10,11 +10,11 @@ use tokio_util::sync::CancellationToken;
 use crate::server::ToolServer;
 use debugger_core::BackendError;
 
-use crate::tests::fake::{
-    single_factory_registry, windbg_like_connect_error_factory, windbg_like_factory, FakeBackend,
-    FakeFactory, FakeState,
-};
 use crate::ToolOutcome;
+use crate::tests::fake::{
+    FakeBackend, FakeFactory, FakeState, single_factory_registry,
+    windbg_like_connect_error_factory, windbg_like_factory,
+};
 
 /// A test harness: the server, the shared session, and the shared fake-backend state.
 pub struct Harness {

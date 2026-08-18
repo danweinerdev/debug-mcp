@@ -827,7 +827,10 @@ async fn set_function_breakpoints_rejects_bare_address_keeps_module_sym() {
         .expect("clear functions");
     let removes = removed(&recorder);
     assert_eq!(
-        removes.iter().copied().collect::<std::collections::HashSet<_>>(),
+        removes
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
         std::collections::HashSet::from([1, 2]),
         "only the two tracked (resolvable) ids are removed; the un-tracked address produces no remove, got {removes:?}"
     );

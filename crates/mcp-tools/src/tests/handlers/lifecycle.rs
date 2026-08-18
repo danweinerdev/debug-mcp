@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::tests::fake::Call;
 use crate::tests::handlers::support::{
-    args, expect_error, expect_json, expect_text, token, Harness,
+    Harness, args, expect_error, expect_json, expect_text, token,
 };
 
 fn stop(reason: &str, thread_id: i64) -> StopInfo {
@@ -725,10 +725,11 @@ async fn disconnect_always_returns_disconnected_and_resets() {
     assert_eq!(h.session.program(), "");
     assert_eq!(h.session.pid(), 0);
     // The backend was asked to disconnect with terminate=true (default).
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::Disconnect { terminate: true })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::Disconnect { terminate: true }))
+    );
     // The backend slot was cleared.
     assert!(h.server.current_backend().await.is_none());
 }
@@ -738,10 +739,11 @@ async fn disconnect_terminate_false_passes_through() {
     let h = Harness::connected(State::Running).await;
     let a = args(&[("terminate", json!(false))]);
     let _ = h.server.handle_disconnect(&crate::Args::new(&a)).await;
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::Disconnect { terminate: false })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::Disconnect { terminate: false }))
+    );
 }
 
 #[tokio::test]

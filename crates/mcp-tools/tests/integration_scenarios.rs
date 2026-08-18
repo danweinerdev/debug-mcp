@@ -9,10 +9,10 @@
 use std::time::Duration;
 
 use integration_tests::harness::{
-    expect_error, expect_json_obj, fixture_path, obj, should_skip, Harness,
+    Harness, expect_error, expect_json_obj, fixture_path, obj, should_skip,
 };
 use mcp_session::State;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Kill an OS process by pid (the lldb-dap subprocess), used by the crash-recovery
 /// scenarios. Shells out to `kill -KILL` to stay zero-`unsafe` (Go uses

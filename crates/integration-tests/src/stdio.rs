@@ -13,7 +13,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A spawned MCP server process driven over stdio.
 pub struct StdioMcp {
@@ -232,10 +232,11 @@ pub struct ToolCallResult {
 /// env var (an explicit path), then `lldb-debug-mcp` on PATH. Returns `None` when absent
 /// (the harness then skips — Go is not installed in the dev sandbox).
 pub fn go_reference_binary() -> Option<String> {
-    if let Ok(path) = std::env::var("GO_DEBUG_MCP_BIN") {
-        if !path.is_empty() && std::path::Path::new(&path).exists() {
-            return Some(path);
-        }
+    if let Ok(path) = std::env::var("GO_DEBUG_MCP_BIN")
+        && !path.is_empty()
+        && std::path::Path::new(&path).exists()
+    {
+        return Some(path);
     }
     which("lldb-debug-mcp")
 }
@@ -243,10 +244,11 @@ pub fn go_reference_binary() -> Option<String> {
 /// Locate the Rust `debug-mcp` binary built by cargo. Order: `DEBUG_MCP_BIN` env var, then
 /// the cargo target dir (`CARGO_TARGET_DIR` or the workspace `target/`), then PATH.
 pub fn rust_binary() -> Option<String> {
-    if let Ok(path) = std::env::var("DEBUG_MCP_BIN") {
-        if !path.is_empty() && std::path::Path::new(&path).exists() {
-            return Some(path);
-        }
+    if let Ok(path) = std::env::var("DEBUG_MCP_BIN")
+        && !path.is_empty()
+        && std::path::Path::new(&path).exists()
+    {
+        return Some(path);
     }
     // The cargo target dir holds the freshly-built binary. Honor CARGO_TARGET_DIR.
     if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {

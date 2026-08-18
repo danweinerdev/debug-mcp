@@ -32,15 +32,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use windows::core::{implement, Ref, PCSTR};
-use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    IDebugBreakpoint, IDebugEventCallbacks, IDebugEventCallbacks_Impl, IDebugOutputCallbacks,
-    IDebugOutputCallbacks_Impl, DEBUG_EVENT_BREAKPOINT, DEBUG_EVENT_CREATE_PROCESS,
-    DEBUG_EVENT_EXCEPTION, DEBUG_EVENT_EXIT_PROCESS, DEBUG_EVENT_LOAD_MODULE,
-    DEBUG_EVENT_SESSION_STATUS, DEBUG_OUTPUT_ERROR, DEBUG_OUTPUT_NORMAL, DEBUG_OUTPUT_PROMPT,
-    DEBUG_OUTPUT_WARNING, DEBUG_STATUS_BREAK, DEBUG_STATUS_NO_CHANGE,
-};
 use windows::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD64;
+use windows::Win32::System::Diagnostics::Debug::Extensions::{
+    DEBUG_EVENT_BREAKPOINT, DEBUG_EVENT_CREATE_PROCESS, DEBUG_EVENT_EXCEPTION,
+    DEBUG_EVENT_EXIT_PROCESS, DEBUG_EVENT_LOAD_MODULE, DEBUG_EVENT_SESSION_STATUS,
+    DEBUG_OUTPUT_ERROR, DEBUG_OUTPUT_NORMAL, DEBUG_OUTPUT_PROMPT, DEBUG_OUTPUT_WARNING,
+    DEBUG_STATUS_BREAK, DEBUG_STATUS_NO_CHANGE, IDebugBreakpoint, IDebugEventCallbacks,
+    IDebugEventCallbacks_Impl, IDebugOutputCallbacks, IDebugOutputCallbacks_Impl,
+};
+use windows::core::{PCSTR, Ref, implement};
 
 /// The Windows initial-process breakpoint exception (`STATUS_BREAKPOINT`, the `int 3` the
 /// loader hits): a first-chance occurrence of this is the engine's initial break and must be

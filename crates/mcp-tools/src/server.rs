@@ -18,21 +18,21 @@ use std::sync::Arc;
 
 use debugger_core::DebuggerBackend;
 use mcp_session::SessionManager;
+use rmcp::ErrorData as McpError;
+use rmcp::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::ErrorData as McpError;
-use rmcp::ServerHandler;
 use serde_json::Map;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::response::ToolOutcome;
-use crate::schema;
 use crate::Args;
 use crate::BackendRegistry;
+use crate::response::ToolOutcome;
+use crate::schema;
 
 /// The shared state every handler operates on: the neutral session, the backend registry
 /// (the runtime switcher), and the currently-connected backend (if any).

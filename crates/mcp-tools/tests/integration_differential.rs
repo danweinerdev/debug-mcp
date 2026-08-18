@@ -26,8 +26,8 @@
 #![cfg(all(feature = "integration", unix))]
 
 use integration_tests::harness::{fixture_path, lldb_dap_available};
-use integration_tests::stdio::{go_reference_binary, rust_binary, StdioMcp, ToolCallResult};
-use serde_json::{json, Value};
+use integration_tests::stdio::{StdioMcp, ToolCallResult, go_reference_binary, rust_binary};
+use serde_json::{Value, json};
 
 /// The `LLDB_DAP_PATH` (if set) to propagate to the spawned server children so both
 /// binaries use the same adapter. Empty slice when unset (they detect via PATH).

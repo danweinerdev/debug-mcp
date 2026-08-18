@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use lldb_backend::{spawn, StderrBuffer};
+use lldb_backend::{StderrBuffer, spawn};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 #[test]

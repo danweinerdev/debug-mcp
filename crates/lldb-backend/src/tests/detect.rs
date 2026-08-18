@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::detect::{find_lldb_dap_with, Env};
+use crate::detect::{Env, find_lldb_dap_with};
 
 /// A deterministic [`Env`]: a name→path map for PATH lookups, an env-var map, a set of
 /// existing absolute paths, an optional `xcrun` result, and the macOS gate.

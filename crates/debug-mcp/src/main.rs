@@ -18,9 +18,9 @@ use std::sync::Arc;
 #[cfg(not(windows))]
 use lldb_backend::LldbFactory;
 use mcp_session::SessionManager;
-use mcp_tools::{default_backend_for_os, BackendRegistry, ToolServer};
-use rmcp::transport::stdio;
+use mcp_tools::{BackendRegistry, ToolServer, default_backend_for_os};
 use rmcp::ServiceExt;
+use rmcp::transport::stdio;
 #[cfg(windows)]
 use windbg_backend::WinDbgFactory;
 

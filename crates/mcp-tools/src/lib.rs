@@ -40,9 +40,9 @@ mod schema;
 mod server;
 
 pub use args::Args;
-pub use flatten::{flatten_variables, FlatVariable, VariableFetcher};
+pub use flatten::{FlatVariable, VariableFetcher, flatten_variables};
 pub use format::{format_hex_dump, format_output_entries};
-pub use registry::{default_backend_for_os, BackendRegistry};
+pub use registry::{BackendRegistry, default_backend_for_os};
 pub use response::{RespBuilder, ToolOutcome};
 pub use server::ToolServer;
 

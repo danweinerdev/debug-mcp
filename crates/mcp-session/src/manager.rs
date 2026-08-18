@@ -334,10 +334,10 @@ impl SessionManager {
         match info.ty.as_str() {
             "source" => {
                 file_path = info.file.clone();
-                if let Some(bps) = inner.source_bps.get_mut(&file_path) {
-                    if let Some(pos) = bps.iter().position(|bp| bp.line == info.line) {
-                        bps.remove(pos);
-                    }
+                if let Some(bps) = inner.source_bps.get_mut(&file_path)
+                    && let Some(pos) = bps.iter().position(|bp| bp.line == info.line)
+                {
+                    bps.remove(pos);
                 }
             }
             "function" => {

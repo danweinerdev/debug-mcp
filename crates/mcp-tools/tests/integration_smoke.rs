@@ -7,7 +7,7 @@
 
 #![cfg(all(feature = "integration", unix))]
 
-use integration_tests::harness::{fixture_path, should_skip, Harness};
+use integration_tests::harness::{Harness, fixture_path, should_skip};
 use mcp_session::State;
 
 #[tokio::test]

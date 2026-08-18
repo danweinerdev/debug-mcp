@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::sync::oneshot;
 
 use crate::tests::fake::Call;
-use crate::tests::handlers::support::{args, expect_error, expect_json, token, Harness};
+use crate::tests::handlers::support::{Harness, args, expect_error, expect_json, token};
 
 fn stop(reason: &str, thread_id: i64) -> StopInfo {
     StopInfo {
@@ -153,10 +153,11 @@ async fn continue_thread_resolution_explicit_arg_wins() {
         .server
         .handle_continue(&crate::Args::new(&a), &token())
         .await;
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::Cont { thread_id: 5 })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::Cont { thread_id: 5 }))
+    );
 }
 
 #[tokio::test]
@@ -169,10 +170,11 @@ async fn continue_thread_resolution_last_stopped() {
         .server
         .handle_continue(&crate::Args::new(&empty), &token())
         .await;
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::Cont { thread_id: 7 })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::Cont { thread_id: 7 }))
+    );
 }
 
 #[tokio::test]
@@ -184,10 +186,11 @@ async fn continue_thread_resolution_default_one() {
         .server
         .handle_continue(&crate::Args::new(&empty), &token())
         .await;
-    assert!(h
-        .calls()
-        .iter()
-        .any(|c| matches!(c, Call::Cont { thread_id: 1 })));
+    assert!(
+        h.calls()
+            .iter()
+            .any(|c| matches!(c, Call::Cont { thread_id: 1 }))
+    );
 }
 
 #[tokio::test]
@@ -426,10 +429,12 @@ async fn pause_returns_pause_requested_without_state_change() {
     let out = h.server.handle_pause(&crate::Args::new(&empty)).await;
     let v = expect_json(&out);
     assert_eq!(v["status"], json!("pause_requested"));
-    assert!(v["message"]
-        .as_str()
-        .unwrap()
-        .contains("Pause request sent"));
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("Pause request sent")
+    );
     // State unchanged.
     assert_eq!(h.session.state(), State::Running);
     assert!(h.calls().iter().any(|c| matches!(c, Call::Pause)));

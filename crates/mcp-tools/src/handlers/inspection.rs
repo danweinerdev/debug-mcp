@@ -12,12 +12,12 @@ use debugger_core::EvalMode;
 use mcp_session::State;
 use serde_json::{Map, Value};
 
+use crate::Args;
 use crate::errors;
 use crate::flatten::flatten_variables;
 use crate::frame::resolve_frame_id;
 use crate::response::{RespBuilder, ToolOutcome};
 use crate::server::ToolServer;
-use crate::Args;
 
 /// The 100-variable hard cap the `variables` flattening applies (Spec FR-10.3).
 const VARIABLE_CAP: usize = 100;
@@ -97,10 +97,10 @@ impl ToolServer {
 
         // levels default 20, overridden only when present and > 0.
         let mut levels = 20;
-        if let Some(l) = args.get_f64("levels") {
-            if l > 0.0 {
-                levels = l as i64;
-            }
+        if let Some(l) = args.get_f64("levels")
+            && l > 0.0
+        {
+            levels = l as i64;
         }
 
         let backend = match self.current_backend().await {
@@ -127,16 +127,16 @@ impl ToolServer {
                 entry.insert("index".to_string(), Value::from(frame.index));
                 entry.insert("name".to_string(), Value::from(frame.name.clone()));
                 entry.insert("id".to_string(), Value::from(frame.id));
-                if let Some(path) = &frame.source_path {
-                    if !path.is_empty() {
-                        entry.insert("file".to_string(), Value::from(path.clone()));
-                        entry.insert("line".to_string(), Value::from(frame.line));
-                    }
+                if let Some(path) = &frame.source_path
+                    && !path.is_empty()
+                {
+                    entry.insert("file".to_string(), Value::from(path.clone()));
+                    entry.insert("line".to_string(), Value::from(frame.line));
                 }
-                if let Some(ip) = &frame.instruction_pointer {
-                    if !ip.is_empty() {
-                        entry.insert("address".to_string(), Value::from(ip.clone()));
-                    }
+                if let Some(ip) = &frame.instruction_pointer
+                    && !ip.is_empty()
+                {
+                    entry.insert("address".to_string(), Value::from(ip.clone()));
                 }
                 Value::Object(entry)
             })
@@ -205,19 +205,15 @@ impl ToolServer {
 
         let scope = {
             let s = args.get_string("scope", "");
-            if s.is_empty() {
-                "local".to_string()
-            } else {
-                s
-            }
+            if s.is_empty() { "local".to_string() } else { s }
         };
 
         // Default depth: 2, except 1 for global. An explicit depth >= 0 overrides.
         let mut depth = if scope == "global" { 1 } else { 2 };
-        if let Some(d) = args.get_f64("depth") {
-            if d >= 0.0 {
-                depth = d as i64;
-            }
+        if let Some(d) = args.get_f64("depth")
+            && d >= 0.0
+        {
+            depth = d as i64;
         }
 
         let filter = args.get_string("filter", "");
@@ -245,7 +241,7 @@ impl ToolServer {
             None => {
                 return ToolOutcome::error(format!(
                     "scope '{scope}' not found in frame {frame_index}"
-                ))
+                ));
             }
         };
 
@@ -263,7 +259,7 @@ impl ToolServer {
                 return ToolOutcome::error(format!(
                     "failed to fetch variables: {}",
                     errors::VARIABLES.render(e)
-                ))
+                ));
             }
         };
 

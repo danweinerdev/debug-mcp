@@ -28,10 +28,10 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use integration_tests::harness::{
-    expect_error, expect_json_obj, obj, should_skip_windbg, windbg_fixture_path, Harness,
+    Harness, expect_error, expect_json_obj, obj, should_skip_windbg, windbg_fixture_path,
 };
 use mcp_session::State;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
 /// A fresh empty argument map for a no-arg tool call.

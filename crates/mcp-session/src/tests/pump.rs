@@ -12,7 +12,7 @@ use std::sync::Arc;
 use debugger_core::{BackendEvent, StopInfo};
 use futures::stream::{self, BoxStream, StreamExt};
 
-use crate::{spawn_event_pump, SessionManager, State};
+use crate::{SessionManager, State, spawn_event_pump};
 
 #[test]
 fn frame_mapping_set_and_clone() {
@@ -61,7 +61,7 @@ fn last_stopped_and_exit_code_accessors() {
 async fn pump_appends_output() {
     // Go `SetOutputHandler` — output events land in the OutputBuffer in order.
     let sm = Arc::new(SessionManager::new());
-    let gen = sm.generation();
+    let generation = sm.generation();
 
     let events: BoxStream<'static, BackendEvent> = stream::iter(vec![
         BackendEvent::Output {
@@ -75,7 +75,7 @@ async fn pump_appends_output() {
     ])
     .boxed();
 
-    let handle = spawn_event_pump(events, Arc::clone(&sm), gen);
+    let handle = spawn_event_pump(events, Arc::clone(&sm), generation);
     handle.await.expect("pump task");
 
     let entries = sm.output_buffer().drain();
@@ -95,12 +95,12 @@ async fn pump_sets_terminated_with_exit_code() {
     // Go `onTerminated` — a Terminated event records the exit code and flips state.
     let sm = Arc::new(SessionManager::new());
     sm.set_state(State::Running);
-    let gen = sm.generation();
+    let generation = sm.generation();
 
     let events: BoxStream<'static, BackendEvent> =
         stream::iter(vec![BackendEvent::Terminated { code: Some(3) }]).boxed();
 
-    let handle = spawn_event_pump(events, Arc::clone(&sm), gen);
+    let handle = spawn_event_pump(events, Arc::clone(&sm), generation);
     handle.await.expect("pump task");
 
     assert_eq!(sm.state(), State::Terminated);
@@ -112,12 +112,12 @@ async fn pump_terminated_without_exit_code_leaves_exit_code_unset() {
     // A Terminated with no code still flips state but does not record an exit code.
     let sm = Arc::new(SessionManager::new());
     sm.set_state(State::Running);
-    let gen = sm.generation();
+    let generation = sm.generation();
 
     let events: BoxStream<'static, BackendEvent> =
         stream::iter(vec![BackendEvent::Terminated { code: None }]).boxed();
 
-    spawn_event_pump(events, Arc::clone(&sm), gen)
+    spawn_event_pump(events, Arc::clone(&sm), generation)
         .await
         .expect("pump task");
 
@@ -167,7 +167,7 @@ async fn pump_processes_output_then_terminated() {
     // The pump drains a mixed stream in order: output appended, then state terminated.
     let sm = Arc::new(SessionManager::new());
     sm.set_state(State::Running);
-    let gen = sm.generation();
+    let generation = sm.generation();
 
     let events: BoxStream<'static, BackendEvent> = stream::iter(vec![
         BackendEvent::Output {
@@ -178,7 +178,7 @@ async fn pump_processes_output_then_terminated() {
     ])
     .boxed();
 
-    spawn_event_pump(events, Arc::clone(&sm), gen)
+    spawn_event_pump(events, Arc::clone(&sm), generation)
         .await
         .expect("pump task");
 
