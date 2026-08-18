@@ -213,6 +213,29 @@ Example prompts:
 - **Output capture**: program stdout/stderr is buffered and merged into `continue`/`step_*`
   responses; `read_output` drains any additional output.
 
+## Agent plugins (Claude Code / OpenCode / Codex)
+
+The repo ships one plugin for three agent harnesses. The canonical plugin is the
+Claude Code tree at `plugin/`; the OpenCode and Codex variants are **generated**
+trees, committed and drift-gated (`make all` runs `plugins-check`).
+
+| Harness | Install from | Form |
+|---|---|---|
+| **Claude Code** | `plugin/` (`claude --plugin-dir ./plugin`, or the marketplace manifest at `.claude-plugin/marketplace.json`) | 6 `debug-mcp-*` skills + a print-debugging nudge hook |
+| **OpenCode** | `.opencode-plugin/` | same 6 skills via skill discovery (skills-only) |
+| **Codex** | `.codex-plugin/` | same 6 skills via a marketplace carrying the tree (skills-only) |
+
+The skills are generic, model-loaded ("modal") skills selected by description
+match — session lifecycle, breakpoints, execution, inspection, low-level
+memory/disassembly/raw-commands, and WinDbg crash-dump/kernel/module work. All
+three harnesses need the `debug` MCP server registered under the name `debug`
+(see each tree's `README.md`).
+
+To change the plugin, edit `plugin/` (skills) or `plugin/README.portable.md`
+(the generated trees' README), then run `make plugins` and commit the
+regenerated `.opencode-plugin/` + `.codex-plugin/`. Never edit the generated
+trees by hand.
+
 ## Tools reference
 
 The **21 core tools** below are available on every platform and are byte-identical to the Go

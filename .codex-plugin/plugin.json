@@ -1,0 +1,24 @@
+{
+  "name": "debug-mcp",
+  "version": "0.2.0",
+  "description": "Interactive native debugging skills for the debug MCP server (lldb-dap on macOS/Linux, WinDbg/DbgEng on Windows): sessions, breakpoints, stepping, stack/variable inspection, expression evaluation, memory/disassembly, crash dumps, and raw debugger commands.",
+  "author": { "name": "Daniel Weiner" },
+  "repository": "https://github.com/danweinerdev/debug-mcp",
+  "license": "MIT",
+  "keywords": ["debug", "mcp", "lldb", "lldb-dap", "windbg", "dbgeng", "debugger", "native-debugging", "breakpoints"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "debug-mcp",
+    "shortDescription": "Interactive native debugging via the debug MCP server",
+    "longDescription": "Scenario skills that teach the model to debug native (C/C++/Rust/Go/Swift) programs live through the debug MCP server instead of print-debugging: launch/attach, breakpoints, stepping, inspection, expression evaluation, memory/disassembly, crash-dump analysis, and raw lldb/WinDbg commands.",
+    "developerName": "Daniel Weiner",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive"],
+    "websiteURL": "https://github.com/danweinerdev/debug-mcp",
+    "defaultPrompt": [
+      "Debug why this binary segfaults using the debug MCP server.",
+      "Attach to the running process and find where it hangs.",
+      "Open this crash dump and tell me the faulting frame."
+    ]
+  }
+}

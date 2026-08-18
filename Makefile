@@ -4,10 +4,10 @@
 MANIFEST := $(CURDIR)/Cargo.toml
 CARGO := cargo
 
-.PHONY: all build clippy fmt fmt-check test integration integration-windbg tsan check seam unsafe-gate audit deny ready
+.PHONY: all build clippy fmt fmt-check test integration integration-windbg tsan check seam unsafe-gate audit deny ready plugins plugins-check
 
 # The full gate, in the order the phase verification runs it.
-all: fmt-check build clippy test seam unsafe-gate
+all: fmt-check build clippy test seam unsafe-gate plugins-check
 
 build:
 	$(CARGO) build --manifest-path $(MANIFEST) --workspace
@@ -98,3 +98,17 @@ deny:
 # Run before cutting a release or shipping a binary. (For the lint/format/seam/unsafe gates,
 # run `make all`; `make ready` focuses on tests + dependency health.)
 ready: test audit deny
+
+# --- Portable (OpenCode/Codex) plugin trees ------------------------------------
+#
+# .opencode-plugin/ and .codex-plugin/ are generated from the canonical Claude
+# Code plugin at plugin/ by scripts/plugins-sync.sh — the same skills, written
+# once per harness install convention. They are committed (they are what the
+# other harnesses install) and drift-gated: `make all` runs plugins-check, which
+# fails when either tree does not match a fresh generation. Never edit them by
+# hand — edit plugin/ (or plugin/README.portable.md), then `make plugins`.
+plugins:
+	@bash scripts/plugins-sync.sh
+
+plugins-check:
+	@bash scripts/plugins-sync.sh check

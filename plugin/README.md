@@ -11,18 +11,26 @@ Two parts:
    (`./bin/foo`, `target/debug/foo`, `cargo run`) to watch it crash. It **never
    blocks**: the command still runs, and version probes / unrelated commands
    (builds, tests, file ops) are left alone.
-2. **Five skills** that teach the model when and how to use the debug API:
+2. **Six skills** that teach the model when and how to use the debug API:
 
    | Skill | Covers |
    |---|---|
-   | `debug-mcp-debugging` | Session lifecycle: launch, attach, disconnect, status |
+   | `debug-mcp-debugging` | Session lifecycle: launch, attach, disconnect, status, backend selection |
    | `debug-mcp-breakpoints` | set_breakpoint, set_function_breakpoint, conditions, list/remove |
    | `debug-mcp-execution` | continue, step_over/into/out, pause, granularity, threads |
    | `debug-mcp-inspection` | backtrace, threads, variables, evaluate, read_output |
-   | `debug-mcp-lowlevel` | read_memory, disassemble, run_command (raw LLDB escape hatch) |
+   | `debug-mcp-lowlevel` | read_memory, disassemble, run_command (raw lldb/WinDbg escape hatch) |
+   | `debug-mcp-windbg` | open_crash_dump, analyze_crash (!analyze -v), attach_kernel, get_modules (Windows) |
 
-The 21 tools are exposed under the MCP server name `debug`, i.e.
+The tools are exposed under the MCP server name `debug`, i.e.
 `mcp__debug__launch`, `mcp__debug__set_breakpoint`, `mcp__debug__backtrace`, …
+(21 tools everywhere; on Windows the 4 WinDbg-only tools bring it to 25).
+
+**Other harnesses:** this directory is the canonical **Claude Code** plugin. The
+same skills ship for **OpenCode** and **Codex** as the generated
+`.opencode-plugin/` and `.codex-plugin/` trees at the repo root (skills-only —
+the nudge hook is Claude-specific). See their `README.md`, and regenerate with
+`make plugins` after editing anything here.
 
 ## Requirements
 

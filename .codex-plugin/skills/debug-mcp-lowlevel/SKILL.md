@@ -5,6 +5,10 @@ description: Low-level and escape-hatch debugging via the debug MCP server (lldb
 
 # debug-mcp — memory, disassembly & raw LLDB
 
+> Tool names below are the `debug` MCP server's own tool names. Your host
+> prefixes them with the server name (e.g. `debug_launch` in OpenCode) —
+> register the server under the name `debug` so they resolve.
+
 When source-level inspection isn't enough — a corrupted pointer, a fault in
 stripped/optimized code, a register-level question, or a one-off LLDB command the
 structured tools don't expose — these drop to the machine level inside the same
@@ -17,9 +21,9 @@ addresses, usually a *stopped* one.
 
 | The user wants… | Tool | Key args |
 |---|---|---|
-| Raw bytes at an address | `mcp__debug__read_memory` | `address` (required), `count` (required) |
-| Machine code at an address / current PC | `mcp__debug__disassemble` | `address`, `instruction_count` |
-| Run any LLDB command | `mcp__debug__run_command` | `command` (required) |
+| Raw bytes at an address | `read_memory` | `address` (required), `count` (required) |
+| Machine code at an address / current PC | `disassemble` | `address`, `instruction_count` |
+| Run any LLDB command | `run_command` | `command` (required) |
 
 ## read_memory
 

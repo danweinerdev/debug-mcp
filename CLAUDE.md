@@ -160,6 +160,19 @@ surface; only the runtime behavior differs (surfaced via result messages where i
   condition fails to evaluate (out-of-scope symbol, typo) is silently **not** taken — C++ DbgEng
   parity; DbgEng provides no API notification for the evaluation failure.
 
+## Agent plugins (Claude Code / OpenCode / Codex)
+
+One plugin, three harnesses. The **canonical** plugin is the Claude Code tree at `plugin/`
+(manifest `plugin/.claude-plugin/plugin.json`, nudge/session-reset hooks, and six generic
+model-loaded `debug-mcp-*` skills: debugging, breakpoints, execution, inspection, lowlevel,
+windbg). The OpenCode and Codex variants are **generated, committed, byte-identical** trees
+(`.opencode-plugin/`, `.codex-plugin/`) produced by `scripts/plugins-sync.sh` (`make plugins`):
+portable `plugin.json` (version injected from the canonical manifest), README from
+`plugin/README.portable.md`, and the same skills with `mcp__debug__<tool>` rewritten to bare
+tool names plus a host-prefix note (hooks are Claude-only and not ported). **Never edit the
+generated trees by hand** — edit `plugin/`, then `make plugins`. Drift is gated: `make all`
+runs `plugins-check`, which fails when either tree differs from a fresh generation.
+
 ## CI / sanitizer coverage notes
 
 - **ThreadSanitizer** (the `tsan` Make target / CI job) covers the `dap-client` concurrency on

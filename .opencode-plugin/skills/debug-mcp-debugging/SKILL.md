@@ -5,6 +5,10 @@ description: Start, attach to, and tear down an interactive native debug session
 
 # debug-mcp — start & control a debug session
 
+> Tool names below are the `debug` MCP server's own tool names. Your host
+> prefixes them with the server name (e.g. `debug_launch` in OpenCode) —
+> register the server under the name `debug` so they resolve.
+
 The `debug` MCP server wraps a native debugger (**lldb-dap** on macOS/Linux,
 **WinDbg/DbgEng** on Windows) as live, stateful debug tools. A session is
 persistent: breakpoints, the stopped thread, the current frame, and program
@@ -37,10 +41,10 @@ program — drive execution with the **debug-mcp-execution** skill, inspect with
 
 | The user wants… | Tool | Key args |
 |---|---|---|
-| Run a program under the debugger | `mcp__debug__launch` | `program` (required), `args`, `cwd`, `env`, `stop_on_entry` |
-| Attach to a live process | `mcp__debug__attach` | `pid` **or** `wait_for` |
-| End the session | `mcp__debug__disconnect` | `terminate` (default true) |
-| Where is the session right now? | `mcp__debug__status` | — |
+| Run a program under the debugger | `launch` | `program` (required), `args`, `cwd`, `env`, `stop_on_entry` |
+| Attach to a live process | `attach` | `pid` **or** `wait_for` |
+| End the session | `disconnect` | `terminate` (default true) |
+| Where is the session right now? | `status` | — |
 
 ## launch
 
@@ -55,7 +59,7 @@ program — drive execution with the **debug-mcp-execution** skill, inspect with
 
 If the program exits during launch (e.g. it ran to completion with
 `stop_on_entry=false` and no breakpoint), the tool returns the exit result rather
-than a stopped state — read captured output with `mcp__debug__read_output`.
+than a stopped state — read captured output with `read_output`.
 
 ## attach
 
