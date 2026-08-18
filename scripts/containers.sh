@@ -46,7 +46,7 @@ dm_container_main() {
     local CACHE_DIR="${DM_CACHE_DIR:-${REPO_DIR}/.cache}"
 
     # Mirror the host username + home path inside the container so absolute
-    # paths in things like ~/.ssh/config (IdentityFile /home/daniel/...) keep
+    # paths in things like ~/.ssh/config (IdentityFile /home/<user>/...) keep
     # working.
     local HOST_USER HOST_HOME CONTAINER_HOME
     HOST_USER="$(id -un)"
